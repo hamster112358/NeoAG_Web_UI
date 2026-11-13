@@ -1,0 +1,6 @@
+# runtime state and secrets - never commit
+data/
+server.pid
+nohup.out
+__pycache__/
+*.pyc

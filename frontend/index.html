@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NeoAG Assistant - MOCK PROTOTYPE</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div id="demo-banner">MOCK DATA PROTOTYPE &mdash; synthetic demo only. No real
+NeoAG pipeline and no patient data are connected.</div>
+<header>
+  <div class="brand"><span class="logo">N</span>
+    <div><h1>NeoAG Assistant</h1><p class="sub">conversational neoantigen workspace (demo)</p></div>
+  </div>
+  <div class="conn"><span id="conn-dot" class="dot"></span><span id="conn-text">connecting…</span></div>
+</header>
+<main>
+  <nav id="rail">
+    <button class="tab active" data-view="workspace">Chat</button>
+    <button class="tab" data-view="tasks">Tasks</button>
+    <button class="tab" data-view="results">Results</button>
+    <button class="tab" data-view="approvals">Approvals <span id="appr-count" class="count"></span></button>
+    <button class="tab" data-view="decisions">Decisions</button>
+    <button class="tab" data-view="discovery">Discovery</button>
+    <button class="tab" data-view="policies">Policies</button>
+    <button class="tab" data-view="data">Data</button>
+    <button class="tab" data-view="audit">Audit</button>
+    <div class="rail-note">Everything here is synthetic.<br>Real pipeline: <b>not implemented</b>.</div>
+  </nav>
+
+  <section id="view-workspace" class="view active">
+    <div id="chat-box"></div>
+    <div id="chips">
+      <button class="chip" data-say="analyze DEMO-P001">analyze DEMO-P001</button>
+      <button class="chip" data-say="what rules does NeoAG enforce">what rules does NeoAG enforce</button>
+      <button class="chip" data-say="what data do we have">what data do we have</button>
+      <button class="chip" data-say="status">status</button>
+      <button class="chip" data-say="show top candidates">show top candidates</button>
+    </div>
+    <form id="chat-form">
+      <input id="chat-input" autocomplete="off" placeholder="Ask the demo assistant… e.g. analyze DEMO-P001">
+      <button type="submit">Send</button>
+    </form>
+  </section>
+
+  <section id="view-tasks" class="view">
+    <div class="panel newjob">
+      <h2>New mock analysis</h2>
+      <div class="row">
+        <label>Sample <select id="nj-sample"></select></label>
+        <label>Mode
+          <select id="nj-mode"><option value="auto">Automatic (required stages)</option>
+          <option value="advanced">Advanced (choose stages)</option></select></label>
+        <label>Execution mode
+          <select id="nj-exec"><option value="controlled">Controlled (ask at decisions)</option>
+          <option value="autonomous">Autonomous (validated defaults, recorded)</option></select></label>
+        <label class="chk"><input type="checkbox" id="nj-fail"> simulate missing stability tool (demo failure)</label>
+      </div>
+      <div id="nj-stages" class="stages hidden"></div>
+      <button id="nj-submit" class="primary">Request analysis…</button>
+      <p class="hint">Requests enter the approval queue - the agent cannot queue
+      execute-class work without a human click (policy POL-005). Both execution
+      modes keep identical validity gates; autonomy only auto-resolves decision
+      points to validated defaults and records each choice in the Decisions panel.</p>
+    </div>
+    <div id="job-list"></div>
+  </section>
+
+  <section id="view-results" class="view">
+    <div class="row"><label>Completed mock run <select id="res-job"></select></label></div>
+    <div id="res-meta"></div>
+    <div id="res-table"></div>
+  </section>
+
+  <section id="view-approvals" class="view"><div id="appr-list"></div></section>
+
+  <section id="view-decisions" class="view">
+    <div class="panel">
+      <h2>Pending decisions (controlled mode)</h2>
+      <div id="dec-pending"></div>
+    </div>
+    <div class="panel">
+      <h2>Decision history</h2>
+      <div id="dec-history"></div>
+    </div>
+  </section>
+
+  <section id="view-discovery" class="view">
+    <div class="panel">
+      <h2>SOTA tool discovery &amp; benchmarking (MOCK research)</h2>
+      <div class="row">
+        <label>Scope
+          <select id="res-scope"><option value="full">Full pipeline review</option>
+          <option value="targeted">Targeted review</option></select></label>
+        <label>Target
+          <select id="res-target">
+            <option value="presentation">Presentation (NetMHCpan/MHCflurry)</option>
+            <option value="stability">Stability (NetMHCstabpan)</option>
+            <option value="fusion">Fusion discovery</option>
+            <option value="hla_typing">HLA typing</option>
+          </select></label>
+        <button id="res-run" class="primary">Run mock research digest</button>
+      </div>
+      <p class="hint">Produces a labelled mock digest: no live literature search,
+      no downloads, no benchmarks. Literature-derived rows are always
+      separated from independently benchmarked rows (none exist yet).</p>
+      <div id="res-list"></div>
+    </div>
+    <div id="res-report"></div>
+  </section>
+
+  <section id="view-policies" class="view"><div id="pol-list"></div></section>
+
+  <section id="view-data" class="view"><div id="data-list"></div></section>
+
+  <section id="view-audit" class="view"><div id="audit-list"></div></section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>
