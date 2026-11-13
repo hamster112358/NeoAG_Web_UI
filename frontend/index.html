@@ -3,119 +3,167 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NeoAG Assistant - MOCK PROTOTYPE</title>
+<title>NeoAG Workspace</title>
 <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-<div id="demo-banner">MOCK DATA PROTOTYPE &mdash; synthetic demo only. No real
-NeoAG pipeline and no patient data are connected.</div>
-<header>
-  <div class="brand"><span class="logo">N</span>
-    <div><h1>NeoAG Assistant</h1><p class="sub">conversational neoantigen workspace (demo)</p></div>
-  </div>
-  <div class="conn"><span id="conn-dot" class="dot"></span><span id="conn-text">connecting…</span></div>
-</header>
-<main>
-  <nav id="rail">
-    <button class="tab active" data-view="workspace">Chat</button>
-    <button class="tab" data-view="tasks">Tasks</button>
-    <button class="tab" data-view="results">Results</button>
-    <button class="tab" data-view="approvals">Approvals <span id="appr-count" class="count"></span></button>
-    <button class="tab" data-view="decisions">Decisions</button>
-    <button class="tab" data-view="discovery">Discovery</button>
-    <button class="tab" data-view="policies">Policies</button>
-    <button class="tab" data-view="data">Data</button>
-    <button class="tab" data-view="audit">Audit</button>
-    <div class="rail-note">Everything here is synthetic.<br>Real pipeline: <b>not implemented</b>.</div>
-  </nav>
-
-  <section id="view-workspace" class="view active">
-    <div id="chat-box"></div>
-    <div id="chips">
-      <button class="chip" data-say="analyze DEMO-P001">analyze DEMO-P001</button>
-      <button class="chip" data-say="what rules does NeoAG enforce">what rules does NeoAG enforce</button>
-      <button class="chip" data-say="what data do we have">what data do we have</button>
-      <button class="chip" data-say="status">status</button>
-      <button class="chip" data-say="show top candidates">show top candidates</button>
+<header id="topbar">
+  <div class="brand">
+    <div class="logo">N</div>
+    <div class="brand-text">
+      <span class="name">NeoAG</span>
+      <span class="tag">neoantigen workspace</span>
     </div>
-    <form id="chat-form">
-      <input id="chat-input" autocomplete="off" placeholder="Ask the demo assistant… e.g. analyze DEMO-P001">
-      <button type="submit">Send</button>
+  </div>
+  <div class="top-right">
+    <button id="agent-mode" class="pill interactive" title="Switch between the scripted demo agent and the real server-side CodeBuddy agent">Demo agent</button>
+    <span id="demo-pill" class="pill demo" title="Demonstration mode: synthetic data only. No real pipeline and no patient data are connected.">Demo mode</span>
+    <span class="conn"><span id="conn-dot" class="dot"></span><span id="conn-text">connecting</span></span>
+  </div>
+</header>
+
+<main id="shell">
+  <section id="agent-pane" aria-label="Agent conversation">
+    <div id="chat-log" class="chat-log"></div>
+    <form id="chat-form" autocomplete="off">
+      <textarea id="chat-input" rows="2"
+        placeholder="Describe your goal - e.g. analyze a sample, or tell the agent where your sequencing data are stored"></textarea>
+      <button id="chat-send" class="btn primary" type="submit">Send</button>
     </form>
   </section>
 
-  <section id="view-tasks" class="view">
-    <div class="panel newjob">
-      <h2>New mock analysis</h2>
-      <div class="row">
-        <label>Sample <select id="nj-sample"></select></label>
-        <label>Mode
-          <select id="nj-mode"><option value="auto">Automatic (required stages)</option>
-          <option value="advanced">Advanced (choose stages)</option></select></label>
-        <label>Execution mode
-          <select id="nj-exec"><option value="controlled">Controlled (ask at decisions)</option>
-          <option value="autonomous">Autonomous (validated defaults, recorded)</option></select></label>
-        <label class="chk"><input type="checkbox" id="nj-fail"> simulate missing stability tool (demo failure)</label>
-      </div>
-      <div id="nj-stages" class="stages hidden"></div>
-      <button id="nj-submit" class="primary">Request analysis…</button>
-      <p class="hint">Requests enter the approval queue - the agent cannot queue
-      execute-class work without a human click (policy POL-005). Both execution
-      modes keep identical validity gates; autonomy only auto-resolves decision
-      points to validated defaults and records each choice in the Decisions panel.</p>
+  <section id="work-pane" aria-label="Workspace">
+    <nav id="work-nav">
+      <button class="wtab active" data-view="tasks">Tasks</button>
+      <button class="wtab" data-view="results">Results</button>
+      <button class="wtab" data-view="discovery">Discovery</button>
+      <button class="wtab" data-view="help">Help</button>
+    </nav>
+    <div id="work-body">
+
+      <section id="view-tasks" class="wview active">
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-head">
+              <h2>New analysis</h2>
+              <span class="pill muted">demo engine</span>
+            </div>
+
+            <div class="block">
+              <label class="lbl">Sequencing data location</label>
+              <p class="hint">Tell the agent where your data live. Large sequencing files stay on the server - you describe the location, the agent proposes the input manifest, you confirm or correct it. No per-file hunting.</p>
+              <textarea id="man-desc" rows="2" placeholder="e.g. Sequencing data for case X are under /data/project-x - tumor DNA, matched normal DNA, and RNA-seq."></textarea>
+              <div class="btnrow">
+                <button id="man-propose" class="btn ghost">Propose manifest</button>
+              </div>
+              <div id="manifest-view"></div>
+            </div>
+
+            <div class="block">
+              <label class="lbl">Sample</label>
+              <select id="nj-sample"></select>
+              <label class="lbl">Stage plan</label>
+              <div id="nj-stages" class="stages"></div>
+              <label class="lbl">Execution mode</label>
+              <div class="mode-row" id="nj-exec-row">
+                <label class="mode-opt">
+                  <input type="radio" name="execmode" value="controlled" checked>
+                  <div><b>Controlled</b><span>blocks at decision points and asks you</span></div>
+                </label>
+                <label class="mode-opt">
+                  <input type="radio" name="execmode" value="autonomous">
+                  <div><b>Autonomous</b><span>validated defaults, every choice recorded</span></div>
+                </label>
+              </div>
+            </div>
+
+            <details class="adv" id="adv-block">
+              <summary>Advanced configuration <span id="adv-count" class="count"></span></summary>
+              <div id="adv-params"></div>
+              <p class="hint">Advanced options map onto real <code>open-neo run</code> flags. The demo engine does not consume them; they are stored with the job for review and reused verbatim when the real gateway is connected.</p>
+            </details>
+
+            <details class="adv">
+              <summary>Demonstration controls</summary>
+              <label class="chk"><input type="checkbox" id="nj-fail"> simulate missing stability tool (demo failure path)</label>
+            </details>
+
+            <div class="btnrow">
+              <button id="nj-submit" class="btn primary">Submit for approval</button>
+              <span class="hint">Execute-class work always requires a human approval click (POL-005), in both modes.</span>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h2>Analysis jobs</h2>
+              <div class="chiprow" id="kind-filter">
+                <button class="chip active" data-kind="">All</button>
+                <button class="chip" data-kind="analysis">Analysis</button>
+                <button class="chip" data-kind="discovery">Discovery</button>
+                <button class="chip" data-kind="diagnostic">Diagnostics</button>
+              </div>
+            </div>
+            <div id="job-list" class="joblist"></div>
+          </div>
+        </div>
+
+        <div id="job-detail" class="drawer hidden"></div>
+      </section>
+
+      <section id="view-results" class="wview">
+        <div class="card">
+          <div class="card-head">
+            <h2>Results</h2>
+            <label class="lbl">Completed run
+              <select id="res-job"></select></label>
+          </div>
+          <div id="res-meta"></div>
+          <div id="res-table"></div>
+        </div>
+      </section>
+
+      <section id="view-discovery" class="wview">
+        <div class="card">
+          <div class="card-head">
+            <h2>SOTA tool discovery &amp; benchmarking</h2>
+            <span class="pill muted">mock digests</span>
+          </div>
+          <div class="row">
+            <label class="lbl">Scope
+              <select id="res-scope">
+                <option value="full">Full pipeline review</option>
+                <option value="targeted">Targeted review</option>
+              </select></label>
+            <label class="lbl">Target
+              <select id="res-target">
+                <option value="presentation">Presentation</option>
+                <option value="stability">Stability</option>
+                <option value="fusion">Fusion discovery</option>
+                <option value="hla_typing">HLA typing</option>
+              </select></label>
+            <button id="res-run" class="btn primary">Run digest</button>
+          </div>
+          <p class="hint">Produces a labelled mock digest: no live literature search, no downloads, no benchmarks. Literature-derived rows are always separated from independently benchmarked rows (none exist yet).</p>
+          <div id="res-list"></div>
+        </div>
+        <div id="res-report"></div>
+      </section>
+
+      <section id="view-help" class="wview">
+        <div class="card">
+          <div class="card-head">
+            <h2>Help &amp; documentation</h2>
+            <div class="chiprow" id="help-tabs"></div>
+          </div>
+          <div id="help-doc" class="helpdoc"></div>
+        </div>
+      </section>
+
     </div>
-    <div id="job-list"></div>
   </section>
-
-  <section id="view-results" class="view">
-    <div class="row"><label>Completed mock run <select id="res-job"></select></label></div>
-    <div id="res-meta"></div>
-    <div id="res-table"></div>
-  </section>
-
-  <section id="view-approvals" class="view"><div id="appr-list"></div></section>
-
-  <section id="view-decisions" class="view">
-    <div class="panel">
-      <h2>Pending decisions (controlled mode)</h2>
-      <div id="dec-pending"></div>
-    </div>
-    <div class="panel">
-      <h2>Decision history</h2>
-      <div id="dec-history"></div>
-    </div>
-  </section>
-
-  <section id="view-discovery" class="view">
-    <div class="panel">
-      <h2>SOTA tool discovery &amp; benchmarking (MOCK research)</h2>
-      <div class="row">
-        <label>Scope
-          <select id="res-scope"><option value="full">Full pipeline review</option>
-          <option value="targeted">Targeted review</option></select></label>
-        <label>Target
-          <select id="res-target">
-            <option value="presentation">Presentation (NetMHCpan/MHCflurry)</option>
-            <option value="stability">Stability (NetMHCstabpan)</option>
-            <option value="fusion">Fusion discovery</option>
-            <option value="hla_typing">HLA typing</option>
-          </select></label>
-        <button id="res-run" class="primary">Run mock research digest</button>
-      </div>
-      <p class="hint">Produces a labelled mock digest: no live literature search,
-      no downloads, no benchmarks. Literature-derived rows are always
-      separated from independently benchmarked rows (none exist yet).</p>
-      <div id="res-list"></div>
-    </div>
-    <div id="res-report"></div>
-  </section>
-
-  <section id="view-policies" class="view"><div id="pol-list"></div></section>
-
-  <section id="view-data" class="view"><div id="data-list"></div></section>
-
-  <section id="view-audit" class="view"><div id="audit-list"></div></section>
 </main>
+<div id="toast" class="toast hidden" role="status"></div>
 <script src="/static/app.js"></script>
 </body>
 </html>

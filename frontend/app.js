@@ -1,474 +1,586 @@
-/* NeoAG web demo frontend - vanilla JS, no build step. */
+/* NeoAG Workspace - frontend logic (vanilla JS, no build step).
+   Data comes from /api/bootstrap + SSE. All writes go through the API;
+   the browser only renders server-persisted state. */
 "use strict";
-const S = { boot: null, openLogs: new Set(), lastAudit: [], resCache: {} };
 
-const $ = (sel, el = document) => el.querySelector(sel);
-const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
-const h = (tag, attrs = {}, ...kids) => {
-  const e = document.createElement(tag);
-  for (const [k, v] of Object.entries(attrs)) {
-    if (k === "class") e.className = v;
-    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
-    else if (k === "html") e.innerHTML = v;
-    else e.setAttribute(k, v);
-  }
-  for (const kid of kids.flat()) {
-    if (kid == null) continue;
-    e.append(kid.nodeType ? kid : document.createTextNode(kid));
-  }
-  return e;
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+const state = {
+  boot: null, params: null, view: "tasks", kindFilter: "",
+  jobDetail: null, helpDoc: null, resultsJob: null,
+  manifest: null, agentMode: "mock",
 };
-const api = async (path, opts) => {
-  const r = await fetch(path, opts);
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error || r.status + " " + r.statusText);
-  return j;
-};
-const post = (path, body) =>
-  api(path, { method: "POST", headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(body || {}) });
-const t = (iso) => (iso || "").replace("T", " ").replace(/\+.*$/, "");
+
+const LEGACY_NOTICE_RE = /^MOCK PROTOTYPE/;
+
+/* ---------------- API ---------------- */
+async function api(method, path, body) {
+  const opt = { method, headers: {} };
+  if (body !== undefined) {
+    opt.headers["Content-Type"] = "application/json";
+    opt.body = JSON.stringify(body);
+  }
+  const r = await fetch(path, opt);
+  const text = await r.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+  if (!r.ok) throw Object.assign(new Error(`HTTP ${r.status}`), { status: r.status, data });
+  return data;
+}
 
 function toast(msg, err) {
-  const el = h("div", { class: "disclaimer", style:
-    `position:fixed;right:16px;bottom:16px;z-index:9;${err ? "border-color:#e88;background:#fde3e0;color:#b42318" : ""}` }, msg);
-  document.body.append(el);
-  setTimeout(() => el.remove(), 4200);
+  const t = $("toast");
+  t.textContent = msg;
+  t.classList.toggle("err", !!err);
+  t.classList.remove("hidden");
+  clearTimeout(toast._h);
+  toast._h = setTimeout(() => t.classList.add("hidden"), 4200);
 }
 
-/* ---------- boot / SSE ---------- */
-async function boot() {
-  S.boot = await api("/api/bootstrap");
-  $("#conn-dot").classList.add("live");
-  $("#conn-text").textContent = "local demo server";
-  renderChat(); renderForm(); renderJobs(); renderApprovals();
-  renderDecisions(); renderPolicies(); renderData(); refreshResults();
-  refreshAudit(); renderResearch();
-}
-function connectSSE() {
-  const es = new EventSource("/api/stream");
-  let pending = null;
-  const refresh = () => {
-    clearTimeout(pending);
-    pending = setTimeout(async () => {
-      const b = await api("/api/bootstrap").catch(() => null);
-      if (!b) return;
-      S.boot = b;
-      renderChat(); renderJobs(); renderApprovals(); renderDecisions();
-      refreshResults(); refreshAudit(); renderResearch();
-    }, 250);
-  };
-  es.onopen = () => { $("#conn-dot").classList.add("live"); $("#conn-text").textContent = "local demo server"; };
-  es.onerror = () => { $("#conn-dot").classList.remove("live"); $("#conn-text").textContent = "reconnecting…"; };
-  es.onmessage = (m) => { const ev = JSON.parse(m.data); if (ev.type !== "hello") refresh(); };
-}
-
-/* ---------- chat ---------- */
-function badges(meta, role) {
-  const list = (meta && meta.badges) || (role === "user" ? [] : ["agent suggestion"]);
-  const cls = { "agent suggestion": "agent", "validated policy": "policy",
-                "mock prototype": "sys" };
-  const out = list.map(b => h("span", { class: "badge " + (cls[b] || "sys") }, b));
-  if (meta && meta.policy_id) out.push(h("span", { class: "badge src" },
-    `${meta.policy_id} - ${meta.source}`));
-  return out;
-}
-function renderChat() {
-  const box = $("#chat-box");
-  box.innerHTML = "";
-  for (const m of S.boot.messages) {
-    const role = m.role === "user" ? "user" : m.role;
-    box.append(h("div", { class: "msg " + role },
-      m.role === "user" ? null : h("div", { class: "meta" }, badges(m.meta, m.role)),
-      m.text));
-  }
-  box.scrollTop = box.scrollHeight;
-}
-$("#chat-form").addEventListener("submit", async (ev) => {
-  ev.preventDefault();
-  const inp = $("#chat-input"), text = inp.value.trim();
-  if (!text) return;
-  inp.value = "";
-  try {
-    const r = await post("/api/chat", { text });
-    S.boot.messages.push(...r.messages);
-    renderChat(); renderJobs(); renderApprovals();
-  } catch (e) { toast("chat failed: " + e.message, true); }
-});
-$("#chips").addEventListener("click", (ev) => {
-  const b = ev.target.closest(".chip");
-  if (!b) return;
-  $("#chat-input").value = b.dataset.say;
-  $("#chat-form").dispatchEvent(new Event("submit"));
-});
-
-/* ---------- tasks ---------- */
-function renderForm() {
-  const sel = $("#nj-sample");
-  sel.innerHTML = "";
-  for (const s of S.boot.samples)
-    sel.append(h("option", { value: s.id }, `${s.id} - ${s.assay}`));
-  const box = $("#nj-stages");
-  if (!box.childElementCount) {
-    for (const st of S.boot.stages) {
-      box.append(h("label", {},
-        h("input", { type: "checkbox", value: st.id }),
-        st.name,
-        st.required ? null : h("span", { class: "opt" }, " (optional)")));
+/* ---------------- markdown (help docs) ---------------- */
+function mdToHtml(md) {
+  const out = [];
+  let inCode = false, inList = false;
+  for (const raw of md.split("\n")) {
+    const line = raw;
+    if (line.startsWith("```")) {
+      if (inCode) { out.push("</pre>"); inCode = false; }
+      else { if (inList) { out.push("</ul>"); inList = false; }
+        out.push("<pre>"); inCode = true; }
+      continue;
     }
-    box.addEventListener("change", syncStageDefaults);
+    if (inCode) { out.push(esc(line)); continue; }
+    const h = line.match(/^(#{1,4})\s+(.*)/);
+    if (h) {
+      if (inList) { out.push("</ul>"); inList = false; }
+      const lvl = Math.min(3, h[1].length + 1);
+      out.push(`<h${lvl}>${mdInline(h[2])}</h${lvl}>`); continue;
+    }
+    const li = line.match(/^\s*[-*]\s+(.*)/);
+    if (li) {
+      if (!inList) { out.push("<ul>"); inList = true; }
+      out.push(`<li>${mdInline(li[1])}</li>`); continue;
+    }
+    if (inList) { out.push("</ul>"); inList = false; }
+    if (/^\s*\|/.test(line)) { out.push(`<p>${mdInline(line.replace(/\|/g, " "))}</p>`); continue; }
+    if (line.trim() === "") { continue; }
+    const bq = line.match(/^>\s?(.*)/);
+    if (bq) { out.push(`<blockquote>${mdInline(bq[1])}</blockquote>`); continue; }
+    out.push(`<p>${mdInline(line)}</p>`);
   }
-  $("#nj-mode").value = S.boot.settings.mode || "auto";
-  syncStageDefaults();
+  if (inList) out.push("</ul>");
+  if (inCode) out.push("</pre>");
+  return out.join("\n");
 }
-function syncStageDefaults() {
-  const adv = $("#nj-mode").value === "advanced";
-  $("#nj-stages").classList.toggle("hidden", !adv);
-  if (!adv) for (const cb of $$("#nj-stages input"))
-    cb.checked = S.boot.stages.find(s => s.id === cb.value).required;
+function mdInline(s) {
+  return esc(s)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1 ($2)");
 }
-$("#nj-mode").addEventListener("change", () => {
-  syncStageDefaults();
-  post("/api/settings", { mode: $("#nj-mode").value });
-});
-$("#nj-submit").addEventListener("click", async () => {
-  const stage_ids = $$("#nj-stages input").filter(c => c.checked).map(c => c.value);
+
+/* ---------------- boot ---------------- */
+async function boot() {
   try {
-    await post("/api/jobs", {
-      sample_id: $("#nj-sample").value, stage_ids,
-      mode: $("#nj-mode").value,
-      execution_mode: $("#nj-exec").value,
-      simulate_failure: $("#nj-fail").checked,
-    });
-    toast("Mock analysis requested - it is now waiting in the Approvals panel.");
+    state.boot = await api("GET", "/api/bootstrap");
+    state.agentMode = state.boot.agent_mode || "mock";
+    state.params = await api("GET", "/api/params");
+    renderAgentBadge();
+    renderChat();
+    renderTasks();
+    renderJobs();
+    renderResults();
+    renderDiscovery();
+    renderHelp();
+    connectSSE();
+  } catch (e) {
+    if (e.status === 401) return; // browser shows the login prompt
+    toast("boot failed: " + e.message, true);
+  }
+}
+
+let es = null;
+function connectSSE() {
+  if (es) es.close();
+  es = new EventSource("/api/stream");
+  es.onopen = () => { $("conn-dot").className = "dot on"; $("conn-text").textContent = "live"; };
+  es.onerror = () => { $("conn-dot").className = "dot off"; $("conn-text").textContent = "reconnecting"; };
+  es.onmessage = (m) => {
+    let ev = {};
+    try { ev = JSON.parse(m.data); } catch { return; }
+    if (ev.type === "chat") refreshChat();
+    else if (ev.type === "job" || ev.type === "approval") { refreshJobs(); refreshChat(); }
+    else if (ev.type === "research") refreshDiscovery();
+    else if (ev.type === "manifest") refreshManifests();
+    else if (ev.type === "agent_mode") renderAgentBadge();
+    else if (ev.type === "settings") refreshTasks();
+  };
+}
+
+/* ---------------- chat ---------------- */
+function msgHtml(m) {
+  const meta = m.meta || {};
+  const badges = (meta.badges || []).map((b) =>
+    `<span class="badge">${esc(b)}</span>`).join("");
+  return `<div class="msg ${esc(m.role)}">
+    <div class="meta"><span>${esc(m.role)}</span>${badges}</div>
+    <div class="body">${esc(m.text)}</div></div>`;
+}
+
+function renderChat() {
+  const log = $("chat-log");
+  const msgs = (state.boot.messages || []).filter((m) =>
+    !(m.meta && Array.isArray(m.meta.badges) &&
+      m.meta.badges.includes("mock prototype")) &&
+    !LEGACY_NOTICE_RE.test(m.text || ""));
+  const start = state.boot.messages.length < 3;
+  let html = msgs.map(msgHtml).join("");
+  if (start) {
+    html += `<div class="quickstart">
+      <div class="qs-title">Quick starts</div>
+      <button data-say="analyze DEMO-P001">Run a demo analysis of sample DEMO-P001</button>
+      <button data-say="what rules does NeoAG enforce">Explain the scientific policy rules</button>
+      <button data-say="show top candidates">Show top-ranked candidates</button>
+    </div>`;
+  }
+  const pend = (state.boot.approvals || []).filter((a) => a.state === "pending");
+  for (const a of pend) {
+    html += `<div class="inline-card">
+      <div class="q">Approval required</div>
+      <div class="body" style="font-size:12.5px;color:var(--text-2)">${esc(a.detail || a.action)}</div>
+      <div class="btnrow">
+        <button class="btn primary sm" data-appr="${esc(a.id)}" data-ok="1">Approve</button>
+        <button class="btn danger sm" data-appr="${esc(a.id)}">Deny</button>
+      </div></div>`;
+  }
+  const pdec = (state.boot.decisions || []).filter((d) => d.status === "pending");
+  for (const d of pdec.slice(0, 4)) {
+    html += `<div class="inline-card">
+      <div class="q">${esc(d.question)}</div>
+      <div class="opts">${(d.options || []).map((o) =>
+        `<button class="opt" data-dec="${esc(d.id)}" data-choice="${esc(o.id)}">${esc(o.label)}${o.validated ? '<span class="validated">validated default</span>' : ""}</button>`).join("")}</div>
+      <div class="why">${esc(d.evidence ? d.evidence.join(" - ") : "")}</div></div>`;
+  }
+  log.innerHTML = html;
+  log.scrollTop = log.scrollHeight;
+}
+
+$("chat-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const text = $("chat-input").value.trim();
+  if (!text) return;
+  $("chat-input").value = "";
+  try {
+    await api("POST", "/api/chat", { text });
+    await refreshChat();
+  } catch (e) { toast("send failed: " + e.message, true); }
+});
+async function refreshChat() {
+  try {
+    state.boot.messages = (await api("GET", "/api/bootstrap")).messages;
+    renderChat();
+  } catch (e) { /* transient */ }
+}
+
+/* ---------------- tasks ---------------- */
+function renderTasks() {
+  const sel = $("nj-sample");
+  sel.innerHTML = (state.boot.samples || []).map((s) =>
+    `<option value="${esc(s.id)}">${esc(s.id)} - ${esc(s.label)}</option>`).join("");
+  const stages = $("nj-stages");
+  stages.innerHTML = (state.boot.stages || []).map((s) => {
+    const dep = (s.depends_on || []).length
+      ? `needs: ${s.depends_on.join(", ")}` : "independent entry";
+    return `<label class="stage-row">
+      <input type="checkbox" data-stage="${esc(s.id)}" ${s.required ? "checked" : ""} ${s.required ? "disabled" : ""}>
+      <span>${esc(s.name)}</span>
+      ${s.required ? '<span class="req">required</span>' : ""}
+      <span class="dep">${esc(dep)}</span></label>`;
+  }).join("");
+  $("adv-count").textContent =
+    `${state.params ? state.params.groups.length : 0} parameter groups from the real pipeline code`;
+  renderAdvanced();
+}
+
+function renderAdvanced() {
+  const host = $("adv-params");
+  if (!state.params) { host.innerHTML = "<p class='hint'>inventory unavailable</p>"; return; }
+  host.innerHTML = state.params.groups.map((g) => `
+    <div class="pgroup ${g.expert ? "expert" : ""}">
+      <h3>${esc(g.group)}</h3>
+      ${g.items.map((p) => pitemHtml(p)).join("")}
+    </div>`).join("");
+  host.querySelectorAll("input,select").forEach((el) => {
+    el.addEventListener("change", collectAdvanced);
+  });
+  collectAdvanced();
+}
+
+function pitemHtml(p) {
+  let ctrl;
+  if (p.type === "choice") {
+    ctrl = `<select data-param="${esc(p.id)}">${(p.values || []).map((v) =>
+      `<option>${esc(v)}</option>`).join("")}</select>`;
+  } else if (p.type === "flag") {
+    ctrl = `<input type="checkbox" data-param="${esc(p.id)}">`;
+  } else {
+    ctrl = `<input type="text" data-param="${esc(p.id)}" placeholder="${esc(p.default || "")}">`;
+  }
+  return `<div class="pitem">
+    <div><div class="pname">${esc(p.label)}</div><div class="pdef">default: ${esc(p.default ?? "none")}</div></div>
+    <div>${ctrl}</div>
+    <div class="pdesc">${esc(p.desc || "")}</div>
+    <div class="psrc">${esc(p.source || "")}</div>
+  </div>`;
+}
+
+function collectAdvanced() {
+  const cfg = {};
+  document.querySelectorAll("[data-param]").forEach((el) => {
+    if (el.type === "checkbox") {
+      if (el.checked) cfg[el.dataset.param] = true;
+    } else if (el.value !== "") {
+      cfg[el.dataset.param] = el.value;
+    }
+  });
+  state.requestedConfig = cfg;
+  return cfg;
+}
+
+/* manifest */
+$("man-propose").addEventListener("click", async () => {
+  const desc = $("man-desc").value.trim();
+  if (!desc) { toast("describe the data location first", true); return; }
+  try {
+    const m = await api("POST", "/api/manifests/propose", { description: desc });
+    state.manifest = m;
+    renderManifest();
+    toast("manifest proposed - review below");
+  } catch (e) { toast("propose failed: " + e.message, true); }
+});
+function renderManifest() {
+  const m = state.manifest;
+  const host = $("manifest-view");
+  if (!m) { host.innerHTML = ""; return; }
+  const rows = (m.proposal.inputs || []).map((i) => `
+    <tr><td><b>${esc(i.role)}</b></td><td><code>${esc(i.path)}</code></td>
+    <td>${esc(i.confidence)}</td><td>${esc(i.basis)}</td></tr>`).join("");
+  const amb = (m.proposal.ambiguous || []).map((x) => `<li>${esc(x)}</li>`).join("");
+  const mis = (m.proposal.missing || []).map((x) => `<li>${esc(x)}</li>`).join("");
+  host.innerHTML = `<div class="manifest-card">
+    <div class="mnote">${esc(m.proposal.note)}</div>
+    <div class="tablewrap"><table class="data">
+      <thead><tr><th>Role</th><th>Path</th><th>Confidence</th><th>Basis</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    ${mis ? `<p class="hint">Missing: <ul>${mis}</ul></p>` : ""}
+    ${amb ? `<p class="hint">Ambiguous: <ul>${amb}</ul></p>` : ""}
+    ${m.status === "proposed"
+      ? `<div class="btnrow">
+           <button class="btn primary sm" id="man-confirm">Confirm manifest</button>
+           <span class="hint">or correct it in chat before confirming</span>
+         </div>`
+      : `<span class="pill ok">confirmed</span>`}
+  </div>`;
+  const cb = $("man-confirm");
+  if (cb) cb.addEventListener("click", async () => {
+    try {
+      const m2 = await api("POST", `/api/manifests/${m.id}/confirm`, { edits: {} });
+      state.manifest = m2; renderManifest();
+    } catch (e) { toast("confirm failed: " + e.message, true); }
+  });
+}
+async function refreshManifests() {
+  state.manifest = (state.manifest && state.manifest.id)
+    ? await api("GET", `/api/manifests/${state.manifest.id}`) : null;
+  renderManifest();
+}
+
+/* submit */
+$("nj-submit").addEventListener("click", async () => {
+  const sample = $("nj-sample").value;
+  const stage_ids = [...document.querySelectorAll("[data-stage]")]
+    .filter((c) => c.checked).map((c) => c.dataset.stage);
+  const execution_mode = document.querySelector(
+    'input[name="execmode"]:checked').value;
+  const simulate_failure = $("nj-fail").checked;
+  const body = { sample_id: sample, stage_ids, mode: "auto",
+                 execution_mode, simulate_failure,
+                 kind: "analysis", requested_config: collectAdvanced() };
+  if (state.manifest && state.manifest.status === "confirmed")
+    body.manifest_id = state.manifest.id;
+  try {
+    const res = await api("POST", "/api/jobs", body);
+    toast(`job ${res.job_id} blocked on approval - approve it in the chat pane`);
+    await refreshJobs(); refreshChat();
   } catch (e) { toast("submit failed: " + e.message, true); }
 });
 
-const CTR = (j) => {
-  const btns = [];
-  if (j.state === "running") {
-    btns.push(h("button", { class: "small", onclick: () => act(`/api/jobs/${j.id}/pause`) }, "Pause"));
-    btns.push(h("button", { class: "small danger", onclick: () => act(`/api/jobs/${j.id}/cancel`) }, "Stop"));
-  } else if (j.state === "paused") {
-    btns.push(h("button", { class: "small", onclick: () => act(`/api/jobs/${j.id}/resume`) }, "Resume"));
-    btns.push(h("button", { class: "small danger", onclick: () => act(`/api/jobs/${j.id}/cancel`) }, "Stop"));
-  } else if (["queued", "blocked"].includes(j.state)) {
-    btns.push(h("button", { class: "small danger", onclick: () => act(`/api/jobs/${j.id}/cancel`) }, "Cancel request"));
-  }
-  btns.push(h("button", { class: "small", onclick: () => toggleLog(j.id) }, "Log"));
-  return btns;
-};
-async function act(path) {
-  try { await post(path, {}); } catch (e) { toast(e.message, true); }
-}
-async function toggleLog(id) {
-  if (S.openLogs.has(id)) S.openLogs.delete(id); else S.openLogs.add(id);
-  renderJobs();
-}
-function modeCtl(j) {
-  const cur = j.spec.execution_mode || "controlled";
-  if (["completed", "failed", "cancelled"].includes(j.state))
-    return h("span", { class: "sub" }, `exec: ${cur}`);
-  return h("select", { value: cur, title:
-      "Switch execution mode - applies at the next stage boundary and is " +
-      "recorded in the decision history",
-    onchange: async (ev) => {
-      try { await post(`/api/jobs/${j.id}/mode`, { mode: ev.target.value }); }
-      catch (e) { toast(e.message, true); ev.target.value = cur; }
-    } },
-    h("option", { value: "controlled" }, "exec: controlled"),
-    h("option", { value: "autonomous" }, "exec: autonomous"));
-}
-async function renderJobs() {
-  const list = $("#job-list");
-  list.innerHTML = "";
-  for (const j of S.boot.jobs) {
-    const card = h("div", { class: "card job" },
-      h("div", { class: "head" },
-        h("h3", {}, j.id),
-        h("span", { class: "pill " + j.state }, j.state),
-        h("span", { class: "sub" }, `${j.sample_id} - ${j.spec.mode || "?"} settings - ` +
-          `${(j.spec.stage_ids || []).length} stages`)),
-      h("div", { class: "bar" }, h("i", { style: `width:${j.progress || 0}%` })),
-      h("div", { class: "sub" },
-        j.stage ? `stage: ${j.stage} - ${j.progress}%` :
-        j.error ? j.error : `created ${t(j.created_at)}${j.finished_at ? " - finished " + t(j.finished_at) : ""}`),
-      h("div", { class: "ctl" }, CTR(j), modeCtl(j)));
-    if (S.openLogs.has(j.id)) {
-      const log = h("div", { class: "log", id: "log-" + j.id }, "loading…");
-      card.append(log);
-      const evs = await api(`/api/jobs/${j.id}/events`).catch(() => []);
-      log.textContent = evs.map(e => `[${t(e.ts).slice(11)}] ${e.text}`).join("\n") || "(no events)";
-      log.scrollTop = log.scrollHeight;
-    }
-    list.append(card);
-  }
+/* ---------------- jobs ---------------- */
+function statusPill(st) {
+  const cls = { completed: "ok", running: "accent", queued: "accent",
+                blocked: "warn", paused: "warn", failed: "danger",
+                cancelled: "muted" }[st] || "muted";
+  return `<span class="pill ${cls}">${esc(st)}</span>`;
 }
 
-/* ---------- results ---------- */
-async function refreshResults() {
-  const sel = $("#res-job");
-  const done = S.boot.jobs.filter(j => j.state === "completed");
-  const cur = sel.value;
-  sel.innerHTML = "";
-  if (!done.length) {
-    sel.append(h("option", { value: "" }, "(no completed mock runs yet)"));
-    $("#res-meta").innerHTML = ""; $("#res-table").innerHTML = "";
+function renderJobs() {
+  const host = $("job-list");
+  const kind = state.kindFilter;
+  const jobs = (state.boot.jobs || []).filter((j) => !kind || j.kind === kind);
+  if (!jobs.length) {
+    host.innerHTML = `<div class="empty">No jobs in this category yet.</div>`;
     return;
   }
-  for (const j of done)
-    sel.append(h("option", { value: j.id }, `${j.id} - ${j.sample_id}`));
-  sel.value = done.some(j => j.id === cur) ? cur : done[0].id;
-  await showResults(sel.value);
-}
-$("#res-job") && $("#res-job").addEventListener("change", e => showResults(e.target.value));
-async function showResults(id) {
-  if (!id) return;
-  let r = S.resCache[id];
-  if (!r) { r = await api("/api/results/" + id).catch(() => null); if (r) S.resCache[id] = r; }
-  if (!r) return;
-  $("#res-meta").innerHTML = "";
-  $("#res-meta").append(
-    h("div", { class: "disclaimer" }, r.disclaimer),
-    r.production_release === false ? h("div", { class: "disclaimer",
-        style: "border-color:#e88;background:#fde3e0;color:#b42318" },
-      "production_release: false - " + r.release_note) : null,
-    r.production_release === true ? h("div", { class: "sub" },
-      "production_release: true - " + r.release_note) : null,
-    h("div", { class: "prov" },
-      `provenance: job=${r.provenance.job_id}  sample=${r.provenance.sample}  ` +
-      `engine=${r.provenance.engine}  exec=${r.provenance.execution_mode}  ` +
-      `dataset=${r.dataset_version}  seed=${r.provenance.generator_seed}`));
-  const cols = [["rank", "#"], ["peptide", "Peptide"], ["gene", "Gene (synthetic)"],
-    ["branch", "Branch"], ["hla", "HLA"], ["pred_el_rank_pct", "pred EL %rank"],
-    ["pred_stability_rank", "pred stability"], ["pred_cleavage_score", "pred cleavage"],
-    ["pred_immunogenicity", "pred immuno"], ["safety_normal_hits", "safety hits"],
-    ["rna_expr_tpm_mock", "expr TPM (mock)"], ["pred_ccf_pct", "pred CCF %"],
-    ["mock_combined_score", "mock score"]];
-  const table = h("table", {},
-    h("thead", {}, h("tr", {}, cols.map(([, l]) => h("th", {}, l)), h("th", {}, "Evidence summary (mock)"))),
-    h("tbody", {}, r.candidates.map(c => h("tr", {},
-      cols.map(([k, l]) => h("td", { class: typeof c[k] === "number" ? "num" : "" }, String(c[k]))),
-      h("td", { class: "sub" }, c.evidence_summary)))));
-  $("#res-table").innerHTML = "";
-  $("#res-table").append(table);
+  host.innerHTML = jobs.map((j) => `
+    <div class="job-row" data-job="${esc(j.id)}">
+      <div class="jr-top">
+        <span class="jr-id">${esc(j.id)}</span>
+        <span class="jr-sample">${esc(j.sample_id)}</span>
+        <span class="pill muted">${esc(j.kind)}</span>
+        ${statusPill(j.state)}
+      </div>
+      <div class="jr-meta">${esc(j.stage || "")} ${esc(j.error || "")}</div>
+      <div class="progress"><i style="width:${j.progress || 0}%"></i></div>
+    </div>`).join("");
+  host.querySelectorAll("[data-job]").forEach((el) =>
+    el.addEventListener("click", () => openJob(el.dataset.job)));
 }
 
-/* ---------- approvals ---------- */
-function renderApprovals() {
-  const list = $("#appr-list");
-  list.innerHTML = "";
-  const pend = S.boot.approvals.filter(a => a.state === "pending");
-  $("#appr-count").textContent = pend.length || "";
-  $("#appr-count").style.display = pend.length ? "" : "none";
-  if (!S.boot.approvals.length) {
-    list.append(h("div", { class: "panel" }, "No approvals yet. Request an analysis in the Tasks panel or ask the assistant to \"analyze DEMO-P001\"."));
-    return;
-  }
-  for (const a of S.boot.approvals) {
-    const card = h("div", { class: "card appr" + (a.state === "pending" ? " pending" : "") },
-      h("div", { class: "head" },
-        h("h3", {}, a.id),
-        h("span", { class: "pill " + (a.state === "pending" ? "blocked" : a.state === "approved" ? "completed" : "failed") }, a.state)),
-      h("p", {}, a.detail),
-      h("p", { class: "sub" }, `action: ${a.action} - risk: ${a.risk} - job: ${a.job_id} - created ${t(a.created_at)}`));
-    if (a.state === "pending") card.append(h("div", { class: "actions" },
-      h("button", { class: "primary small", onclick: () => decide(a.id, true) }, "Approve"),
-      h("button", { class: "danger small", onclick: () => decide(a.id, false) }, "Deny")));
-    else card.append(h("p", { class: "sub" }, `decided ${t(a.decided_at)} by ${a.decided_by}`));
-    list.append(card);
-  }
-}
-async function decide(id, approve) {
-  try { await post("/api/approvals/" + id, { approve }); }
-  catch (e) { toast(e.message, true); }
-}
-
-/* ---------- decisions (persistent decision history) ---------- */
-function decisionCard(d) {
-  return h("div", { class: "card appr pending" },
-    h("div", { class: "head" },
-      h("h3", {}, d.id),
-      h("span", { class: "pill blocked" }, d.status)),
-    h("p", {}, d.question),
-    h("p", { class: "sub" },
-      `job: ${d.job_id} - stage: ${d.stage} - type: ${d.decision_type}` +
-      (d.policy_id ? ` - policy: ${d.policy_id} (${d.policy_version})` : "")),
-    (d.evidence || []).length ? h("p", { class: "sub" },
-      "evidence: " + d.evidence.join("; ")) : null,
-    h("div", { class: "actions" },
-      (d.options || []).map(o => h("button",
-        { class: "small " + (o.validated ? "primary" : ""),
-          title: o.validated ? "validated default" :
-                 "alternative (recorded as an override)",
-          onclick: () => resolveDec(d.id, o.id) },
-        (o.validated ? "[default] " : "[alt] ") + o.id))));
-}
-async function resolveDec(id, choice) {
-  try { await post(`/api/decisions/${id}/resolve`, { choice }); }
-  catch (e) { toast(e.message, true); }
-}
-function renderDecisions() {
-  const ds = S.boot.decisions || [];
-  const pend = ds.filter(d => d.status === "pending");
-  const pendBox = $("#dec-pending");
-  pendBox.innerHTML = "";
-  if (!pend.length) pendBox.append(h("div", { class: "hint" },
-    "No open decisions. In Controlled mode the run pauses at each decision " +
-    "point (input mapping, gate parameters, stage failures) and the options " +
-    "appear here; in Autonomous mode the engine resolves them to validated " +
-    "defaults and each choice is recorded in the history below."));
-  for (const d of pend) pendBox.append(decisionCard(d));
-  const hist = $("#dec-history");
-  hist.innerHTML = "";
-  if (!ds.length) {
-    hist.append(h("div", { class: "hint" }, "Decision history is empty."));
-    return;
-  }
-  hist.append(h("table", {},
-    h("thead", {}, h("tr", {},
-      ["time", "job", "stage", "type", "options considered", "chosen",
-       "rationale", "evidence", "policy", "decided by", "status"]
-      .map(x => h("th", {}, x)))),
-    h("tbody", {}, ds.map(d => h("tr", {},
-      h("td", {}, t(d.decided_at || d.ts)),
-      h("td", { class: "sub" }, d.job_id),
-      h("td", {}, d.stage),
-      h("td", {}, d.decision_type),
-      h("td", { class: "sub" }, (d.options || []).map(o =>
-        (o.validated ? "[default] " : "[alt] ") + o.id + ": " + o.label)
-        .join(" | ")),
-      h("td", {}, d.chosen || "-"),
-      h("td", { class: "sub" }, d.rationale || "-"),
-      h("td", { class: "sub" }, (d.evidence || []).join("; ")),
-      h("td", { class: "sub" }, (d.policy_id || "-") +
-        (d.policy_version ? ` (${d.policy_version})` : "")),
-      h("td", {}, d.decided_by || "-"),
-      h("td", {}, h("span", { class: "pill " + d.status }, d.status)))))));
-}
-
-/* ---------- discovery (mock research digests) ---------- */
-function renderResearch() {
-  const list = $("#res-list");
-  list.innerHTML = "";
-  const rs = S.boot.research || [];
-  if (!rs.length) {
-    list.append(h("div", { class: "hint" },
-      "No mock research digests yet. Pick a scope and target above, then run - " +
-      "the digest is static example content, no network access."));
-    return;
-  }
-  for (const r of rs)
-    list.append(h("div", { class: "card" },
-      h("div", { class: "head" },
-        h("h3", {}, r.id),
-        h("span", { class: "pill " + r.status }, r.status)),
-      h("p", { class: "sub" },
-        `scope: ${r.scope} - target: ${r.target} - started ${t(r.created_at)}` +
-        (r.finished_at ? ` - finished ${t(r.finished_at)}` : "")),
-      h("button", { class: "small", onclick: () => showResearch(r.id) },
-        "Open report")));
-}
-$("#res-run") && $("#res-run").addEventListener("click", async () => {
+async function refreshJobs() {
   try {
-    const r = await post("/api/research", {
-      scope: $("#res-scope").value, target: $("#res-target").value });
-    toast("Mock research digest queued: " + r.research_id +
-          " - static example content, no live research is connected.");
-    renderResearch();
-  } catch (e) { toast(e.message, true); }
-});
-async function showResearch(id) {
-  const r = await api("/api/research/" + id).catch(e => {
-    toast(e.message, true); return null; });
-  if (!r) return;
-  const rep = r.report;
-  const box = $("#res-report");
-  box.innerHTML = "";
-  if (!rep) {
-    box.append(h("p", { class: "sub" },
-      "report not ready yet (status: " + r.status + ")"));
+    const b = await api("GET", "/api/bootstrap");
+    state.boot.jobs = b.jobs; state.boot.approvals = b.approvals;
+    state.boot.decisions = b.decisions;
+    renderJobs(); renderChat();
+  } catch (e) { /* transient */ }
+}
+
+document.querySelectorAll("#kind-filter .chip").forEach((c) =>
+  c.addEventListener("click", () => {
+    document.querySelectorAll("#kind-filter .chip").forEach((x) =>
+      x.classList.remove("active"));
+    c.classList.add("active");
+    state.kindFilter = c.dataset.kind;
+    renderJobs();
+  }));
+
+async function openJob(id) {
+  let detail;
+  try { detail = await api("GET", `/api/jobs/${id}/events`); }
+  catch (e) { toast("cannot open job: " + e.message, true); return; }
+  const job = (state.boot.jobs || []).find((j) => j.id === id);
+  let decisions = [];
+  try { decisions = (await api("GET", `/api/decisions?job_id=${id}`)).decisions; }
+  catch { /* optional */ }
+  const jobEl = $("job-detail");
+  const running = job && job.state === "running";
+  jobEl.classList.remove("hidden");
+  jobEl.innerHTML = `
+    <button class="btn sm ghost close" id="jd-close">Close</button>
+    <h2>${esc(job ? job.sample_id : id)}</h2>
+    <div class="btnrow">${job ? statusPill(job.state) : ""}
+      <span class="pill muted">${esc(job ? job.kind : "?")}</span></div>
+    <section><h3>Controls</h3><div class="btnrow">
+      <button class="btn sm" id="jd-pause" ${running ? "" : "disabled"}>Pause</button>
+      <button class="btn sm" id="jd-resume" ${job && job.state === "paused" ? "" : "disabled"}>Resume</button>
+      <button class="btn sm danger" id="jd-cancel"
+        ${job && !["completed", "failed", "cancelled"].includes(job.state) ? "" : "disabled"}>Cancel</button>
+    </div></section>
+    <section><h3>Requested configuration</h3>
+      <div class="kv">${Object.entries((job && job.spec &&
+        job.spec.requested_config) || {})
+        .map(([k, v]) => `<div class="k">${esc(k)}</div><div>${esc(v)}</div>`).join("") ||
+        '<div class="hint">defaults only</div>'}</div></section>
+    <section><h3>Decision history</h3><div class="timeline">${decisions.map((d) => `
+      <div class="tl-row"><span class="tl-ts">${esc(d.ts || "")}</span>
+        <span class="tl-kind">${esc(d.decision_type || "")}</span>
+        <span>${esc(d.question || "")} -> <b>${esc(d.chosen || "pending")}</b></span>
+      </div>`).join("") || '<div class="hint">no decisions recorded</div>'}</div></section>
+    <section><h3>Live events</h3><div class="logview">${detail.slice(0, 120)
+      .map((e) => `${esc(e.ts || "")} ${esc(e.kind || "")} ${esc(e.text || "")}`)
+      .join("\n")}</div></section>`;
+  $("jd-close").addEventListener("click", () => jobEl.classList.add("hidden"));
+  const pc = $("jd-pause"), rc = $("jd-resume"), cc = $("jd-cancel");
+  pc.addEventListener("click", () => api("POST", `/api/jobs/${id}/pause`, {}).then(refreshJobs));
+  rc.addEventListener("click", () => api("POST", `/api/jobs/${id}/resume`, {}).then(refreshJobs));
+  cc.addEventListener("click", () => api("POST", `/api/jobs/${id}/cancel`, {}).then(refreshJobs));
+}
+
+/* ---------------- results ---------------- */
+function renderResults() {
+  const done = (state.boot.jobs || []).filter((j) => j.state === "completed");
+  $("res-job").innerHTML = done.map((j) =>
+    `<option value="${esc(j.id)}">${esc(j.id)} - ${esc(j.sample_id)}</option>`).join("");
+  if (!done.length) {
+    $("res-meta").innerHTML = `<div class="empty">No completed runs yet.</div>`;
+    $("res-table").innerHTML = "";
     return;
   }
-  box.append(h("div", { class: "disclaimer" }, rep.disclaimer));
-  box.append(h("p", { class: "sub" },
-    `scope: ${rep.scope} - target: ${rep.target}`));
-  box.append(h("p", { class: "sub" },
-    "availability classes: " + rep.availability_classes_legend));
-  const cols = ["tool", "version", "availability_class", "license",
-    "source_citation", "publication_year", "evidence_quality",
-    "accuracy_example", "perf_example", "io_compat", "maintenance",
-    "notes"];
-  box.append(h("table", {},
-    h("thead", {}, h("tr", {}, cols.map(c => h("th", {}, c)),
-      h("th", {}, "current in NeoAG"), h("th", {}, "basis"),
-      h("th", {}, "independently benchmarked"))),
-    h("tbody", {}, rep.comparison.map(row => h("tr", {},
-      cols.map(c => h("td", { class: c === "publication_year" ? "num" : "sub" },
-        String(row[c]))),
-      h("td", {}, row.current_in_neoag ? "yes" : "no"),
-      h("td", { class: "sub" }, row.basis),
-      h("td", {}, row.independently_benchmarked ? "yes" :
-        "NO - no independent benchmark exists yet"))))));
-  box.append(h("div", { class: "card" },
-    h("p", {}, h("strong", {}, "recommendation: "),
-      rep.recommendation.verdict),
-    h("p", { class: "sub" },
-      "required experiments before any adoption:"),
-    h("ol", {}, rep.recommendation.experiments_before_adoption
-      .map(x => h("li", {}, x)))));
-  box.append(h("p", { class: "sub" },
-    `provenance: engine=${rep.provenance.engine}  ` +
-    `dataset=${rep.provenance.dataset_version}  ` +
-    `live_sources_connected=${rep.provenance.live_sources_connected}`));
+  if (!state.resultsJob || !done.find((j) => j.id === state.resultsJob))
+    state.resultsJob = done[0].id;
+  $("res-job").value = state.resultsJob;
+  api("GET", `/api/results/${state.resultsJob}`).then((res) => {
+    const rel = res.production_release === false
+      ? `<div class="mnote">production release BLOCKED: ${esc(res.release_note || "")}</div>`
+      : "";
+    $("res-meta").innerHTML = rel + `
+      <div class="hint">${esc(res.disclaimer || "")}</div>
+      <div class="kv">${Object.entries(res.provenance || {})
+        .map(([k, v]) => `<div class="k">${esc(k)}</div><div>${esc(v)}</div>`).join("")}</div>`;
+    const rows = (res.candidates || []).map((r) => `
+      <tr><td>${esc(r.rank)}</td><td><code>${esc(r.peptide)}</code></td>
+      <td>${esc(r.gene)}</td><td>${esc(r.hla)}</td><td>${esc(r.branch)}</td>
+      <td>${esc(r.mock_combined_score)}</td>
+      <td>${esc(r.safety_normal_hits)}</td></tr>`).join("");
+    $("res-table").innerHTML = `<div class="tablewrap"><table class="data">
+      <thead><tr><th>Rank</th><th>Peptide</th><th>Gene</th><th>HLA</th>
+      <th>Branch</th><th>Score</th><th>Normal hits</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`;
+  }).catch((e) => { $("res-table").innerHTML = ""; });
+}
+$("res-job").addEventListener("change", () => {
+  state.resultsJob = $("res-job").value;
+  renderResults();
+});
+
+/* ---------------- discovery ---------------- */
+function renderDiscovery() {
+  const list = (state.boot.research || []);
+  $("res-list").innerHTML = list.length ? list.map((r) => `
+    <div class="job-row" data-res="${esc(r.id)}">
+      <div class="jr-top"><span class="jr-id">${esc(r.id)}</span>
+        <span class="pill muted">${esc(r.scope)}</span>
+        <span class="pill accent">${esc(r.target)}</span>
+        <span class="pill ${r.status === "completed" ? "ok" : "warn"}">${esc(r.status)}</span>
+      </div></div>`).join("")
+    : `<div class="empty">No digests yet.</div>`;
+  document.querySelectorAll("[data-res]").forEach((el) =>
+    el.addEventListener("click", () => showReport(el.dataset.res)));
+  if (list.length) showReport(list[0].id);
+}
+async function showReport(id) {
+  try {
+    const r = await api("GET", `/api/research/${id}`);
+    if (!r.report) { $("res-report").innerHTML = ""; return; }
+    const rep = r.report;
+    const rows = (rep.comparison || []).map((c) => `
+      <tr><td><b>${esc(c.tool)}</b> ${esc(c.version || "")}</td>
+      <td>${esc(c.availability_class)}</td><td>${esc(c.license)}</td>
+      <td>${esc(c.evidence_quality)}</td>
+      <td>${esc(c.accuracy_example || "")}</td>
+      <td>${c.independently_benchmarked ? "YES" : "no"}</td>
+      <td>${esc(c.notes || "")}</td></tr>`).join("");
+    $("res-report").innerHTML = `<div class="card">
+      <div class="mnote">${esc(rep.disclaimer)}</div>
+      <div class="tablewrap"><table class="data">
+        <thead><tr><th>Tool</th><th>Availability</th><th>License</th>
+        <th>Evidence</th><th>Example figures</th><th>Independently benchmarked</th>
+        <th>Notes</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <p class="hint">${esc(rep.recommendation.verdict)}</p>
+      <p class="hint">Pre-adoption experiments: ${esc(rep.recommendation.experiments_before_adoption.join(" | "))}</p>
+      </div>`;
+  } catch (e) { toast("report failed: " + e.message, true); }
+}
+$("res-run").addEventListener("click", async () => {
+  const scope = $("res-scope").value, target = $("res-target").value;
+  try {
+    const r = await api("POST", "/api/research", { scope, target });
+    toast(`digest ${r.research_id} started`);
+    await refreshDiscovery();
+  } catch (e) { toast("research failed: " + e.message, true); }
+});
+async function refreshDiscovery() {
+  try {
+    const b = await api("GET", "/api/bootstrap");
+    state.boot.research = b.research;
+    renderDiscovery();
+  } catch (e) { /* transient */ }
 }
 
-/* ---------- policies / data / audit ---------- */
-function renderPolicies() {
-  const box = $("#pol-list");
-  box.innerHTML = "";
-  box.append(h("div", { class: "hint", style: "margin-bottom:10px" },
-    "These rules are quoted from the NeoAG repository (read-only inspection). " +
-    "They are displayed separately from agent suggestions and cannot be edited in the UI."));
-  for (const p of S.boot.policies)
-    box.append(h("div", { class: "card pcard" },
-      h("span", { class: "pid" }, p.id), " ", p.text,
-      h("div", { class: "src" }, "source: " + p.source)));
+/* ---------------- help ---------------- */
+function renderHelp() {
+  const docs = (state.boot.help || []);
+  $("help-tabs").innerHTML = docs.map((d, i) =>
+    `<button class="chip ${i === 0 ? "active" : ""}" data-doc="${esc(d.name)}">${esc(d.title)}</button>`).join("");
+  document.querySelectorAll("[data-doc]").forEach((el) =>
+    el.addEventListener("click", () => {
+      document.querySelectorAll("[data-doc]").forEach((x) =>
+        x.classList.remove("active"));
+      el.classList.add("active");
+      loadHelp(el.dataset.doc);
+    }));
+  if (docs.length) loadHelp(docs[0].name);
 }
-function renderData() {
-  const box = $("#data-list");
-  box.innerHTML = "";
-  for (const s of S.boot.samples) {
-    box.append(h("div", { class: "card" },
-      h("div", { class: "head" }, h("h3", {}, s.id + " - " + s.label)),
-      h("p", { class: "sub" }, `${s.assay} - ${s.genome_build} - ${s.status}`),
-      h("ul", { class: "flist" }, s.files.map(f =>
-        h("li", {}, f.path, h("span", { class: "kind" }, f.kind),
-          f.size, h("span", { class: "mock" }, "MOCK")))),
-      h("p", { class: "ni" }, "Preview / download of files: not implemented - these entries are names only, no data exists behind them.")));
+async function loadHelp(name) {
+  try {
+    const d = await api("GET", `/api/help/${name}`);
+    $("help-doc").innerHTML = `<div class="doc-src">${esc(d.source)}</div>`
+      + mdToHtml(d.markdown);
+  } catch (e) { $("help-doc").innerHTML = `<p class="hint">unavailable</p>`; }
+}
+
+/* ---------------- workspace tabs ---------------- */
+document.querySelectorAll(".wtab").forEach((t) =>
+  t.addEventListener("click", () => {
+    document.querySelectorAll(".wtab").forEach((x) => x.classList.remove("active"));
+    t.classList.add("active");
+    document.querySelectorAll(".wview").forEach((x) => x.classList.remove("active"));
+    $(`view-${t.dataset.view}`).classList.add("active");
+  }));
+
+/* ---------------- agent mode badge ---------------- */
+function renderAgentBadge() {
+  const real = state.agentMode === "real";
+  $("agent-mode").textContent = real
+    ? "CodeBuddy (real)" : "Demo agent (scripted)";
+  $("agent-mode").title = real
+    ? "Connected to the real server-side CodeBuddy agent. Click to switch back to the scripted demo agent."
+    : "Scripted demo agent - no LLM. Click to switch to the real server-side CodeBuddy agent.";
+}
+$("agent-mode").addEventListener("click", async () => {
+  const real = state.agentMode === "real";
+  const next = real ? "mock" : "real";
+  const ok = confirm(next === "real"
+    ? "Switch to the REAL CodeBuddy agent?\n\nMessages will be sent to the server-side CodeBuddy gateway (one active run; approvals must be given in the operator CodeBuddy Web UI; the gateway rate-limits run creation)."
+    : "Switch back to the scripted demo agent?");
+  if (!ok) return;
+  try {
+    await api("POST", "/api/agent/mode", { mode: next });
+    state.agentMode = next;
+    renderAgentBadge();
+    toast(next === "real"
+      ? "real CodeBuddy agent connected - be aware this drives the operator's live gateway"
+      : "switched to the scripted demo agent");
+  } catch (e) { toast("mode switch failed: " + e.message, true); }
+});
+
+/* ---------------- approvals + decisions (chat cards) ---------------- */
+document.addEventListener("click", async (ev) => {
+  const appr = ev.target.closest("[data-appr]");
+  if (appr) {
+    try {
+      await api("POST", `/api/approvals/${appr.dataset.appr}`,
+        { approve: appr.dataset.ok === "1" });
+      await refreshJobs(); refreshChat();
+    } catch (e) { toast("approval failed: " + e.message, true); }
+    return;
   }
-}
-async function refreshAudit() {
-  const rows = await api("/api/audit").catch(() => []);
-  if (JSON.stringify(rows) === JSON.stringify(S.lastAudit)) return;
-  S.lastAudit = rows;
-  const box = $("#audit-list");
-  box.innerHTML = "";
-  box.append(h("div", { class: "hint", style: "margin-bottom:10px" },
-    "Decision audit trail - every user/agent/engine action is recorded durably."));
-  box.append(h("div", {}, h("table", {},
-    h("thead", {}, h("tr", {}, ["time", "actor", "action", "object", "detail"].map(x => h("th", {}, x)))),
-    h("tbody", {}, rows.map(a => h("tr", {},
-      h("td", {}, t(a.ts)), h("td", {}, a.actor), h("td", {}, a.action),
-      h("td", { class: "sub" }, a.object),
-      h("td", { class: "sub" }, a.detail_json === "{}" ? "" : a.detail_json)))))));
-}
+  const dec = ev.target.closest("[data-dec]");
+  if (dec) {
+    try {
+      await api("POST", `/api/decisions/${dec.dataset.dec}/resolve`,
+        { choice: dec.dataset.choice, note: "resolved in chat" });
+      await refreshJobs(); refreshChat();
+    } catch (e) { toast("resolve failed: " + e.message, true); }
+  }
+});
 
-/* ---------- nav ---------- */
-$$(".tab").forEach(b => b.addEventListener("click", () => {
-  $$(".tab").forEach(x => x.classList.toggle("active", x === b));
-  $$(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + b.dataset.view));
-  if (b.dataset.view === "audit") refreshAudit();
-}));
+document.querySelectorAll("[data-say]").forEach((b) =>
+  b.addEventListener("click", () => {
+    $("chat-input").value = b.dataset.say;
+    $("chat-form").requestSubmit();
+  }));
 
-boot().then(connectSSE).catch(e => toast("cannot reach demo server: " + e.message, true));
+boot();

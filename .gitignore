@@ -1,6 +1,7 @@
 # runtime state and secrets - never commit
 data/
 server.pid
+watchdog.pid
 nohup.out
 __pycache__/
 *.pyc

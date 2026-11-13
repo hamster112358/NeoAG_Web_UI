@@ -128,7 +128,9 @@ class JobManager:
     # ----- submission -----
     def submit(self, sample_id: str, stage_ids: list[str], mode: str,
                execution_mode: str = "controlled", simulate_failure: bool = False,
-               requested_by: str = "user") -> dict:
+               requested_by: str = "user", kind: str = "mock-analysis",
+               manifest_id: str | None = None,
+               requested_config: dict | None = None) -> dict:
         stages = [mock_data.STAGE_BY_ID[s] for s in stage_ids if s in mock_data.STAGE_BY_ID]
         if not stages:
             raise ValueError("no valid stages selected")
@@ -137,7 +139,9 @@ class JobManager:
         spec = {"stage_ids": [s["id"] for s in stages], "mode": mode,
                 "execution_mode": execution_mode,
                 "simulate_failure": simulate_failure,
-                "dataset_version": mock_data.DEMO_DATASET_VERSION}
+                "dataset_version": mock_data.DEMO_DATASET_VERSION,
+                "manifest_id": manifest_id,
+                "requested_config": requested_config or {}}
         job_id = new_id("job")
         # Mirrors gateway policy POL-005: execute-class requests need a human
         # approval before they may run, even for mock work (boundary drill).
@@ -150,7 +154,7 @@ class JobManager:
             "MEDIUM (mock of an execute-class request)",
             "Approving queues the MOCK job. No real pipeline is connected; "
             "with the real gateway this class maps to HIGH risk / approved=true.")
-        self.store.job_create(job_id, "mock-analysis", sample_id, spec,
+        self.store.job_create(job_id, kind, sample_id, spec,
                               "blocked", appr["id"])
         self.store.event_add(job_id, "state",
                              f"blocked: waiting for approval {appr['id']}")

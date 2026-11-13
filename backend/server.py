@@ -1,5 +1,6 @@
-"""NeoAG web demo server - stdlib only, binds 127.0.0.1, no auth (loopback
-prototype; see README security notes before any exposure change).
+"""NeoAG web demo server - stdlib only, binds 127.0.0.1, Basic auth on all
+routes (credentials live only in data/auth.json, 0600; see README security
+notes before any exposure change).
 
 Run:  python3 -m backend.server  (from the project root, or via ../start.sh)
 """
@@ -17,8 +18,11 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from .agent import DemoAgent
+from .help_docs import DOCS as HELP_DOCS, get as help_get
 from .jobs import JobManager
 from .mock_data import SAMPLES, STAGES, DEMO_DATASET_VERSION
+from .neoag_params import (PARAM_GROUPS, STAGE_GRAPH, DECISION_POINTS,
+                           HUMAN_REQUIRED)
 from .policies import POLICIES
 from .research import TARGETS, run_research
 from .store import Store, new_id, now
@@ -149,10 +153,64 @@ class Handler(BaseHTTPRequestHandler):
                 "approvals": store.approval_list(),
                 "decisions": store.decision_list(),
                 "research": store.research_list(),
+                "manifests": store.manifest_list(),
+                "agent_mode": store.setting("agent_mode", "mock"),
+                "params_meta": [
+                    {"group": g["group"], "expert": g["expert"],
+                     "items": len(g["items"])} for g in PARAM_GROUPS],
+                "stage_graph": STAGE_GRAPH,
+                "decision_points": DECISION_POINTS,
+                "help": [
+                    {"name": k, "title": v["title"],
+                     "source": str(v["path"]) if v["path"] else "app-internal"}
+                    for k, v in HELP_DOCS.items()],
                 "settings": store.setting("ui", {"mode": "auto"}),
             })
+        if path == "/api/params":
+            return self._json(200, {"groups": PARAM_GROUPS,
+                                   "stage_graph": STAGE_GRAPH,
+                                   "decision_points": DECISION_POINTS,
+                                   "human_required": HUMAN_REQUIRED})
         if path == "/api/audit":
             return self._json(200, store.audit_list(300))
+        if path == "/api/help":
+            return self._json(200, {"docs": [
+                {"name": k, "title": v["title"],
+                 "source": str(v["path"]) if v["path"] else "app-internal"}
+                for k, v in HELP_DOCS.items()]})
+        if path.startswith("/api/help/"):
+            name = path.strip("/").split("/")[2]
+            doc = help_get(name)
+            if not doc:
+                return self._json(404, {"error": "no such doc"})
+            return self._json(200, doc)
+        if path.startswith("/api/manifests/"):
+            mid = path.strip("/").split("/")[2]
+            m = store.manifest_get(mid)
+            if not m:
+                return self._json(404, {"error": "no such manifest"})
+            return self._json(200, m)
+        if path == "/api/decisions":
+            jid = (q.get("job_id") or [None])[0]
+            ds = store.decision_list(jid)
+            return self._json(200, {"decisions": ds})
+        if path == "/api/codebuddy/status":
+            mode = store.setting("agent_mode", "mock")
+            info = {"mode": mode, "connected": False, "active_run": None,
+                    "detail": ""}
+            try:
+                if agent._client is not None:
+                    info["active_run"] = agent._client.active_run
+                    info["connected"] = True
+                    info["detail"] = "session established earlier"
+                else:
+                    from .codebuddy_client import CodeBuddyClient
+                    CodeBuddyClient()  # login probe (no run created)
+                    info["connected"] = True
+                    info["detail"] = "login probe succeeded"
+            except Exception as e:
+                info["detail"] = str(e)[:200]
+            return self._json(200, info)
         if path == "/api/stream":
             return self._sse()
         if path.startswith("/api/research/"):
@@ -189,18 +247,65 @@ class Handler(BaseHTTPRequestHandler):
                 text = str(body.get("text", ""))[:2000]
                 store.audit("user", "chat.send", "-", {"text": text[:120]})
                 msgs = [store.msg_add("user", text, {})]
-                msgs += agent.handle(text)
+                mode = store.setting("agent_mode", "mock")
+                if mode == "real":
+                    msgs += agent.handle_real(text)
+                else:
+                    msgs += agent.handle(text)
                 publish({"type": "chat"})
                 return self._json(200, {"messages": msgs})
+            if path == "/api/agent/mode":
+                mode = str(body.get("mode", ""))
+                if mode not in ("mock", "real"):
+                    return self._json(400, {"error": "mode must be mock|real"})
+                store.setting_set("agent_mode", mode)
+                store.audit("user", "agent.mode.set", mode, {})
+                publish({"type": "agent_mode", "mode": mode})
+                return self._json(200, {"agent_mode": mode})
+            if path == "/api/manifests/propose":
+                desc = str(body.get("description", ""))[:1000]
+                if not desc.strip():
+                    return self._json(400, {"error": "description required"})
+                proposal = agent.propose_manifest(desc)
+                mid = new_id("man")
+                m = store.manifest_add(mid, desc, proposal)
+                store.audit("user", "manifest.propose", mid,
+                            {"sample": proposal["sample_id"]})
+                publish({"type": "manifest", "id": mid})
+                return self._json(201, m)
+            if path.startswith("/api/manifests/") and \
+                    path.endswith("/confirm"):
+                mid = path.split("/")[3]
+                m = store.manifest_get(mid)
+                if not m:
+                    return self._json(404, {"error": "no such manifest"})
+                if m["status"] != "proposed":
+                    return self._json(409, {"error": "manifest not proposed"})
+                edits = body.get("edits") or {}
+                m2 = store.manifest_set(mid, "confirmed", confirmed=edits)
+                store.audit("user", "manifest.confirm", mid,
+                            {"edits": list(edits.keys())})
+                publish({"type": "manifest", "id": mid})
+                return self._json(200, m2)
             if path == "/api/jobs":
                 stage_ids = body.get("stage_ids") or [
                     s["id"] for s in STAGES if s["required"]]
+                kind = str(body.get("kind", "analysis"))
+                if kind not in ("analysis", "discovery", "diagnostic"):
+                    return self._json(400, {"error": "invalid kind"})
+                rcfg = body.get("requested_config")
+                if rcfg is not None and not isinstance(rcfg, dict):
+                    return self._json(400, {"error": "requested_config must be an object"})
                 res = jobs.submit(str(body.get("sample_id", "DEMO-P001")),
                                   list(stage_ids),
                                   str(body.get("mode", "auto")),
                                   execution_mode=str(body.get(
                                       "execution_mode", "controlled")),
-                                  simulate_failure=bool(body.get("simulate_failure")))
+                                  simulate_failure=bool(body.get(
+                                      "simulate_failure")),
+                                  kind=kind,
+                                  manifest_id=body.get("manifest_id"),
+                                  requested_config=rcfg)
                 return self._json(202, res)
             if path.startswith("/api/jobs/") and path.endswith("/cancel"):
                 jid = path.split("/")[3]
@@ -308,12 +413,10 @@ def main() -> None:
     recovered = store.recover_interrupted()
     if recovered:
         print(f"recovered {len(recovered)} interrupted job(s) -> failed (see UI)")
+    n = store.msg_purge_legacy_notices()
+    if n:
+        print(f"purged {n} pre-redesign mock banner(s) from chat history")
     store.audit("server", "server.start", "-", {"host": HOST, "port": PORT})
-    store.msg_add("system",
-                  "MOCK PROTOTYPE - synthetic data only, no real pipeline and no "
-                  "patient data are connected. Controls operate the demo job "
-                  "engine; real-pipeline integration is listed in the README.",
-                  {"badges": ["mock prototype"]})
     jobs.resume_queued()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"NeoAG web demo (MOCK) on http://{HOST}:{PORT}  (Ctrl+C to stop)")

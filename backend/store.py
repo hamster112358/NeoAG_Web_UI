@@ -56,6 +56,10 @@ CREATE TABLE IF NOT EXISTS research(
 CREATE TABLE IF NOT EXISTS research_events(
   id INTEGER PRIMARY KEY AUTOINCREMENT, research_id TEXT, ts TEXT, text TEXT
 );
+CREATE TABLE IF NOT EXISTS manifests(
+  id TEXT PRIMARY KEY, created_at TEXT, updated_at TEXT, description TEXT,
+  status TEXT, proposal_json TEXT, confirmed_json TEXT, job_id TEXT
+);
 """
 
 JOB_STATES = {"queued", "running", "paused", "blocked", "completed", "failed",
@@ -209,6 +213,24 @@ class Store:
             out.append(d)
         return out
 
+    def msg_purge_legacy_notices(self) -> int:
+        """One-time cleanup: drop pre-redesign 'MOCK PROTOTYPE' system banners
+        from persisted history (the redesign replaced them with the single
+        header demo indicator). Returns the number of rows removed."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT id, meta_json FROM messages").fetchall()
+            stale = [r["id"] for r in rows
+                     if json.loads(r["meta_json"] or "{}").get("badges")
+                     == ["mock prototype"]
+                     or (r["meta_json"] or "").startswith('{"badges": ["mock prototype"')]
+            if not stale:
+                return 0
+            self.db.executemany("DELETE FROM messages WHERE id = ?",
+                                [(i,) for i in stale])
+            self.db.commit()
+        return len(stale)
+
     # ---------- approvals ----------
     def approval_create(self, appr_id: str, job_id: str, action: str, risk: str,
                         detail: str) -> dict:
@@ -357,4 +379,56 @@ class Store:
             rows = self.db.execute(
                 "SELECT id,created_at,finished_at,status,scope,target FROM "
                 "research ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---------- input manifests ----------
+    def manifest_add(self, mid: str, description: str, proposal: dict) -> dict:
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO manifests(id,created_at,updated_at,description,"
+                "status,proposal_json) VALUES(?,?,?,?, 'proposed', ?)",
+                (mid, now(), now(), description,
+                 json.dumps(proposal, ensure_ascii=False)))
+            self.db.commit()
+            row = self.db.execute("SELECT * FROM manifests WHERE id=?",
+                                  (mid,)).fetchone()
+        m = dict(row)
+        m["proposal"] = json.loads(m.pop("proposal_json") or "{}")
+        return m
+
+    def manifest_get(self, mid: str) -> dict | None:
+        with self.lock:
+            row = self.db.execute("SELECT * FROM manifests WHERE id=?",
+                                  (mid,)).fetchone()
+        if not row:
+            return None
+        m = dict(row)
+        m["proposal"] = json.loads(m.pop("proposal_json") or "{}")
+        m["confirmed"] = json.loads(m.pop("confirmed_json") or "null")
+        return m
+
+    def manifest_set(self, mid: str, status: str, confirmed: dict | None = None,
+                     job_id: str | None = None) -> dict | None:
+        with self.lock:
+            self.db.execute(
+                "UPDATE manifests SET status=?, confirmed_json=?, job_id=?, "
+                "updated_at=? WHERE id=?",
+                (status, json.dumps(confirmed, ensure_ascii=False) if confirmed
+                 is not None else None, job_id, now(), mid))
+            self.db.commit()
+            row = self.db.execute("SELECT * FROM manifests WHERE id=?",
+                                  (mid,)).fetchone()
+        if not row:
+            return None
+        m = dict(row)
+        m["proposal"] = json.loads(m.pop("proposal_json") or "{}")
+        m["confirmed"] = json.loads(m.pop("confirmed_json") or "null")
+        return m
+
+    def manifest_list(self, limit: int = 30) -> list[dict]:
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT id,created_at,updated_at,description,status,job_id "
+                "FROM manifests ORDER BY created_at DESC LIMIT ?",
+                (limit,)).fetchall()
         return [dict(r) for r in rows]
