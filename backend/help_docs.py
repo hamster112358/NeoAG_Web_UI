@@ -37,44 +37,69 @@ DOCS = {
 
 CODEBUDDY_DOC = """# CodeBuddy agent integration
 
-## What is connected (verified live)
+## What is connected (verified live, 2026-11-14, gateway v2.180.0)
 
 The Chat pane can run in REAL mode against the server-side CodeBuddy
-gateway on 127.0.0.1:7890. Verified request/response shapes:
+gateway on 127.0.0.1:7890 through its **Jobs API** (agent instances):
 
 - `POST /api/v1/auth/login` with the gateway password from
-  `~/.codebuddy/settings.json` (gateway.password) -> session cookie +
-  token. Verified 200.
-- `POST /api/v1/runs` with a Gateway Protocol message
-  (`id`, `type`, `payload.text`, `sender`) plus the
-  `x-codebuddy-request` header -> 202 with a runId. Verified live.
-- `GET /api/v1/runs/<runId>` -> `{runId, active}`. Verified.
-- `POST /api/v1/runs/<runId>/cancel` and
-  `GET /api/v1/runs/<runId>/stream` (SSE) exist; streaming requires the
-  session cookie.
+  `~/.codebuddy/settings.json` (gateway.password) -> session cookie.
+- `POST /api/v1/jobs` (`prompt`, `cwd`, `name`, `permissionMode`) ->
+  job instance `{id, state, sessionId, ...}`.
+- `GET /api/v1/jobs/<id>` -> `data.job` lifecycle:
+  `state` (working/blocked/done/failed/stopped), `status`
+  (busy/waiting/idle), `settled`, `alive`, `output.result`, `detail`.
+- `GET /api/v1/jobs/<id>/transcript` -> the real ACP conversation
+  replay (user/agent/tool events). This is the content channel the
+  workspace relays into chat - reliable and poll-safe.
+- `POST /api/v1/jobs/<id>/reply` -> continues the SAME conversation,
+  even after the turn settled (verified: result updates in place), so
+  real chat is genuinely multi-turn.
+
+The earlier integration used the runs API (`POST /api/v1/runs` + SSE
+stream). It was replaced because a run's SSE stream is unavailable
+after the run leaves the registry (404, no replay) - transcript
+delivery could not be guaranteed. The jobs API replays its transcript
+on demand, which closes that gap.
+
+## Approval / execution semantics (measured, not assumed)
+
+- Jobs dispatched with the default permission mode execute tools
+  autonomously - headless job workers have no interactive approval
+  prompt (measured: tool_call pending -> completed with real output).
+- Jobs dispatched with `permissionMode: "plan"` get execution tools
+  DENIED gateway-side (measured verbatim: "Permission to use Bash has
+  been denied because this tool requires approval but permission
+  prompts are not available"), while inspecting and answering still
+  work.
+- **This workspace therefore runs its real chat agent as a plan-mode
+  job.** The real agent answers questions and proposes exact commands,
+  but this interface can never execute them; any denial text the agent
+  hits is relayed verbatim. Formal pipeline execution, when wired,
+  must go through this workspace's own approval queue - never silently
+  through a dispatched job.
 
 ## Documented limits (do not assume otherwise)
 
-- **Approval relay: not implemented.** With the gateway's default
-  permission mode, tool actions that need approval prompt in the
-  operator's own CodeBuddy Web UI; no endpoint is known that approves
-  them via the runs API. Real-agent prompts are therefore restricted
-  to read-only inspection tasks.
-- **One active run.** Creating a second run while one is active is
-  rejected (observed 429 concurrency cap).
-- **Rate limits.** Rapid run creation returns 429; the client backs
-  off with a bounded retry and surfaces an honest error.
-- **Context is not guaranteed.** Each message parses as its own
-  conversation, so the client sends a rolling context snippet with
-  every run instead of assuming server-side memory.
+- **One in-flight exchange.** While the agent is answering, further
+  real-mode messages are refused with an honest notice.
+- **Rate limits.** Rapid dispatch can return 429; the client backs
+  off with bounded retries and surfaces an honest error.
+- **Chat job lifetime.** The chat job lives while the demo process
+  runs; after a demo restart the next message re-dispatches a job and
+  recent turns ride along as a rolling transcript snippet.
+- Gateway detail JSON can contain raw newlines - parsed leniently.
 
 ## Safety posture
 
 - Real mode is OFF by default and switched only from this UI, audited.
 - The gateway password is read from the operator's settings file at
   client construction and never logged, echoed, or stored elsewhere.
-- Tool-execution approval controls are preserved: nothing in this
-  integration silently enables unrestricted command execution.
+- Tool-execution approval controls are preserved: the chat job is
+  plan-mode (execution denied gateway-side), and nothing here
+  silently enables unrestricted command execution.
+- Real answers come only from the gateway transcript - the workspace
+  never fabricates agent output.
 """
 
 APP_GUIDE = """# NeoAG Web workspace - user guide

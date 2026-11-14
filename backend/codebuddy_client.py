@@ -1,28 +1,56 @@
-"""Real-agent integration: minimal client for the CodeBuddy Web UI gateway
-(127.0.0.1:7890), verified live 2026-11-13:
+"""Real-agent integration: client for the CodeBuddy gateway JOBS API
+(127.0.0.1:7890), verified live 2026-11-14 against gateway v2.180.0.
 
-  POST /api/v1/auth/login          {"password": ...} -> session cookie+token
-  POST /api/v1/runs                Gateway Protocol message:
-                                   {"id","type","payload":{"text"},"sender"}
-                                   + header x-codebuddy-request  -> 202 {runId}
-  GET  /api/v1/runs/<runId>        {"runId","active"}
-  POST /api/v1/runs/<runId>/cancel -> {"status":"cancelled"}
-  GET  /api/v1/runs/<runId>/stream  SSE (text/event-stream)
+Why the Jobs API and not the Runs API
+-------------------------------------
+The earlier integration used the runs API
+(POST /api/v1/runs + GET /api/v1/runs/<id>/stream). Verified limitation:
+a run still in the registry holds its SSE stream open WITHOUT response
+headers until an event arrives, and once a run leaves the registry its
+stream answers 404 with NO replay - so transcript delivery could not be
+guaranteed end-to-end. The jobs API has no such gap:
 
-Notes / honesty:
- - The access password is read from ~/.codebuddy/settings.json
-   (gateway.password) at client construction and is NEVER logged or echoed.
- - The gateway rate-limits run creation (HTTP 429) - the client backs off
-   with a bounded retry and refuses to start a second run while one is
-   active (observed server-side concurrency cap of 1).
- - Tool approvals (permission-mode default) are NOT relayable through the
-   runs API today: any server-side tool action that needs approval must be
-   approved in the operator's own CodeBuddy Web UI. Until an approval-relay
-   endpoint exists, real-agent prompts are restricted to READ-ONLY
-   inspection tasks, and this restriction is stated in the UI.
- - Conversation context across runs is NOT guaranteed by the gateway
-   (each message parses as its own conversation), so the client sends a
-   rolling context snippet with every run instead of assuming memory.
+  POST /api/v1/jobs                 dispatch agent instance -> {id,...}
+  GET  /api/v1/jobs/<id>            detail under data.job:
+                                    state working|blocked|done|failed|
+                                    stopped, status busy|waiting|idle,
+                                    tempo, settled, alive, output.result,
+                                    detail (live progress line)
+  GET  /api/v1/jobs/<id>/transcript one-shot ACP replay updates (last
+                                    ~1000 lines), read-only, no worker
+                                    needed - the reliable content channel
+  GET  /api/v1/jobs/<id>/stream     SSE: replays the transcript tail
+                                    immediately, then tails live events
+                                    (verified: instant 200 + headers)
+  POST /api/v1/jobs/<id>/reply      continue the SAME conversation, even
+                                    after settle (multi-turn) - verified:
+                                    {delivered:true}, result updates
+  POST /api/v1/jobs/<id>/stop       stop worker
+  DELETE /api/v1/jobs/<id>          remove record
+  GET  /api/v1/info                 gateway version/cwd probe (status)
+
+Approval semantics (measured, not assumed)
+------------------------------------------
+- permissionMode "default" (gateway process default): dispatched jobs
+  execute tools autonomously (tool_call pending -> completed with real
+  output; no interactive approval exists for headless job workers).
+- permissionMode "plan": execution tools are DENIED with a verbatim
+  error - "Permission to use Bash has been denied because this tool
+  requires approval but permission prompts are not available" - while
+  read/inspect behaviour still works. THIS demo therefore dispatches
+  its chat agent in plan mode: the real agent answers and proposes, but
+  this interface can never execute commands or edit files. Execution,
+  if ever wired, must go through the demo's own approval queue.
+
+Gateway quirks (verified):
+- JSON responses can embed raw newlines in free-text fields (detail):
+  parse with json.loads(..., strict=False).
+- Rapid dispatch can return 429: bounded backoff below.
+- GET /api/v1/jobs/<name> is NOT supported - only ids (stable, short,
+  or sessionId).
+
+The gateway password is read from ~/.codebuddy/settings.json
+(gateway.password) at client construction and is NEVER logged or echoed.
 """
 from __future__ import annotations
 
@@ -32,7 +60,6 @@ import threading
 import time
 import urllib.error
 import urllib.request
-import uuid
 from pathlib import Path
 
 SETTINGS = Path.home() / ".codebuddy" / "settings.json"
@@ -44,18 +71,22 @@ class CodeBuddyError(RuntimeError):
     pass
 
 
-class CodeBuddyClient:
-    """One client = one authenticated session; runs are serialized."""
+def _loads(text: str):
+    """Gateway free-text fields can contain raw control characters."""
+    return json.loads(text, strict=False)
 
-    def __init__(self, sender: str = "neoag-web-demo"):
-        self.sender_id = sender
+
+class CodeBuddyClient:
+    """One client = one authenticated gateway session."""
+
+    def __init__(self):
         self._lock = threading.Lock()
-        self.active_run: str | None = None
         pw = self._read_password()
         self.jar = http.cookiejar.CookieJar()
         self.op = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(self.jar))
-        code, body = self._req("POST", "/api/v1/auth/login", {"password": pw})
+        code, body = self._req("POST", "/api/v1/auth/login",
+                               {"password": pw})
         if code != 200:
             raise CodeBuddyError(f"CodeBuddy login failed (HTTP {code})")
 
@@ -87,112 +118,60 @@ class CodeBuddyClient:
             return -1, str(e)
 
     # ------------------------------------------------------------------
-    def create_run(self, text: str, context: list[str] | None = None,
-                   tries: int = 4, backoff: int = 20) -> str:
-        with self._lock:
-            if self.active_run:
-                raise CodeBuddyError(
-                    "a real-agent run is already active - cancel it first "
-                    "(one concurrent run is allowed by the gateway)")
-            # rolling context: the gateway treats each message as its own
-            # conversation, so recent turns ride along in the prompt.
-            prompt = text
-            if context:
-                tail = "\n".join(f"- {c}" for c in context[-6:])
-                prompt = f"Recent conversation summary:\n{tail}\n\nUser: {text}"
-            payload = {"id": str(uuid.uuid4()), "type": "message",
-                       "payload": {"text": prompt},
-                       "sender": {"id": self.sender_id, "name": "NeoAG Web UI"}}
-            for i in range(tries):
-                code, body = self._req("POST", "/api/v1/runs", payload)
-                if code == 202:
-                    run_id = json.loads(body)["data"]["runId"]
-                    self.active_run = run_id
-                    return run_id
-                if code == 429 and i < tries - 1:
-                    time.sleep(backoff)
-                    continue
-                raise CodeBuddyError(f"run creation failed (HTTP {code})")
-        raise CodeBuddyError("run creation failed (retries exhausted)")
-
-    def status(self, run_id: str) -> dict:
-        code, body = self._req("GET", f"/api/v1/runs/{run_id}")
+    def info(self) -> dict:
+        """Gateway identity probe (version, cwd, uptime) - no job created."""
+        code, body = self._req("GET", "/api/v1/info")
         if code != 200:
-            return {"runId": run_id, "active": False, "unknown": True}
-        return json.loads(body)["data"]
+            raise CodeBuddyError(f"gateway info probe failed (HTTP {code})")
+        return _loads(body).get("data", {})
 
-    def cancel(self, run_id: str) -> dict:
-        code, body = self._req("POST", f"/api/v1/runs/{run_id}/cancel")
+    def dispatch(self, prompt: str, cwd: str, name: str,
+                 permission_mode: str | None = None,
+                 tries: int = 4, backoff: int = 15) -> dict:
+        """Dispatch a job instance. Returns the {id, sessionId, ...} dict."""
+        payload = {"prompt": prompt[:16000], "cwd": cwd, "name": name}
+        if permission_mode:
+            payload["permissionMode"] = permission_mode
+        for i in range(tries):
+            code, body = self._req("POST", "/api/v1/jobs", payload)
+            if code in (200, 201, 202):
+                return _loads(body).get("data", {})
+            if code == 429 and i < tries - 1:
+                time.sleep(backoff)
+                continue
+            raise CodeBuddyError(
+                f"job dispatch failed (HTTP {code}: {body[:120]})")
+        raise CodeBuddyError("job dispatch failed (retries exhausted)")
+
+    def job(self, job_id: str) -> dict:
+        """Detail dict (state/status/tempo/settled/alive/output/detail)."""
+        code, body = self._req("GET", f"/api/v1/jobs/{job_id}")
+        if code != 200:
+            return {"unknown": True, "http": code}
+        return _loads(body).get("data", {}).get("job", {})
+
+    def transcript(self, job_id: str) -> list[dict]:
+        """ACP replay updates (append-only window, last ~1000 lines)."""
+        code, body = self._req("GET", f"/api/v1/jobs/{job_id}/transcript")
+        if code != 200:
+            return []
+        return _loads(body).get("data", {}).get("updates", []) or []
+
+    def reply(self, job_id: str, text: str) -> dict:
+        """Continue the same conversation (works after settle while the
+        worker is alive). Returns {delivered, notice} or {error, http}."""
+        code, body = self._req("POST", f"/api/v1/jobs/{job_id}/reply",
+                               {"text": text[:16000], "bash": False})
         if code == 200:
-            return json.loads(body)["data"]
-        return {"error": body[:120], "http": code}
+            return _loads(body).get("data", {})
+        return {"error": body[:160], "http": code}
 
-    def stream(self, run_id: str, max_seconds: int = 900, max_events: int = 400,
-               probe_seconds: int = 20):
-        """Yield parsed SSE events; ends on completion or limits.
+    def stop(self, job_id: str) -> dict:
+        code, body = self._req("POST", f"/api/v1/jobs/{job_id}/stop")
+        return {"http": code, **(_loads(body).get("data", {})
+                                 if code == 200 else {"raw": body[:120]})}
 
-        Gateway behaviour verified live 2026-11-13:
-        - a run still in the registry holds the stream open WITHOUT
-          response headers until an event arrives (so a plain long read
-          can block for the whole window), while
-        - a run that left the registry (completed/dropped) answers the
-          stream with an immediate 404 - no replay.
-        Therefore: short probe timeouts + status re-polls between
-        attempts, a distinct end signal on stream-404, and an explicit
-        idle-timeout signal - never an indefinite block."""
-        url = f"{BASE}/api/v1/runs/{run_id}/stream"
-        # The gateway rejects gateway-protocol requests that lack the
-        # x-codebuddy-request header (same requirement as every _req call),
-        # so the stream request must carry it too - a cookie alone is not
-        # enough (observed live 2026-11-13: without the header -> HTTP 403).
-        hdrs = {"Accept": "text/event-stream",
-                "x-codebuddy-request": "1",
-                "Cache-Control": "no-cache"}
-        t0 = time.time()
-        n = 0
-        try:
-            while time.time() - t0 < max_seconds:
-                st = self.status(run_id)
-                if st.get("unknown"):
-                    yield {"run_left_registry": True,
-                           "detail": "the status endpoint no longer knows "
-                                     "this run (completed/dropped); the "
-                                     "gateway does not replay transcripts"}
-                    return
-                if not st.get("active", True):
-                    return  # run known but inactive: end quietly; the
-                    # relay's generic fallback covers this accurately
-                try:
-                    with self.op.open(urllib.request.Request(
-                            url, headers=dict(hdrs)),
-                            timeout=probe_seconds) as resp:
-                        for raw in resp:
-                            line = raw.decode("utf-8", "replace").strip()
-                            if not line:
-                                continue
-                            if line.startswith("data:"):
-                                n += 1
-                                try:
-                                    yield json.loads(line[5:].strip())
-                                except Exception:
-                                    yield {"raw": line[5:200]}
-                            if n >= max_events or \
-                                    time.time() - t0 > max_seconds:
-                                return
-                except urllib.error.HTTPError as e:
-                    if e.code == 404:
-                        yield {"run_left_registry": True,
-                               "detail": "stream answered 404 - the run is "
-                                         "no longer active and the gateway "
-                                         "does not replay transcripts"}
-                        return
-                    yield {"stream_error":
-                           f"HTTP Error {e.code}: {e.reason}"[:160]}
-                    return
-                except Exception:
-                    pass  # open/read timeout -> re-poll status, retry
-            yield {"stream_idle_timeout": max_seconds}
-        finally:
-            with self._lock:
-                if self.active_run == run_id:
-                    self.active_run = None
+    def delete(self, job_id: str) -> dict:
+        code, body = self._req("DELETE", f"/api/v1/jobs/{job_id}")
+        return {"http": code, **(_loads(body).get("data", {})
+                                 if code == 200 else {"raw": body[:120]})}

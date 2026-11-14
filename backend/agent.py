@@ -1,4 +1,9 @@
-"""Scripted demo agent (no LLM is called anywhere in the prototype).
+"""Agent layer with two transports (see POST /api/agent/mode, audited):
+
+ - mock (default): scripted demo agent - no LLM is called at all.
+ - real: the genuine server-side CodeBuddy agent via the gateway Jobs
+   API, plan-mode (execution tools denied gateway-side). See
+   handle_real/_relay_job below and backend/codebuddy_client.py.
 
 Channel separation, per project requirements:
  - role="agent"      -> agent suggestion   (badge: "agent suggestion")
@@ -24,25 +29,43 @@ class DemoAgent:
         self.store = store
         self.jobs = jobs
         self._client = None            # lazy CodeBuddyClient (real mode)
-        self._context: list[str] = []  # rolling context for real runs
-        self._run_thread: threading.Thread | None = None
+        self._context: list[str] = []  # rolling context for re-dispatch
+        self._job_id: str | None = None  # persistent real chat job
+        self._relay_thread: threading.Thread | None = None
+        self._busy = False             # one in-flight real exchange
 
     # ------------------------------------------------------------------
-    # Real-agent integration (CodeBuddy gateway). OFF by default; the
-    # operator switches modes in the UI (POST /api/agent/mode), and the
-    # switch is audited. See backend/codebuddy_client.py for the API map
-    # and its documented limits (no approval relay, rate limits).
+    # Real-agent integration via the CodeBuddy gateway JOBS API (the
+    # runs API could not guarantee transcript delivery - see
+    # backend/codebuddy_client.py for the verified API map). OFF by
+    # default; the operator switches modes in the UI
+    # (POST /api/agent/mode), and the switch is audited. The chat agent
+    # runs as a plan-mode job instance: a REAL agent whose execution
+    # tools (Bash/edits) are denied gateway-side, so this interface can
+    # propose but never execute. Tool denial text is relayed verbatim.
     # ------------------------------------------------------------------
+    CHAT_CWD = "/tmp"                  # deliberately inert working dir
+    CHAT_PREAMBLE = (
+        "You are the real CodeBuddy agent embedded as the assistant of "
+        "the NeoAG web workspace (a front-end for the NeoAG neoantigen "
+        "pipeline; the workspace's own demo jobs run on synthetic data "
+        "only). This session is permissionMode=plan: Bash and file "
+        "edits are denied by the gateway - when the user asks for an "
+        "action, describe the exact command or change instead of "
+        "attempting it. Never invent results; say when you are unsure. "
+        "The user's message follows.\n\n")
+
     def _ensure_client(self):
         if self._client is None:
-            from .codebuddy_client import CodeBuddyClient, CodeBuddyError
+            from .codebuddy_client import CodeBuddyClient
             self._client = CodeBuddyClient()
         return self._client
 
     def handle_real(self, text: str) -> list[dict]:
-        """Send the user text to the REAL server-side CodeBuddy agent and
-        start a streaming relay thread. Returns the immediate message(s);
-        agent/tool output arrives asynchronously via SSE ('chat' events)."""
+        """Send the user text to the REAL server-side CodeBuddy agent
+        (persistent plan-mode job; multi-turn via /reply). Immediate
+        acknowledgement returns here; the agent's real output arrives
+        asynchronously from the job transcript ('chat' SSE events)."""
         try:
             client = self._ensure_client()
         except Exception as e:
@@ -50,90 +73,131 @@ class DemoAgent:
                 f"Real-agent mode is ON but the CodeBuddy gateway is not "
                 f"reachable from this server ({e}). Nothing was executed.",
                 meta={"badges": ["agent suggestion", "integration error"]})]
-        try:
-            run_id = client.create_run(text, context=self._context)
-        except Exception as e:
+        if self._busy:
             return [self._say(
-                f"Could not start a real-agent run: {e} Nothing was "
-                "executed. (The gateway rate-limits run creation and "
-                "allows one active run.)",
+                "The real agent is still working on the previous message "
+                "(one exchange at a time). Wait for its reply.",
+                meta={"badges": ["real agent", "integration note"]})]
+        detail = client.job(self._job_id) if self._job_id else {}
+        alive = bool(detail) and not detail.get("unknown") and \
+            detail.get("state") not in (None, "stopped", "failed")
+        try:
+            if alive:
+                r = client.reply(self._job_id, text)
+                if r.get("delivered"):
+                    job_id, started = self._job_id, "continued"
+                else:
+                    raise RuntimeError(f"reply failed: "
+                                       f"{r.get('error') or r}")
+            else:
+                prompt = self.CHAT_PREAMBLE + self._context_block() + text
+                d = client.dispatch(prompt, cwd=self.CHAT_CWD,
+                                    name="neoag-web-chat",
+                                    permission_mode="plan")
+                job_id, started = d.get("id"), "started"
+                self._job_id = job_id
+        except Exception as e:
+            self._job_id = None
+            return [self._say(
+                f"Could not reach the real agent: {e} Nothing was "
+                "executed. (The gateway rate-limits job dispatch; try "
+                "again shortly.)",
                 meta={"badges": ["agent suggestion", "integration error"]})]
+        self._busy = True
+        self._context.append(f"user: {text[:140]}")
         note = self.store.msg_add(
             "agent",
-            f"Real-agent run started on the server-side CodeBuddy gateway "
-            f"(run {run_id[:8]}...). Output streams below as it arrives. "
-            "Tool actions needing approval must still be approved in the "
-            "operator's CodeBuddy Web UI - this interface never bypasses "
-            "that gate.",
+            f"Real agent {started} (job {str(job_id)[:8]}..., read-only "
+            "plan mode - it can inspect and propose but not execute). "
+            "Its answer and any tool attempts stream in below from the "
+            "gateway transcript.",
             {"badges": ["real agent", "streaming"],
-             "source": "codebuddy", "run_id": run_id})
-        self._context.append(f"user: {text[:140]}")
-        self._run_thread = threading.Thread(
-            target=self._relay_run, args=(run_id,), daemon=True)
-        self._run_thread.start()
+             "source": "codebuddy", "job_id": job_id})
+        self._relay_thread = threading.Thread(
+            target=self._relay_job, args=(job_id,), daemon=True)
+        self._relay_thread.start()
         return [note]
 
-    def _relay_run(self, run_id: str) -> None:
+    def _context_block(self) -> str:
+        if not self._context:
+            return ""
+        tail = "\n".join(f"- {c}" for c in self._context[-8:])
+        return ("Rolling transcript of this chat (the job was "
+                f"re-dispatched, so prior turns ride along):\n{tail}\n\n")
+
+    def _relay_job(self, job_id: str) -> None:
+        """Poll the job transcript, post NEW tool events immediately and
+        the assistant's reply when the turn settles. Never fabricates:
+        content comes only from the gateway transcript/detail fields."""
         import html as _html
+        import time as _time
         from .server import publish
         client = self._client
-        final_texts: list[str] = []
-        n_tool = 0
-        for ev in client.stream(run_id):
-            etype = str(ev.get("status") or ev.get("type") or "")
-            md = ""
-            content = ev.get("content")
-            if isinstance(content, dict):
-                md = str(content.get("markdown") or "")
-            elif isinstance(ev.get("markdown"), str):
-                md = ev["markdown"]
-            if ev.get("stream_error"):
-                self.store.msg_add(
-                    "system",
-                    f"Real-agent stream ended abnormally: {ev['stream_error']}",
-                    {"badges": ["integration error"], "run_id": run_id})
-            elif ev.get("run_left_registry"):
-                self.store.msg_add(
-                    "agent",
-                    f"(Run {run_id[:8]} finished; the gateway no longer "
-                    "streams it and does not replay transcripts. Its "
-                    "transcript, if the run was processed, is in the "
-                    "operator's CodeBuddy Web UI.)",
-                    {"badges": ["real agent", "integration note"],
-                     "run_id": run_id})
-            elif ev.get("stream_idle_timeout"):
-                self.store.msg_add(
-                    "agent",
-                    f"(No streamed output arrived for {ev['stream_idle_timeout']}s "
-                    f"while the gateway still reports run {run_id[:8]} active. "
-                    "This interface will not fabricate the transcript - "
-                    "check the operator's CodeBuddy Web UI for whether the "
-                    "run was processed.)",
-                    {"badges": ["real agent", "integration note"],
-                     "run_id": run_id})
-            elif etype == "completed" or md:
-                final_texts.append(md or json.dumps(ev)[:400])
-            elif etype:
-                n_tool += 1
-                self.store.msg_add(
-                    "tool", f"[{etype}] {_html.escape(json.dumps(ev)[:200])}",
-                    {"badges": ["tool output", "real agent"],
-                     "run_id": run_id})
-            publish({"type": "chat"})
-        if final_texts:
-            body = "\n\n".join(t for t in final_texts if t.strip()) or "(empty)"
-            self.store.msg_add(
-                "agent", body,
-                {"badges": ["real agent"], "source": "codebuddy",
-                 "run_id": run_id})
-            self._context.append(f"agent: {body[:140]}")
-        elif not n_tool:
+        seen: set[str] = set()
+        reply_texts: dict[str, str] = {}
+        t0 = _time.time()
+        max_seconds = 600
+        try:
+            while _time.time() - t0 < max_seconds:
+                _time.sleep(2.5)
+                detail = client.job(job_id)
+                state = detail.get("state")
+                for u in client.transcript(job_id):
+                    kind = str(u.get("sessionUpdate") or "")
+                    mid = str(u.get("messageId") or u.get("toolCallId") or "")
+                    if kind in ("tool_call", "tool_call_update"):
+                        key = f"{kind}|{u.get('toolCallId')}|{u.get('status')}"
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        if kind == "tool_call":
+                            body = (f"[attempted] {u.get('title') or 'tool'}"
+                                    f" (status {u.get('status')})")
+                        else:
+                            out = str(u.get("rawOutput") or "")[:300]
+                            body = (f"[tool {u.get('status')}] "
+                                    f"{_html.escape(out)}")
+                        self.store.msg_add(
+                            "tool", body,
+                            {"badges": ["tool output", "real agent"],
+                             "job_id": job_id})
+                        publish({"type": "chat"})
+                    elif kind == "agent_message_chunk" and mid:
+                        txt = (u.get("content") or {}).get("text") or ""
+                        if txt.strip():
+                            reply_texts[mid] = txt
+                if state in ("done", "failed", "stopped"):
+                    body = max(reply_texts.values(),
+                               key=len) if reply_texts else ""
+                    if state == "done" and body:
+                        self.store.msg_add(
+                            "agent", body,
+                            {"badges": ["real agent"],
+                             "source": "codebuddy", "job_id": job_id})
+                        self._context.append(f"agent: {body[:140]}")
+                    else:
+                        live = str(detail.get("detail") or "")[:200]
+                        self.store.msg_add(
+                            "agent",
+                            f"(Real-agent turn ended: {state}."
+                            + (f" Gateway detail: {live}" if live else "")
+                            + " No assistant reply text was recorded - "
+                              "this interface does not fabricate one.)",
+                            {"badges": ["real agent", "integration note"],
+                             "job_id": job_id})
+                    publish({"type": "chat"})
+                    return
             self.store.msg_add(
                 "agent",
-                f"(Run {run_id[:8]} finished without streamed content - "
-                "check the operator CodeBuddy Web UI for the transcript.)",
-                {"badges": ["real agent"], "run_id": run_id})
-        publish({"type": "chat"})
+                f"(No terminal job state seen within {max_seconds}s; the "
+                "gateway still holds the job. Its transcript remains "
+                "readable - send another message or check the operator's "
+                "CodeBuddy Web UI.)",
+                {"badges": ["real agent", "integration note"],
+                 "job_id": job_id})
+            publish({"type": "chat"})
+        finally:
+            self._busy = False
 
     # ------------------------------------------------------------------
     # Input-manifest proposal (mock integration point). In demo mode the

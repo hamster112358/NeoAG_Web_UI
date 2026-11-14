@@ -64,9 +64,11 @@ build-free vanilla-JS frontend. No packages installed anywhere.
 - **Policies page removed** in favor of a real Help/Documentation
   view (`backend/help_docs.py`): the app guide plus the real repo's
   README and integration docs, rendered read-only.
-- **Real-agent chat**: `POST /api/chat` in `real` mode starts an actual
-  run on the server-side CodeBuddy gateway and streams what arrives.
-  Mock mode (default) stays fully scripted.
+- **Real-agent chat**: `POST /api/chat` in `real` mode continues a real
+  CodeBuddy agent session (gateway Jobs API, plan-mode instance) and
+  relays the actual transcript. Mock mode (default) stays fully
+  scripted. Rewired to the jobs transport 2026-11-14 - see the
+  integration section.
 
 ## Architecture
 
@@ -78,9 +80,9 @@ backend/
   agent.py    demo agent (scripted intents) + real-agent relay
               (CodeBuddyClient) + manifest proposal
   codebuddy_client.py  minimal authenticated client for the
-              CodeBuddy gateway runs API (login, create, status,
-              cancel, SSE stream) with bounded retries and
-              bounded streaming
+              CodeBuddy gateway JOBS API (login, dispatch, detail,
+              transcript, reply, stop, delete, info) with bounded
+              429 backoff and lenient JSON parsing
   neoag_params.py     code-grounded parameter inventory
               (source-cited rows from the frozen NeoAG repo)
   help_docs.py        Help/Documentation content (app guide,
@@ -107,48 +109,62 @@ API (all JSON, all behind Basic auth): `GET /api/bootstrap |
 mode | /api/approvals/<id> | /api/decisions/<id>/resolve |
 /api/research | /api/settings`.
 
-## Real-agent integration (CodeBuddy gateway) - verified status
+## Real-agent integration (CodeBuddy gateway, Jobs API) - verified status
 
 The demo talks to the operator's own CodeBuddy Web UI gateway on
-127.0.0.1:7890 using the documented runs API. Verified live
-2026-11-13:
+127.0.0.1:7890 through its documented **Jobs API** (agent instances).
+The earlier runs-API integration could not guarantee transcript
+delivery (a run's SSE stream never emitted observable events during
+the observed windows, and once a run left the registry the stream
+answered 404 with no replay), so real chat was moved to the jobs
+transport, which closes the gap. Verified live 2026-11-14, gateway
+v2.180.0:
 
 | Capability | State | Notes |
 | --- | --- | --- |
 | Login probe (`POST /api/v1/auth/login`) | verified | password read from `~/.codebuddy/settings.json` (`gateway.password`), never logged |
-| Run creation (`POST /api/v1/runs`) | verified | 202 + runId; needs `x-codebuddy-request` header; rate-limited (429) after bursts, client backs off 4 x 20 s then reports honestly |
-| Run status (`GET /api/v1/runs/<id>`) | verified | 200 + `active` flag |
-| Run cancel (`POST .../cancel`) | verified reachable | returns 404 `RUN_NOT_FOUND` for a run that already completed |
-| SSE stream (`GET .../stream`) | PARTIAL | connection opens with correct headers, but for the observed runs NO events arrived while active, and completed runs answer 404 (no replay). One successful streamed exchange was observed on 2026-11-12/13; today's runs produced no streamed events within 15-minute windows. |
-| Approval relay | NOT implemented | any server-side tool action needing approval must be approved in the operator's own CodeBuddy Web UI; real-mode prompts are restricted to read-only inspection tasks |
-| One active run | observed | the client refuses to start a second run while one is active |
+| Gateway probe (`GET /api/v1/info`) | verified | version/cwd; used by `/api/codebuddy/status` |
+| Dispatch (`POST /api/v1/jobs`) | verified | `{prompt, cwd, name, permissionMode}` -> `{id, state, sessionId,...}`; rapid dispatch may 429, client backs off with bounded retries |
+| Lifecycle (`GET /api/v1/jobs/<id>`) | verified | `data.job`: state working/done/failed/stopped, status, settled, alive, `output.result`, live `detail` line |
+| Transcript (`GET .../transcript`) | verified | one-shot ACP replay (user/agent/tool events) - the content channel relayed into the demo chat |
+| Multi-turn (`POST .../reply`) | verified | continues the SAME session even after settle; measured: second turn answered from session memory |
+| End-to-end real chat via demo | verified 2026-11-14 | two-turn probe through `POST /api/chat`: agent's exact tokens arrived in the demo chat both turns (`tests/verify_real_agent.py`) |
+| Stop/delete (`POST .../stop`, `DELETE /jobs/<id>`) | verified | `{stopped:true}` / `{deleted:true}` |
+| Execution gate | enforced gateway-side | chat agent is dispatched `permissionMode=plan`; Bash/edits DENIED with verbatim denial text (measured); plan-mode denial is relayed honestly, never bypassed |
+| Runs API (old transport) | superseded | kept out of the code path; its no-replay limitation is what motivated this switch |
 
-Run lifecycle as observed 2026-11-13: a created run sits `active:true`
-for roughly 10-15 minutes, then flips to `active:false`; during the
-active window the stream endpoint holds the connection open without
-sending response headers; after the run leaves the registry, the
-stream answers 404. The relay therefore never blocks indefinitely:
-short probe timeouts, status re-polls, and explicit end-of-stream
-notes ("finished without streamed content - check the operator's
-CodeBuddy Web UI") - the chat never fabricates a transcript.
+Approval semantics (measured, not assumed): jobs dispatched in the
+default mode execute tools autonomously (headless workers have no
+interactive approval), so this demo does NOT dispatch default-mode
+jobs; its chat agent is plan-mode only. If formal pipeline execution
+is ever wired, it must go through the demo's own approval queue, never
+a silently dispatched default-mode job.
 
-Safety posture of the integration (unchanged):
+Relay behaviour: after dispatch/reply the relay polls the transcript
+every 2.5 s, posts new tool attempts/statuses immediately and the
+assistant reply when the turn settles, capped at 600 s with an honest
+timeout note. The demo never fabricates agent output.
+
+Safety posture of the integration:
 
 - Real mode is OFF by default; switching is explicit, audited and
   visible in the UI mode indicator.
-- No approval-relay endpoint exists, so the interface never issues
-  tool-execution grants; nothing in this integration silently
-  enables unrestricted command execution.
+- The chat agent cannot execute: plan-mode enforcement is gateway-side
+  (verified), and the chat job runs in an inert cwd (`/tmp`).
 - The gateway password is read at client construction from
   `~/.codebuddy/settings.json` and never logged, echoed or stored
   in demo state.
+- The chat job id is shown in the acknowledgement message and in
+  `/api/codebuddy/status`; settled chat jobs stay alive on the
+  gateway for continuity until stopped (they are ordinary job
+  instances, visible in the operator's own CodeBuddy Web UI).
 
 ## Mock vs operational
 
 | Feature | Status |
 | --- | --- |
 | Chat workspace, quick actions | **works** (scripted intents, no LLM in mock mode) |
-| Real-agent chat (CodeBuddy gateway) | **partial** - run creation + honest streaming relay verified; streamed output delivery not yet observed end-to-end (see table above) |
+| Real-agent chat (CodeBuddy gateway) | **works** - genuine server-side agent via Jobs API, transcript relay + multi-turn verified end-to-end 2026-11-14; plan-mode (cannot execute) |
 | Parameter inventory (code-grounded) | **works** (`/api/params`, source per row) |
 | Input manifest propose/confirm | **works** (double-confirm rejected 409; empty description 400) |
 | Data browser (3 demo cases) | **works** (names/metadata only; preview/download explicitly not implemented) |
@@ -183,29 +199,41 @@ Safety posture of the integration (unchanged):
   this tree; prototype sqlite state is 0600 by convention.
 - pidfiles (`server.pid`, `watchdog.pid`) are gitignored.
 
-## Verification performed (2026-11-13)
+## Verification performed
 
-- Redesign battery: 53 automated checks against the running
-  server - static/auth, milestone-2 invariants (dual modes, decision
-  points, gate20 override, bounded retry, skip semantics, cancel),
-  plus redesign checks: code-grounded params with per-row sources,
-  real help docs, manifest propose/confirm/double-confirm,
-  job kinds, requested_config provenance, decision filtering,
-  agent-mode persistence + audit, mock-banner purge invariant,
-  honest `/api/codebuddy/status`. Result: 53/53 PASS.
-- Live real-agent relay: login probe OK; run creation OK
-  (202 + runId); stream relay bounded (no indefinite hang; explicit
-  end-of-stream notes). Streamed output delivery: NOT verified
-  end-to-end today (see integration table).
+- 2026-11-14 (current code): redesign battery re-run on the jobs
+  transport - 53/53 PASS (`tests/verify_battery.py`). Real-agent E2E
+  (`tests/verify_real_agent.py`): 5/5 PASS - two-turn probe through
+  the public demo API where the real agent's exact tokens arrived in
+  the demo chat on both turns (second turn answered from live session
+  memory), plus honest `/api/codebuddy/status` (transport=jobs,
+  plan-mode chat job, gateway version). Gateway probes backing the
+  integration table (dispatch/lifecycle/transcript/reply/stop/delete,
+  plan-mode execution denial, default-mode auto-execution finding)
+  were run against the live gateway and are described above.
+- 2026-11-13 (predecessor runs-API build): 53/53 battery; run
+  creation verified but streamed output NOT delivered end-to-end -
+  the limitation that motivated the 2026-11-14 rewire.
+- Browser-based visual acceptance: not performed in this session
+  (no browser tooling); functional surface is covered by the HTTP
+  batteries above. Operator acceptance via the demo tunnel URL.
 
 ## Known risks and next integration tasks
 
-- Gateway runs API is the operator's privileged session: real mode
-  must stay opt-in, audited, and read-only in scope until an approval
-  relay exists.
-- No replay: once a run leaves the gateway registry, its output is
-  only in the operator's CodeBuddy Web UI transcript; the demo chat
-  cannot recover it (documented, not worked around).
+- The gateway session used for real mode is the operator's privileged
+  session. Residual risk is bounded because the chat job is
+  gateway-enforced plan-mode (execution denied, verified) and runs in
+  an inert cwd - but the agent can still READ files the operator can
+  read: never prompt it toward patient data, and note this constraint
+  before any future exposure change.
+- Measured product behavior to keep in mind: default-mode dispatched
+  jobs auto-execute tools (no approval UI exists for headless
+  workers). Do not "upgrade" the chat job to default mode to make it
+  "more capable" - that silently removes the execution gate.
+- Chat job pointers live in memory: after a demo restart the next
+  real-mode message re-dispatches a job and recent turns ride along
+  as a rolling snippet; the old settled job stays visible on the
+  gateway until stopped.
 - Quick-tunnel URLs rotate; re-check after restarts.
 - Real pipeline execution remains out of scope for this prototype:
   the future path is the NeoAG controlled-execution gateway

@@ -196,18 +196,23 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"decisions": ds})
         if path == "/api/codebuddy/status":
             mode = store.setting("agent_mode", "mock")
-            info = {"mode": mode, "connected": False, "active_run": None,
-                    "detail": ""}
+            info = {"mode": mode, "connected": False, "transport": "jobs",
+                    "chat_job": None, "chat_permission_mode": "plan",
+                    "gateway_version": None, "detail": ""}
             try:
-                if agent._client is not None:
-                    info["active_run"] = agent._client.active_run
-                    info["connected"] = True
-                    info["detail"] = "session established earlier"
-                else:
-                    from .codebuddy_client import CodeBuddyClient
-                    CodeBuddyClient()  # login probe (no run created)
-                    info["connected"] = True
-                    info["detail"] = "login probe succeeded"
+                client = agent._ensure_client()  # login probe, no dispatch
+                gw = client.info()
+                info["connected"] = True
+                info["gateway_version"] = gw.get("version")
+                info["detail"] = (f"gateway v{gw.get('version')} via the "
+                                  "jobs API (chat agent = plan-mode job)")
+                if agent._job_id:
+                    d = client.job(agent._job_id)
+                    info["chat_job"] = {"id": agent._job_id,
+                                        "state": d.get("state"),
+                                        "status": d.get("status"),
+                                        "settled": d.get("settled"),
+                                        "alive": d.get("alive")}
             except Exception as e:
                 info["detail"] = str(e)[:200]
             return self._json(200, info)
