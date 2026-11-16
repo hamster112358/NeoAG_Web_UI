@@ -233,16 +233,20 @@ Fixes (verified: live 12/12 + battery 64-68 + real-mode R7/R8):
 
 ## Verification performed
 
-- 2026-11-16 (phase B): `tests/verify_battery.py` **67/67 PASS**
-  (now self-hosted on an isolated DB/port: fresh-empty-workspace,
-  conversation lifecycle, gate classifier straight from the versioned
-  asset, grant single-use semantics, layout contract, restore-path
-  rejection); `tests/verify_real_agent.py` **23/23 PASS** against the
-  live gateway (routine-execute, block->card->approve->retry,
-  credential deny + no leak, restart reattach, expired-session
-  recovery, chat/jobs separation); gate classifier unit regression
-  29/29 (incl. `$HOME` secret variants and relative-path false
-  positives fixed this round).
+- 2026-11-16 (stall fix): `tests/verify_battery.py` **73/73 PASS**
+  (adds 64-68: relay terminal-state regressions - dead gateway ->
+  honest "connection lost", done -> completed with clean tool text,
+  failed -> no fabricated reply, startup sweep, frontend fallback);
+  `tests/verify_real_agent.py` **31/31 PASS** (adds R7 job stopped
+  mid-turn -> honest "cancelled", R8 server killed mid-turn ->
+  "interrupted by server restart" + conversation stays usable);
+  live E2E driver **12/12** (hello/pwd/follow-up through the real
+  API: real Bash stdout, prompt terminal states, honest notices).
+- 2026-11-16 (phase B): battery 67/67 + real-mode 23/23 on the
+  Phase-B build (conversation lifecycle, gate classifier from the
+  versioned asset, grant single-use, layout contract); gate
+  classifier unit regression 29/29 (incl. `$HOME` secret variants
+  and relative-path false positives fixed that round).
 - 2026-11-14: 53/53 battery + 5/5 real-mode E2E (plan-mode era).
 - Browser-based visual acceptance: not performed (no browser
   tooling); layout contract is asserted statically in the battery.
