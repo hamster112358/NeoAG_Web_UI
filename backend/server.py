@@ -513,6 +513,9 @@ def main() -> None:
     recovered = store.recover_interrupted()
     if recovered:
         print(f"recovered {len(recovered)} interrupted job(s) -> failed (see UI)")
+    swept = store.msg_sweep_stale_streaming()
+    if swept:
+        print(f"marked {swept} abandoned 'streaming' message(s) as interrupted")
     n = store.msg_purge_legacy_notices()
     if n:
         print(f"purged {n} pre-redesign mock banner(s) from chat history")

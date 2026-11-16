@@ -16,6 +16,12 @@ Checks (each turn talks to a genuine CodeBuddy gateway job):
      history with an honest 'session new' notice (no fake continuity)
  R6  conversation persisted across restart; chat agent jobs never
      entered the formal Task History table
+ R7  REGRESSION (stall bug): a job stopped mid-turn must drive the
+     streaming kickoff message to an honest terminal state - never
+     leave a turn permanently 'streaming'
+ R8  REGRESSION (stall bug): server restart mid-turn marks the
+     orphaned streaming message 'interrupted by server restart', and
+     the next message still completes the conversation
 
 Run:  python3 tests/verify_real_agent.py     (takes several minutes)
 """
@@ -121,6 +127,36 @@ def wait_gate_card(cl, cid, timeout=480):
     return None
 
 
+def wait_kick_state(cl, cid, kick_id, timeout=120):
+    """REGRESSION helper: poll until the turn's kickoff message leaves
+    'streaming'. The stalled-chat bug = this never happening."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        time.sleep(2)
+        for m in cl.req("GET", f"/api/conversations/{cid}")["messages"]:
+            if m["id"] == kick_id:
+                ts = m["meta"].get("turn_state")
+                if ts and ts != "streaming":
+                    return ts
+    return "TIMEOUT_STILL_STREAMING"
+
+
+def kick_of(resp):
+    k = [m for m in resp["messages"]
+         if (m.get("meta") or {}).get("turn_state") == "streaming"]
+    return k[-1]["id"] if k else -1
+
+
+def wait_tool_running(cl, cid, since, timeout=90):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        time.sleep(2)
+        for m in cl.req("GET", f"/api/conversations/{cid}")["messages"]:
+            if m["role"] == "tool" and m["id"] > since and "[running]" in m["text"]:
+                return True
+    return False
+
+
 def last_id(cl, cid):
     msgs = cl.req("GET", f"/api/conversations/{cid}")["messages"]
     return msgs[-1]["id"] if msgs else 0
@@ -143,9 +179,13 @@ def main():
     job_id = None
     cid = None
     gw = None
+    CLEANUP_JOBS = set()
     try:
         check("isolated server starts", cl.wait_up())
         cl.req("POST", "/api/agent/mode", {"mode": "real"})
+        sys.path.insert(0, str(ROOT))
+        from backend.codebuddy_client import CodeBuddyClient
+        gw = CodeBuddyClient()
 
         # ---------- R1 routine write, no prompts ----------
         r = cl.req("POST", "/api/chat", {
@@ -167,6 +207,7 @@ def main():
               (final or {}).get("text", "")[:160])
         job_id = cl.req("GET", f"/api/conversations/{cid}")[
             "conversation"]["job_id"]
+        CLEANUP_JOBS.add(job_id)
         check("R1 job id persisted on conversation", bool(job_id))
 
         # ---------- R2 destructive outside -> card -> approve ----------
@@ -217,6 +258,31 @@ def main():
         check("R3 agent honestly reported the block", refused,
               (final or {}).get("text", "")[:160])
 
+        # ---------- R7 REGRESSION: stopped job must end the stream ----
+        # Reproduces the field bug: a job that stops mid-turn used to
+        # leave the kickoff message 'streaming' forever (SSE dead, no
+        # terminal stamp). A dedicated conversation keeps R1-R6 intact.
+        r7 = cl.req("POST", "/api/chat", {
+            "text": "Use Bash right now, no questions: run exactly "
+                    "'sleep 45 && echo SLEPT-9' and then report its "
+                    "output."})
+        r7_cid, r7_kick = r7["conv_id"], kick_of(r7)
+        check("R7 streaming kickoff carries turn_state", r7_kick > 0)
+        r7_job = cl.req("GET", f"/api/conversations/{r7_cid}")[
+            "conversation"]["job_id"]
+        CLEANUP_JOBS.add(r7_job)
+        started = wait_tool_running(cl, r7_cid, r7_kick)
+        check("R7 agent job started working (repro precondition)", started)
+        gw.stop(r7_job)          # hard-stop the live job mid-turn
+        ts = wait_kick_state(cl, r7_cid, r7_kick)
+        check("R7 stopped job -> honest terminal (never stalls)",
+              ts in ("cancelled", "failed", "connection lost"), f"ts={ts}")
+        r7msgs = cl.req("GET", f"/api/conversations/{r7_cid}")["messages"]
+        check("R7 no assistant reply text was fabricated",
+              any("does not fabricate" in m["text"] or
+                  "connection" in m["text"].lower()
+                  for m in r7msgs if m["role"] == "agent"))
+
         # ---------- R4 server restart -> reattach same live job --------
         stop_server(srv)
         time.sleep(1)
@@ -253,6 +319,7 @@ def main():
         conv = cl.req("GET", f"/api/conversations/{cid}")["conversation"]
         check("R5 new job dispatched after expiry",
               conv["job_id"] not in (None, job_id), str(conv["job_id"]))
+        CLEANUP_JOBS.add(conv["job_id"])
         msgs = cl.req("GET", f"/api/conversations/{cid}")["messages"]
         honest = [m for m in msgs if m["role"] == "system"
                   and "new" in m["text"].lower() and m["id"] > since]
@@ -260,6 +327,34 @@ def main():
         check("R5 durable history rode along (marker recalled)",
               bool(final) and "marker" in final["text"].lower(),
               (final or {}).get("text", "")[:200])
+
+        # ---------- R8 REGRESSION: restart mid-turn -----------------
+        # The relay thread dying with the server used to leave the
+        # kickoff 'streaming' forever. The startup sweep must stamp it,
+        # and the conversation must stay usable.
+        r8 = cl.req("POST", "/api/chat", {
+            "conv_id": cid,
+            "text": "Use Bash right now, no questions: run exactly "
+                    "'sleep 35 && echo RESTART-TEST-7', then report "
+                    "its output."})
+        r8_kick = kick_of(r8)
+        CLEANUP_JOBS.add(cl.req("GET", f"/api/conversations/{cid}")[
+            "conversation"]["job_id"])
+        started = wait_tool_running(cl, cid, r8_kick)
+        check("R8 job working before kill (repro precondition)", started)
+        stop_server(srv)          # relay dies mid-turn - exactly the bug
+        srv = start_server()
+        check("R8 server back up after mid-turn kill", cl.wait_up())
+        ts = wait_kick_state(cl, cid, r8_kick, timeout=30)
+        check("R8 orphaned streaming msg -> interrupted (never stalls)",
+              ts == "interrupted by server restart", f"ts={ts}")
+        since = last_id(cl, cid)
+        cl.req("POST", "/api/chat",
+               {"conv_id": cid, "text": "Reply with exactly: BACK-ON"})
+        final = wait_turn(cl, cid, since, timeout=240)
+        check("R8 conversation usable after interrupted turn",
+              bool(final) and "BACK-ON" in final["text"],
+              (final or {}).get("text", "")[:160])
 
         # ---------- R6 separation + persistence ------------------------
         boot = cl.req("GET", "/api/bootstrap")
@@ -284,14 +379,14 @@ def main():
             (ROOT / "data" / DB).unlink()
         except OSError:
             pass
-        if job_id:
+        for jid in CLEANUP_JOBS:
             try:
                 if gw is None:
                     sys.path.insert(0, str(ROOT))
                     from backend.codebuddy_client import CodeBuddyClient
                     gw = CodeBuddyClient()
-                gw.stop(job_id)
-                gw.delete(job_id)
+                gw.stop(jid)
+                gw.delete(jid)
             except Exception:
                 pass
     print(f"\nREAL-MODE E2E: {ok} passed, {fail} failed")

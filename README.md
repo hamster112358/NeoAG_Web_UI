@@ -177,6 +177,34 @@ at settle (already-delivered messages are never re-sent), and posts
 an honest turn-end note when the gateway recorded no reply.
 The workspace never fabricates agent output.
 
+### Turn delivery and honest terminal states (2026-11-16 fix)
+
+Field failure: through the Cloudflare quick tunnel the browser
+received NO SSE bytes - the tunnel buffers streaming responses
+(proved: localhost SSE delivered instantly; via tunnel zero bytes in
+40 s; the tunnel log shows `context canceled` every ~2 min). Real
+replies were relayed and stored server-side within seconds, but the
+UI depended solely on SSE, so chats appeared stuck in "streaming" -
+and the kickoff notice's `streaming` badge was persisted and never
+cleared, so even a reload looked stalled.
+
+Fixes (verified: live 12/12 + battery 64-68 + real-mode R7/R8):
+
+- Every turn ends in a PERSISTED terminal `turn_state` stamped onto
+  its kickoff message: completed / failed / cancelled /
+  no reply recorded / timed out / connection lost / relay error;
+  a server restart mid-turn sweeps orphans to
+  "interrupted by server restart". No path leaves a message
+  streaming forever.
+- The relay tolerates transient gateway blips (3 retries), then says
+  honestly that the job connection was lost - never a guess.
+- Frontend never trusts SSE: it refetches on every SSE (re)open and
+  polls every 3 s while the visible chat shows a streaming turn, so
+  the terminal state arrives whatever the proxy does.
+- The "previous agent session had ended" recovery notice now appears
+  only when a real session actually existed for that chat (not on a
+  fresh chat that merely has mock-era history).
+
 ## Mock vs operational
 
 | Feature | Status |
@@ -222,6 +250,10 @@ The workspace never fabricates agent output.
 
 ## Known risks / limits
 
+- SSE does not survive the quick tunnel (buffered): live updates
+  there arrive via the 3 s watchdog instead of instantly. The fix
+  is delivery-agnostic; a future tunnel protocol tweak may restore
+  instant push.
 - Same-uid: the gate defends against mistakes, not hostile code
   running as the same user.
 - One in-flight exchange per chat; rate-limited dispatch; transcript

@@ -614,6 +614,121 @@ except OSError:
     pass
 check("63 grant is single-use and hash-matched (real protocol dir)", _ok63)
 
+# ---------- 64-68 relay terminal-state regression (2026-11-16 stall bug) ----
+# The field failure: a real-mode turn stayed 'streaming' forever when the
+# delivery path (SSE via the buffering quick tunnel) went dead and no
+# terminal state was ever stamped. These unit checks pin the backend half
+# of the fix against an isolated temp DB - no gateway needed.
+import shutil
+import tempfile
+import types
+
+sys.path.insert(0, str(ROOT))
+_stub = types.ModuleType("backend.server")
+_stub.publish = lambda ev: None
+sys.modules.setdefault("backend.server", _stub)
+from backend.store import Store as _Store            # noqa: E402
+from backend import agent as _amod                   # noqa: E402
+from backend.agent import DemoAgent as _Agent        # noqa: E402
+
+_udb = tempfile.mkdtemp(prefix="neoag-relay-unit-")
+os.environ["NEOAG_DEMO_DB"] = "relayunit.sqlite3"
+_ts = _Store(pathlib.Path(_udb))
+_ag = _Agent(_ts, None)
+
+
+class _TimeShim:                 # make relay polling instant
+    sleep = staticmethod(lambda s: None)
+    time = staticmethod(time.time)
+
+
+class _DeadGW:
+    def job(self, j):
+        raise ConnectionError("gateway down (unit)")
+
+    def transcript(self, j):
+        raise ConnectionError("gateway down (unit)")
+
+
+class _DoneGW:
+    def job(self, j):
+        return {"state": "done"}
+
+    def transcript(self, j):
+        return [
+            {"sessionUpdate": "tool_call", "toolCallId": "t1",
+             "status": "pending", "title": "`pwd`"},
+            {"sessionUpdate": "tool_call_update", "toolCallId": "t1",
+             "status": "completed",
+             "rawOutput": {"type": "text", "text": "Stdout: /unit/ws"}},
+            {"sessionUpdate": "agent_message_chunk", "messageId": "m1",
+             "content": {"text": "/unit/ws"}}]
+
+
+class _FailGW:
+    def job(self, j):
+        return {"state": "failed", "detail": "boom"}
+
+    def transcript(self, j):
+        return []
+
+
+def _unit_turn(client, cid, seen={"x"}):
+    _amod.time = _TimeShim
+    try:
+        k = _ts.msg_add("agent", "kick",
+                        {"badges": ["real agent", "streaming"],
+                         "turn_state": "streaming"}, cid)
+        st = _ag._cstate(cid)
+        st.update({"job": "unitjob", "kick": k["id"], "seen": set(seen),
+                   "busy": True})
+        _ag._client = client
+        _ag._turn(cid, max_seconds=60)
+        msgs = _ts.msg_list(500, conv_id=cid)
+        kick = [m for m in msgs if m["id"] == k["id"]][0]
+        return kick["meta"].get("turn_state"), msgs
+    finally:
+        _amod.time = time
+
+
+_ts1, _msgs1 = _unit_turn(_DeadGW(), "u-lost")
+check("64 gateway failure -> honest 'connection lost', never stuck",
+      _ts1 == "connection lost" and
+      any("connection to the agent job was lost" in m["text"]
+          for m in _msgs1), str(_ts1))
+_ts2, _msgs2 = _unit_turn(_DoneGW(), "u-ok")
+check("65 done turn -> completed + clean real tool text",
+      _ts2 == "completed" and
+      any(m["role"] == "tool"
+          and m["text"] == "[tool completed] Stdout: /unit/ws"
+          for m in _msgs2) and
+      any(m["role"] == "agent" and m["text"] == "/unit/ws"
+          for m in _msgs2), str(_ts2))
+_ts3, _msgs3 = _unit_turn(_FailGW(), "u-fail")
+check("66 failed job -> honest terminal, no fabricated reply",
+      _ts3 == "failed" and
+      any("does not fabricate" in m["text"] for m in _msgs3), str(_ts3))
+_ts3b, _msgs3b = _unit_turn(_DeadGW(), "u-seedfail", seen=set())
+check("66b transcript-seeding failure also ends honestly (never stuck)",
+      _ts3b in ("relay error", "connection lost") and _ts3b != "streaming",
+      str(_ts3b))
+_k = _ts.msg_add("agent", "orphan",
+                 {"badges": ["real agent", "streaming"],
+                  "turn_state": "streaming"}, "u-sweep")
+_n = _ts.msg_sweep_stale_streaming()
+_kr = [m for m in _ts.msg_list(500, conv_id="u-sweep")
+       if m["id"] == _k["id"]][0]
+check("67 startup sweep: orphaned streaming -> interrupted",
+      _n >= 1 and _kr["meta"].get("turn_state")
+      == "interrupted by server restart")
+_appjs = (ROOT / "frontend" / "app.js").read_text()
+check("68 frontend reaches terminal WITHOUT SSE: watchdog + reopen catch-up",
+      "Streaming watchdog" in _appjs and "inflight" in _appjs and
+      "Reconnect catch-up" in _appjs and
+      "refreshConv(); refreshSidebar(); refreshJobs()" in _appjs)
+del os.environ["NEOAG_DEMO_DB"]
+shutil.rmtree(_udb, ignore_errors=True)
+
 print()
 print(f"RESULT: {len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:

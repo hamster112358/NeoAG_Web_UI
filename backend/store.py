@@ -294,6 +294,36 @@ class Store:
         return {"id": mid, "ts": now(), "role": role, "text": text,
                 "meta": meta or {}, "conv_id": conv_id}
 
+    def msg_set_meta(self, msg_id: int, meta: dict) -> None:
+        """Replace one message's meta (used to take a real-agent kickoff
+        notice from 'streaming' to a terminal turn_state)."""
+        with self.lock:
+            self.db.execute(
+                "UPDATE messages SET meta_json=? WHERE id=?",
+                (json.dumps(meta, ensure_ascii=False), msg_id))
+            self.db.commit()
+
+    def msg_sweep_stale_streaming(self) -> int:
+        """Startup honesty sweep: any persisted message still labelled
+        'streaming' belongs to a relay that died with the previous
+        server process - mark it terminal, do not resurrect it."""
+        n = 0
+        with self.lock:
+            for r in self.db.execute(
+                    "SELECT id, meta_json FROM messages").fetchall():
+                meta = json.loads(r["meta_json"] or "{}")
+                if meta.get("turn_state") == "streaming":
+                    meta["turn_state"] = "interrupted by server restart"
+                    meta["badges"] = [
+                        b for b in meta.get("badges", [])
+                        if b != "streaming"] + ["interrupted"]
+                    self.db.execute(
+                        "UPDATE messages SET meta_json=? WHERE id=?",
+                        (json.dumps(meta, ensure_ascii=False), r["id"]))
+                    n += 1
+            self.db.commit()
+        return n
+
     def msg_list(self, limit: int = 200, conv_id: str | None = None) -> list[dict]:
         q = "SELECT * FROM messages"
         args: list = []

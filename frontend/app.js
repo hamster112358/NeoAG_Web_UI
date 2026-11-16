@@ -122,7 +122,13 @@ let es = null;
 function connectSSE() {
   if (es) es.close();
   es = new EventSource("/api/stream");
-  es.onopen = () => { $("conn-dot").className = "dot on"; $("conn-text").textContent = "live"; };
+  // Reconnect catch-up: events published while the stream was down are
+  // gone, so (re)opening always refetches the visible state. SSE is
+  // best-effort - the streaming watchdog below is the guarantee.
+  es.onopen = () => {
+    $("conn-dot").className = "dot on"; $("conn-text").textContent = "live";
+    refreshConv(); refreshSidebar(); refreshJobs(); renderAttention();
+  };
   es.onerror = () => { $("conn-dot").className = "dot off"; $("conn-text").textContent = "reconnecting"; };
   es.onmessage = (m) => {
     let ev = {};
@@ -214,6 +220,21 @@ async function refreshConv() {
     renderChat();
   } catch { /* transient */ }
 }
+
+/* Streaming watchdog: while the visible chat shows a streaming message,
+   refetch every 3 s whether SSE is alive or not - reverse proxies can
+   buffer or kill SSE, and missed events are never replayed. The server
+   always stamps a terminal turn_state (completed / failed / cancelled /
+   timed out / connection lost / interrupted), so this polling stops by
+   itself once the turn honestly ends. */
+setInterval(() => {
+  if (!state.activeCid) return;
+  const inflight = (state.convMsgs || []).slice(-8).some((m) => {
+    const mt = m.meta || {};
+    return mt.turn_state === "streaming" || (mt.badges || []).includes("streaming");
+  });
+  if (inflight) refreshConv();
+}, 3000);
 
 $("new-chat").addEventListener("click", async () => {
   try {

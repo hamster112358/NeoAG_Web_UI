@@ -71,7 +71,8 @@ class DemoAgent:
         with self._lock:
             return self._conv.setdefault(
                 conv_id, {"job": None, "busy": False, "seen": set(),
-                          "ops": set(), "replies": {}, "delivered": set()})
+                          "ops": set(), "replies": {}, "delivered": set(),
+                          "kick": None})
 
     @staticmethod
     def title_from(text: str) -> str:
@@ -122,7 +123,7 @@ class DemoAgent:
             d = client.job(job_id)
             alive = bool(d) and not d.get("unknown") and \
                 d.get("state") not in (None, "stopped", "failed")
-        redispatched = False
+        had_prior_session = bool(job_id)
         try:
             if alive:
                 r = client.reply(job_id, text)
@@ -132,7 +133,9 @@ class DemoAgent:
                 started = "continued"
             else:
                 # durable-history recovery: rebuild context from saved
-                # messages, then dispatch a fresh job (one honest notice)
+                # messages, then dispatch a fresh job. The "previous
+                # session ended" notice is only honest when a real
+                # agent session actually existed for this chat before.
                 hist = [ln for ln in self.store.conv_recent_text(conv_id, 14)]
                 ctx = ""
                 if hist:
@@ -147,7 +150,7 @@ class DemoAgent:
                 self.store.conv_set_job(conv_id, job_id, "working")
                 self.store.audit("agent", "real.dispatch", conv_id,
                                  {"job": job_id})
-                started, redispatched = "started", bool(hist)
+                started = "started"
         except Exception as e:
             self.store.conv_set_job(conv_id, None, "error")
             return [self._say(
@@ -159,7 +162,9 @@ class DemoAgent:
         st["job"] = job_id
         st["busy"] = True
         msgs = []
-        if redispatched:
+        if started == "started" and had_prior_session:
+            # honest ONLY for a re-dispatch after a real session ended -
+            # never on a continued live session, never on a fresh chat
             msgs.append(self.store.msg_add(
                 "system",
                 "The previous agent session for this chat had ended; a "
@@ -167,45 +172,97 @@ class DemoAgent:
                 "Earlier context is available, but the agent process "
                 "itself is new.",
                 {"badges": ["real agent", "integration note"]}, conv_id))
-        msgs.append(self.store.msg_add(
+        kick = self.store.msg_add(
             "agent",
             f"Real agent {started} (job {str(job_id)[:8]}...). Its tool "
             "work executes on the server; routine operations run "
             "directly, destructive ones will appear here as a "
             "confirmation card before anything changes.",
             {"badges": ["real agent", "streaming"],
-             "source": "codebuddy", "job_id": job_id}, conv_id))
+             "source": "codebuddy", "job_id": job_id,
+             "turn_state": "streaming"}, conv_id)
+        st["kick"] = kick["id"]
+        msgs.append(kick)
         threading.Thread(target=self._turn, args=(conv_id,),
                          daemon=True).start()
         return msgs
 
-    def _turn(self, conv_id: str) -> None:
+    TURN_MAX_SECONDS = 900   # module-level for testability
+
+    def _finish_turn(self, st: dict, turn_state: str) -> None:
+        """Take the turn's kickoff notice out of 'streaming' into an
+        honest terminal state (persisted, so reloads show it too)."""
+        kid = st.get("kick")
+        if not kid:
+            return
+        for m in self.store.msg_list(500):
+            if m["id"] == kid:
+                meta = m["meta"]
+                meta["turn_state"] = turn_state
+                meta["badges"] = [b for b in meta.get("badges", [])
+                                  if b != "streaming"] + [turn_state]
+                self.store.msg_set_meta(kid, meta)
+                break
+        st["kick"] = None
+
+    def _turn(self, conv_id: str, max_seconds: int | None = None) -> None:
         """Relay one agent turn: post NEW tool activity live, create
         confirmation cards for gate CONFIRM denials, post the assistant
         reply when the turn settles. Content only from the gateway -
-        never fabricated."""
+        never fabricated. ANY exit path ends in an honest terminal
+        state (the kickoff notice leaves 'streaming')."""
         import html as _html
         from .server import publish
         st = self._cstate(conv_id)
         client = self._client
         job_id = st["job"]
+        if not job_id:
+            self.store.msg_add(
+                "agent", "(This chat has no agent job to relay yet - "
+                "send a message first.)",
+                {"badges": ["real agent", "integration note"]}, conv_id)
+            st["busy"] = False
+            return
+        max_seconds = max_seconds or self.TURN_MAX_SECONDS
         t0 = time.time()
-        max_seconds = 900
-        if not st["seen"]:
-            # First relay since (re)start: replayed history of earlier
-            # turns must NOT be re-posted as fresh tool activity.
-            for u in client.transcript(job_id):
-                kind = str(u.get("sessionUpdate") or "")
-                if kind in ("tool_call", "tool_call_update"):
-                    st["seen"].add(
-                        f"{kind}|{u.get('toolCallId')}|{u.get('status')}")
+        errors = 0
         try:
+            if not st["seen"]:
+                # First relay since (re)start: replayed history of earlier
+                # turns must NOT be re-posted as fresh tool activity.
+                for u in client.transcript(job_id):
+                    kind = str(u.get("sessionUpdate") or "")
+                    if kind in ("tool_call", "tool_call_update"):
+                        st["seen"].add(
+                            f"{kind}|{u.get('toolCallId')}|{u.get('status')}")
             while time.time() - t0 < max_seconds:
                 time.sleep(2.5)
-                detail = client.job(job_id)
+                try:
+                    detail = client.job(job_id)
+                    items = client.transcript(job_id)
+                    errors = 0
+                except Exception as e:
+                    # Transient gateway blip: tolerate a few, then be
+                    # honest about losing the job (never fabricate).
+                    errors += 1
+                    if errors < 4:
+                        continue
+                    self.store.audit("agent", "relay.connection_lost",
+                                     conv_id, {"job": job_id, "err": str(e)})
+                    self.store.msg_add(
+                        "agent",
+                        f"(The connection to the agent job was lost "
+                        f"after repeated gateway errors ({e}). The job "
+                        "may still be working on the gateway; this "
+                        "interface will not guess its outcome.)",
+                        {"badges": ["real agent", "connection lost"],
+                         "job_id": job_id}, conv_id)
+                    self._finish_turn(st, "connection lost")
+                    publish({"type": "chat", "conv_id": conv_id})
+                    return
                 state = detail.get("state")
                 self.store.conv_touch(conv_id, job_state=str(state))
-                for u in client.transcript(job_id):
+                for u in items:
                     kind = str(u.get("sessionUpdate") or "")
                     if kind in ("tool_call", "tool_call_update"):
                         key = f"{kind}|{u.get('toolCallId')}|{u.get('status')}"
@@ -215,8 +272,13 @@ class DemoAgent:
                         if kind == "tool_call":
                             body = (f"[running] {u.get('title') or 'tool'}")
                         else:
-                            out = str(u.get("rawOutput") or "")[:300]
-                            body = f"[tool {u.get('status')}] {_html.escape(out)}"
+                            raw = u.get("rawOutput")
+                            if isinstance(raw, dict):
+                                raw = raw.get("text") or json.dumps(
+                                    raw, ensure_ascii=False)
+                            out = str(raw or "")[:600]
+                            body = (f"[tool {u.get('status')}] "
+                                    f"{_html.escape(out)}")
                             self._scan_gate_confirm(u, conv_id, st)
                         self.store.msg_add(
                             "tool", body,
@@ -241,8 +303,12 @@ class DemoAgent:
                             {"badges": ["real agent"],
                              "source": "codebuddy", "job_id": job_id},
                             conv_id)
+                        self._finish_turn(st, "completed")
                     else:
                         live = str(detail.get("detail") or "")[:200]
+                        label = {"done": "no reply recorded",
+                                 "failed": "failed",
+                                 "stopped": "cancelled"}[state]
                         self.store.msg_add(
                             "agent",
                             f"(Agent turn ended: {state}."
@@ -251,6 +317,7 @@ class DemoAgent:
                               "this interface does not fabricate one.)",
                             {"badges": ["real agent", "integration note"],
                              "job_id": job_id}, conv_id)
+                        self._finish_turn(st, label)
                     publish({"type": "chat", "conv_id": conv_id})
                     return
             self.store.msg_add(
@@ -258,9 +325,25 @@ class DemoAgent:
                 f"(No terminal job state seen within {max_seconds}s; the "
                 "gateway still holds the job. Send another message to "
                 "continue, or check the operator's CodeBuddy Web UI.)",
-                {"badges": ["real agent", "integration note"],
+                {"badges": ["real agent", "timed out"],
                  "job_id": job_id}, conv_id)
+            self._finish_turn(st, "timed out")
             publish({"type": "chat", "conv_id": conv_id})
+        except Exception as e:  # never leave a turn stuck streaming
+            self.store.audit("agent", "relay.crashed", conv_id,
+                             {"job": job_id, "err": repr(e)})
+            try:
+                self.store.msg_add(
+                    "agent",
+                    f"(The message relay for this turn stopped "
+                    f"unexpectedly: {e}. Nothing was fabricated; check "
+                    "the job status or send another message.)",
+                    {"badges": ["real agent", "relay error"],
+                     "job_id": job_id}, conv_id)
+                self._finish_turn(st, "relay error")
+                publish({"type": "chat", "conv_id": conv_id})
+            except Exception:
+                pass
         finally:
             st["busy"] = False
 
@@ -320,6 +403,14 @@ class DemoAgent:
             if not st["busy"]:
                 st["busy"] = True
                 st["job"] = job_id
+                kick = self.store.msg_add(
+                    "agent",
+                    f"Acting on your decision (job {str(job_id)[:8]}...) - "
+                    "relaying the agent's response.",
+                    {"badges": ["real agent", "streaming"],
+                     "source": "codebuddy", "job_id": job_id,
+                     "turn_state": "streaming"}, conv_id)
+                st["kick"] = kick["id"]
                 threading.Thread(target=self._turn, args=(conv_id,),
                                  daemon=True).start()
         except Exception as e:

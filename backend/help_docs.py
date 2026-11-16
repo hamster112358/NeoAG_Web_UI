@@ -168,6 +168,11 @@ workspace to resize.
 - Chats and formal analysis runs are different things: conversations
   never appear in Task History, and analysis jobs never appear as chat
   messages.
+- A real-mode turn always ends visibly: the "Real agent started"
+  line carries the final status (completed, failed, cancelled,
+  timed out, connection lost, or interrupted by a server restart).
+  Nothing stays "streaming" forever, and the app never invents the
+  missing tail of a turn.
 
 ## Confirmation cards
 
