@@ -30,17 +30,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import platform
 import random
 import threading
 import time
 
 from . import mock_data
+from . import native as native_mod
+from . import versions as versions_mod
 from .store import Store, new_id, now
 from .policies import POLICY_VERSION
 
 # Version stamping for per-run snapshots: a recorded run keeps the version
 # strings it actually ran under; later releases never rewrite them.
 ENGINE_VERSION = "mock-job-engine-2026.11-r3"
+NATIVE_ENGINE_VERSION = "neoag-native-adapter-2026.11-r1"
 # Declared (NOT executed) tool stack of the mock engine - honest labels,
 # so a snapshot can never be mistaken for a real software manifest.
 MOCK_TOOLCHAIN = {
@@ -252,6 +257,507 @@ class JobManager:
         self.publish({"type": "job", "id": job_id})
         return {"job_id": job_id, "approval_id": appr["id"]}
 
+    def submit_native(self, sample_id: str, profile: str = "demo",
+                      native_params: dict | None = None, stub: bool = False,
+                      requested_by: str = "user",
+                      conv_id: str = "") -> dict:
+        """Formal NEOAG job on the NATIVE execution system (Milestone 5,
+        PART 1). Two profiles, both real NeoAG code paths:
+          demo    - `neoag.cli run-demo`: the deployed repo's own safe
+                    synthetic execution (fixture inputs, predictors
+                    explicitly stubbed, no patient data / licensed
+                    binaries / network). Completes -> real artifacts.
+          gateway - `open-neo run --mode execute` through the native
+                    controlled-execution gateway (the ONLY way native
+                    code permits heavy execution; verified: direct
+                    execute returns GATEWAY_REQUIRED). Requires real
+                    inputs and a working toolchain; failures are
+                    reported honestly, never rerouted to the mock engine.
+        Same approval boundary as mock execute-class work: a human
+        approves BEFORE anything runs (POL-005)."""
+        if profile not in ("demo", "gateway"):
+            raise ValueError("profile must be demo|gateway")
+        if profile == "gateway" and not (native_params or {}).get("sample_id"):
+            raise ValueError("gateway profile requires native_params.sample_id")
+        params = dict(native_params or {})
+        params.setdefault("sample_id", sample_id)
+        spec = {"engine": "native", "native_profile": profile,
+                "native_params": params, "stub": bool(stub),
+                "execution_mode": "autonomous",
+                "requested_config": dict(params)}
+        job_id = new_id("job")
+        if profile == "demo":
+            summary = ("start NATIVE demo execution for sample "
+                       f"{sample_id} - real NeoAG pipeline code, bundled "
+                       "demo fixtures, predictors stubbed")
+            risk = "MEDIUM (native runner, synthetic fixture inputs only)"
+            note = ("Approving runs `neoag.cli run-demo` from the deployed "
+                    "NeoAG source. No patient data, no licensed binaries, "
+                    "no network. Outputs are real files under the run's "
+                    "scratch directory.")
+        else:
+            summary = ("start NATIVE execution via the NeoAG gateway for "
+                       f"case {params.get('case_id') or sample_id} "
+                       "(planning first, then execute after this approval)")
+            risk = "HIGH (execute-class on the native gateway)"
+            note = ("Approving plans through the native planner and submits "
+                    "the execution to NeoAG's controlled-execution gateway "
+                    "with approved=true. Cancel is NOT supported by the "
+                    "native gateway (verified limitation): cancelling here "
+                    "marks the Web job cancelled but the gateway job runs "
+                    "to completion.")
+        appr = self.store.approval_create(new_id("appr"), job_id, summary,
+                                          risk, note)
+        self.store.job_create(job_id, "neoag-native-run", sample_id, spec,
+                              "blocked", appr["id"], conv_id=conv_id)
+        self.store.event_add(job_id, "state",
+                             f"blocked: native job waiting for approval "
+                             f"{appr['id']} ({profile} profile)")
+        self.store.audit(requested_by, "job.native.create.blocked", job_id,
+                         {"sample": sample_id, "profile": profile,
+                          "inputs": sorted(params.keys()),
+                          "approval": appr["id"]})
+        self.publish({"type": "approval", "id": appr["id"]})
+        self.publish({"type": "job", "id": job_id})
+        return {"job_id": job_id, "approval_id": appr["id"]}
+
+    # ---------- benchmark jobs (Milestone 5 PART 6) ----------
+    BENCH_STRATEGIES = ("weighted", "evidence-consensus")
+
+    @staticmethod
+    def _dataset_consent_ok(appr: dict | None,
+                            dataset_ref: str = "") -> bool:
+        """PART 3 dataset consent = an APPROVED dataset-download consent
+        card: the gate card written by the agent (risk 'dataset' or a
+        structured kind 'dataset_download'). The approval 'action'
+        column holds free prose (job summaries), so a substring match
+        there would let an ordinary benchmark card masquerade as
+        consent. When the consent card names a dataset it must match
+        the requested one - consent to one dataset is not blanket
+        consent."""
+        if not appr or appr.get("state") != "approved":
+            return False
+        kind_ok = False
+        ds_name = ""
+        if str(appr.get("risk") or "") == "dataset":
+            kind_ok = True
+        if str(appr.get("action") or "") == "gate_op":
+            try:
+                d = json.loads(appr.get("detail") or "{}")
+            except (ValueError, TypeError):
+                d = {}
+            strd = d.get("structured") or {}
+            if strd.get("kind") == "dataset_download":
+                kind_ok = True
+                ds_name = str(strd.get("dataset") or "")
+        if not kind_ok:
+            return False
+        if ds_name and dataset_ref:
+            return ds_name.strip().lower() == dataset_ref.strip().lower()
+        return True
+
+    def submit_benchmark(self, brief: dict, sample_id: str = "DEMO-BENCH",
+                         requested_by: str = "user",
+                         conv_id: str = "") -> dict:
+        """A benchmark is a FORMAL job: the full experiment brief
+        (hypothesis / tools / baseline / dataset / metrics / compute /
+        risks) is shown on the approval card, and NOTHING runs before a
+        human approves it. Dataset rule (PART 3): only the synthetic
+        demo fixture is free - any other dataset must carry an APPROVED
+        dataset-download CONSENT card (the PART 3 gate card, see
+        _dataset_consent_ok); free prose that merely mentions the word
+        'dataset' is not consent. A benchmark job never downloads data.
+        Candidate tools are probed read-only:
+        an external tool not installed on this host gets a reviewable
+        run plan recorded, never simulated measurements."""
+        if not isinstance(brief, dict):
+            raise ValueError("benchmark brief must be an object")
+        hyp = str(brief.get("hypothesis") or "").strip()
+        tools = brief.get("tools") or {}
+        cand = str(tools.get("candidate") or "").strip()
+        base = str(tools.get("baseline") or "").strip()
+        metrics = [str(m) for m in (brief.get("metrics") or [])
+                   if str(m).strip()]
+        if not hyp or not cand or not base:
+            raise ValueError("benchmark brief needs hypothesis, "
+                             "tools.candidate and tools.baseline")
+        if not metrics:
+            raise ValueError("benchmark brief needs explicit metrics - a "
+                             "comparison without a stated metric is not a "
+                             "benchmark")
+        ds = brief.get("dataset") or {}
+        src = str(ds.get("source") or "demo_fixture")
+        if src != "demo_fixture":
+            cid = str(ds.get("consent_approval_id") or "")
+            appr = self.store.approval_get(cid) if cid else None
+            ds_ref = str(ds.get("id") or src)
+            if not self._dataset_consent_ok(appr, ds_ref):
+                raise ValueError(
+                    f"dataset {ds_ref!r} is not the synthetic demo "
+                    "fixture and consent_approval_id does not reference "
+                    "an APPROVED dataset-download consent card "
+                    "(dataset-specific) - benchmark jobs never download "
+                    "datasets, an operator must supply the data first")
+        cfg = brief.get("config") or {}
+        try:
+            gate_b = float(cfg.get("baseline_gate", 1.4))
+            gate_c = float(cfg.get("candidate_gate", 1.4))
+        except (TypeError, ValueError):
+            raise ValueError("gates must be numbers")
+        strat = str(brief.get("candidate_strategy")
+                    or "evidence-consensus")
+        if strat not in self.BENCH_STRATEGIES:
+            raise ValueError("candidate_strategy must be one of "
+                             + "/".join(self.BENCH_STRATEGIES)
+                             + " (strategies this deployment can execute)"
+                             + " - external tools run via plan-only arms")
+        spec = {
+            "engine": "benchmark",
+            "benchmark": {
+                "hypothesis": hyp,
+                "tools": {"candidate": cand, "baseline": base},
+                "baseline_strategy": "weighted",
+                "candidate_strategy": strat,
+                "metrics": metrics,
+                "compute_estimate": str(brief.get("compute_estimate")
+                                        or "not stated"),
+                "risks": [str(r) for r in (brief.get("risks") or [])],
+                "dataset": {"source": src, "id": ds.get("id") or src,
+                            "consent_approval_id":
+                                ds.get("consent_approval_id")},
+                "gates": {"baseline": gate_b, "candidate": gate_c}},
+            "dataset_version": mock_data.DEMO_DATASET_VERSION,
+            "execution_mode": "controlled",
+            "requested_config": {"benchmark": True,
+                                 "top_n": int(brief.get("top_n", 12))}}
+        job_id = new_id("job")
+        summary = (f"BENCHMARK proposal - hypothesis: {hyp[:180]} | "
+                   f"candidate '{cand}' vs baseline '{base}' on dataset "
+                   f"{ds.get('id') or src} | metrics: "
+                   f"{', '.join(metrics)} | compute: "
+                   f"{spec['benchmark']['compute_estimate']}")
+        note = ("Approving runs the benchmark harness on this host. Arms "
+                "using the deployment's own ranking strategies execute "
+                "for real on identical seeded inputs with a full "
+                "reproducibility record; a candidate tool that is not "
+                "installed here is NOT simulated - its arm records a "
+                "reviewable run plan and the result states that. No "
+                "dataset downloads happen at run time.")
+        if spec["benchmark"]["risks"]:
+            note += (" Stated risks: "
+                     + "; ".join(spec["benchmark"]["risks"])[:400])
+        appr = self.store.approval_create(
+            new_id("appr"), job_id, summary,
+            "MEDIUM (benchmark harness on synthetic demo fixture)", note)
+        self.store.job_create(job_id, "benchmark", sample_id, spec,
+                              "blocked", appr["id"], conv_id=conv_id)
+        self.store.event_add(job_id, "state",
+                             f"blocked: benchmark brief waiting for "
+                             f"approval {appr['id']}")
+        self.store.audit(requested_by, "job.benchmark.create.blocked",
+                         job_id,
+                         {"hypothesis": hyp[:200], "candidate": cand,
+                          "baseline": base,
+                          "dataset": spec["benchmark"]["dataset"],
+                          "approval": appr["id"]})
+        self.publish({"type": "approval", "id": appr["id"]})
+        self.publish({"type": "job", "id": job_id})
+        return {"job_id": job_id, "approval_id": appr["id"]}
+
+    @staticmethod
+    def _spearman(a: list[str], b: list[str]) -> float | None:
+        """Rank correlation over the items both rankings contain (ties:
+        first occurrence). None when fewer than 3 shared items - the
+        harness must not compute a correlation from a stub."""
+        ia = {k: i for i, k in reversed(list(enumerate(a)))}
+        ib = {k: i for i, k in reversed(list(enumerate(b)))}
+        shared = [k for k in a if k in ib]
+        n = len(shared)
+        if n < 3:
+            return None
+        ra = [ia[k] for k in shared]
+        rb = [ib[k] for k in shared]
+        ma, mb = sum(ra) / n, sum(rb) / n
+        cov = sum((x - ma) * (y - mb) for x, y in zip(ra, rb))
+        va = sum((x - ma) ** 2 for x in ra)
+        vb = sum((y - mb) ** 2 for y in rb)
+        if va <= 0 or vb <= 0:
+            return None
+        return round(cov / (va ** 0.5 * vb ** 0.5), 4)
+
+    def _run_benchmark(self, job: dict, spec: dict) -> None:
+        """Benchmark harness. Both arms receive the IDENTICAL seeded
+        candidate pool; metrics are computed from the produced tables,
+        not asserted. The run is pinned by a reproducibility record
+        (seed, input/output checksums, environment, versions, measured
+        wall time). An external candidate tool that is not installed
+        here is recorded as a plan-only arm with a read-only probe
+        result - never a simulated measurement."""
+        job_id = job["id"]
+        b = spec["benchmark"]
+        top_n = int((spec.get("requested_config") or {}).get("top_n", 12))
+        seed = f"{job_id}:{job['sample_id']}:{spec['dataset_version']}"
+        benchdir = os.path.join(str(self.store.data_dir), "benchmarks",
+                                job_id)
+        os.makedirs(benchdir, exist_ok=True)
+        t0 = time.monotonic()
+        self.store.job_set(job_id, state="running", started_at=now(),
+                           stage="benchmark: inputs", progress=5.0)
+        self.store.event_add(
+            job_id, "log",
+            f"(benchmark harness) hypothesis: {b['hypothesis']}")
+        self.store.event_add(job_id, "log",
+                             f"(benchmark harness) seed pinned: {seed}; "
+                             "both arms will see the identical input pool")
+
+        def _cancelled() -> bool:
+            if not self._flag(job_id, "cancel"):
+                return False
+            self.store.job_set(job_id, state="cancelled", finished_at=now(),
+                               error="cancelled by user mid-benchmark - "
+                                     "partial files kept under the run dir")
+            self.store.event_add(job_id, "state", "cancelled")
+            self.publish({"type": "job", "id": job_id})
+            return True
+
+        pool = mock_data.make_pool(job_id, job["sample_id"], top_n)
+        pool_sha = hashlib.sha256(
+            json.dumps(pool, sort_keys=True, ensure_ascii=False)
+            .encode()).hexdigest()
+        self.store.event_add(job_id, "log",
+                             f"(benchmark harness) input pool: {len(pool)} "
+                             f"candidate(s), sha256 {pool_sha[:16]}...")
+        if _cancelled():
+            return
+        # read-only probes for BOTH named tools (installed version honesty)
+        probes = {arm: versions_mod.installed_version(b["tools"][arm])
+                  for arm in ("baseline", "candidate")}
+        for arm in ("baseline", "candidate"):
+            p = probes[arm]
+            if p.get("value"):
+                pline = (f"installed version {p['value']} "
+                         f"({p.get('evidence')})")
+            else:
+                pline = ("not verified - " + str(
+                    p.get("reason") or
+                    "no version evidence in the deployed tools layout"))
+            self.store.event_add(
+                job_id, "log",
+                f"(benchmark harness) tool probe {arm}="
+                f"{b['tools'][arm]}: {pline}")
+        arms: dict[str, dict] = {}
+        registered: list[dict] = []
+        warnings: list[str] = []
+        # baseline arm: the deployment's current weighted ranking
+        self.store.job_set(job_id, stage="benchmark: baseline arm",
+                           progress=30.0)
+        try:
+            base_pool = mock_data.make_pool(job_id, job["sample_id"], top_n)
+            base_tbl, base_meta = mock_data.weighted_rank(
+                mock_data.apply_gate(base_pool, b["gates"]["baseline"]))
+            arms["baseline"] = {
+                "kind": "deployed strategy", "strategy": "weighted",
+                "gate": b["gates"]["baseline"], "rows": base_tbl,
+                "meta": base_meta, "tool": b["tools"]["baseline"],
+                "installed": probes["baseline"]}
+        except Exception as e:
+            arms["baseline"] = {"kind": "deployed strategy",
+                                "error": str(e)[:300], "rows": []}
+            warnings.append(f"baseline arm failed: {e}")
+        if _cancelled():
+            return
+        # candidate arm: deployed strategy when requested (real, paired),
+        # otherwise a PLAN (never simulated) with the read-only probe
+        self.store.job_set(job_id, stage="benchmark: candidate arm",
+                           progress=50.0)
+        if b["candidate_strategy"] in self.BENCH_STRATEGIES:
+            try:
+                cand_pool = mock_data.make_pool(job_id, job["sample_id"],
+                                                top_n)
+                if b["candidate_strategy"] == "weighted":
+                    cand_tbl, cand_meta = mock_data.weighted_rank(
+                        mock_data.apply_gate(cand_pool,
+                                             b["gates"]["candidate"]))
+                else:
+                    cand_tbl = mock_data.consensus_rank(
+                        mock_data.apply_gate(cand_pool,
+                                             b["gates"]["candidate"]),
+                        b["gates"]["candidate"])
+                    cand_meta = {"gate": b["gates"]["candidate"],
+                                 "tier": f">={mock_data.CONSENSUS_TIER}/"
+                                         f"{len(mock_data.CONSENSUS_RULES)}"
+                                         " rules"}
+                arms["candidate"] = {
+                    "kind": "deployed strategy",
+                    "strategy": b["candidate_strategy"],
+                    "gate": b["gates"]["candidate"], "rows": cand_tbl,
+                    "meta": cand_meta, "tool": b["tools"]["candidate"],
+                    "installed": probes["candidate"]}
+            except Exception as e:
+                arms["candidate"] = {"kind": "deployed strategy",
+                                     "error": str(e)[:300], "rows": []}
+                warnings.append(f"candidate arm failed: {e}")
+        else:
+            arms["candidate"] = {
+                "kind": "plan-only (external tool not executed)",
+                "tool": b["tools"]["candidate"],
+                "installed": probes["candidate"],
+                "rows": [],
+                "plan": (
+                    "TO RUN THIS ARM: an operator must install/enable "
+                    f"'{b['tools']['candidate']}' (production tool "
+                    "install requires explicit authorization - this app "
+                    "never installs or patches tools silently), pin its "
+                    "exact version, feed it the identical input pool "
+                    "recorded in this bundle (input_pool.json), and write "
+                    "its ranked output to arm_candidate.tsv in the same "
+                    "schema as arm_baseline.tsv. Then resubmit this "
+                    "benchmark brief; the harness will compute the "
+                    "metrics from real outputs."),
+                "note": ("NO measurements were produced for this arm and "
+                         "none were invented")}
+            warnings.append(
+                f"candidate '{b['tools']['candidate']}' is not a strategy "
+                "this deployment executes - arm recorded as PLAN ONLY "
+                "(no simulated measurements)")
+        if _cancelled():
+            return
+        # metrics: computed from the two tables, or explicitly absent
+        self.store.job_set(job_id, stage="benchmark: metrics",
+                           progress=70.0)
+        a_rows = arms["baseline"].get("rows") or []
+        c_rows = arms["candidate"].get("rows") or []
+        a_keys = [r.get("peptide") for r in a_rows]
+        c_keys = [r.get("peptide") for r in c_rows]
+        k = min(len(a_keys), len(c_keys), top_n)
+        metrics = {
+            "stated_metrics": b["metrics"],
+            "computed": None,
+            "note": ""}
+        if a_rows and c_rows and k >= 2:
+            overlap = len(set(a_keys[:k]) & set(c_keys[:k]))
+            both = set(a_keys) & set(c_keys)
+            metrics["computed"] = {
+                "top_k_overlap": {"value": round(overlap / k, 4),
+                                  "k": k,
+                                  "definition": f"shared entries in the "
+                                  f"top-{k} of both rankings / k"},
+                "rank_correlation_spearman": {
+                    "value": self._spearman(a_keys, c_keys),
+                    "definition": "Spearman rho over the shared peptides "
+                                  "(first-occurrence ranks); null when "
+                                  "fewer than 3 shared items"},
+                "candidate_set_fraction": {
+                    "value": round(len(both) / max(len(set(a_keys)
+                                                      | set(c_keys)), 1), 4),
+                    "definition": "Jaccard of the two candidate sets"}}
+            metrics["note"] = ("values COMPUTED from the two produced "
+                               "tables (see arm files); recompute is "
+                               "possible from the pinned seed + checksums")
+        else:
+            metrics["note"] = (
+                "NOT computed: at least one arm produced no table "
+                "(plan-only or failed arm). The stated metrics remain "
+                f"{b['metrics']} and are UNANSWERED by this run - no "
+                "number is substituted")
+        wall = round(time.monotonic() - t0, 3)
+        # persist the reproducibility record + arm files (real bytes on
+        # disk; the results-bundle export ships them)
+        repro = {
+            "kind": "benchmark_reproducibility_record",
+            "job_id": job_id, "seed": seed,
+            "input_pool_sha256": pool_sha,
+            "dataset_version": spec["dataset_version"],
+            "dataset_source": b["dataset"],
+            "ground_truth": (
+                "the mock fixture pool is a deterministic function of the "
+                "seed (mock_data.make_pool) - 'ground truth' here is the "
+                "identical-input property, NOT validated biology"),
+            "environment": {
+                "python": platform.python_version(),
+                "platform": platform.platform(),
+                "engine": ENGINE_VERSION, "policy": POLICY_VERSION,
+                "wall_time_seconds_measured": wall},
+            "tools": {"baseline": {"name": b["tools"]["baseline"],
+                                   **probes["baseline"]},
+                      "candidate": {"name": b["tools"]["candidate"],
+                                    **probes["candidate"]}},
+            "arms": {arm: {k2: v2 for k2, v2 in a.items()
+                           if k2 != "rows"}
+                     for arm, a in arms.items()},
+            "metrics": metrics,
+            "commands_note": ("the harness calls backend/mock_data "
+                              "functions in-process (no subprocess was "
+                              "spawned); external-arm commands would be "
+                              "recorded verbatim here")}
+        files = {"reproducibility.json": json.dumps(repro, indent=1,
+                                                    ensure_ascii=False),
+                 "benchmark_metrics.json": json.dumps(metrics, indent=1,
+                                                      ensure_ascii=False),
+                 "input_pool.json": json.dumps(pool, indent=1,
+                                               ensure_ascii=False)}
+        for arm in ("baseline", "candidate"):
+            rows = arms[arm].get("rows")
+            if rows:
+                files[f"arm_{arm}.tsv"] = (
+                    "\t".join(str(x) for x in rows[0].keys()) + "\n"
+                    + "\n".join("\t".join(
+                        json.dumps(r.get(c), ensure_ascii=False)
+                        if isinstance(r.get(c), (dict, list))
+                        else str(r.get(c)) for c in rows[0])
+                        for r in rows))
+            else:
+                files[f"arm_{arm}.plan.txt"] = str(
+                    arms[arm].get("plan") or arms[arm].get("error")
+                    or "no output")
+        for name, text in files.items():
+            with open(os.path.join(benchdir, name), "w") as f:
+                f.write(text)
+            registered.append(self.store.artifact_add(
+                job_id, "benchmark_output", name, None,
+                os.path.join(benchdir, name), "available",
+                text.count("\n") + 1,
+                hashlib.sha256(text.encode()).hexdigest()[:16], {}))
+            self.store.event_add(job_id, "log",
+                                 f"(benchmark harness) wrote {name}")
+        outcome = classify_outcome(registered)
+        result = {
+            "engine": "benchmark", "engine_version": ENGINE_VERSION,
+            "disclaimer": ("BENCHMARK ON MOCK FIXTURE - inputs are the "
+                           "synthetic demo pool, not patient data. "
+                           "Computed values are real computations on that "
+                           "fixture; they say NOTHING about real-world "
+                           "tool performance."),
+            "outcome": outcome,
+            "outcome_note": (
+                "both arms executed for real on identical seeded inputs"
+                if (a_rows and c_rows) else
+                "AT LEAST ONE ARM HAS NO EXECUTED OUTPUT - the stated "
+                "metrics are unanswered by this run (see metrics.note)"),
+            "brief": b,
+            "metrics": metrics,
+            "arms_summary": {arm: {k2: v2 for k2, v2 in a.items()
+                                   if k2 != "rows"}
+                             for arm, a in arms.items()},
+            "reproducibility": repro,
+            "warnings": warnings,
+            "outdir": benchdir,
+            "provenance": {"job_id": job_id, "seed": seed,
+                           "input_pool_sha256": pool_sha,
+                           "dataset_version": spec["dataset_version"]}}
+        self.store.job_set(job_id, state="completed", finished_at=now(),
+                           progress=100.0, stage=None, outcome=outcome,
+                           result_json=json.dumps(result,
+                                                  ensure_ascii=False))
+        self.store.event_add(job_id, "state",
+                             f"completed (benchmark): outcome={outcome}, "
+                             f"metrics computed={'yes' if metrics['computed'] else 'NO - unanswered'}")
+        self.store.audit("engine", "job.benchmark.completed", job_id,
+                         {"outcome": outcome,
+                          "computed": bool(metrics["computed"]),
+                          "wall_s": wall})
+        self.publish({"type": "job", "id": job_id})
+
     def on_approval_decided(self, appr_id: str, approve: bool) -> None:
         with self.store.lock:
             rows = self.store.db.execute(
@@ -296,6 +802,13 @@ class JobManager:
         job = self.store.job_get(job_id)
         if not job or job["state"] != "running":
             return False
+        if json.loads(job["spec_json"] or "{}").get("engine") == "native":
+            self.store.event_add(job_id, "log",
+                "pause requested - NOT supported for native runs: the "
+                "pipeline executes inside NeoAG's gateway or as one "
+                "supervised runner process with no safe pause point. "
+                "Cancel (with its honest caveats) is the only stop control.")
+            return False
         self.store.job_set(job_id, pause_requested=1)
         self.controls.setdefault(job_id, {})["pause"] = True
         self.store.audit("user", "job.pause.requested", job_id)
@@ -317,6 +830,11 @@ class JobManager:
         if not job or job["state"] in ("completed", "failed", "cancelled"):
             return None
         cur = (json.loads(job["spec_json"]) or {}).get("execution_mode", "controlled")
+        if json.loads(job["spec_json"] or "{}").get("engine") == "native":
+            return {"ok": False,
+                    "error": "mode switching applies to mock decision points; "
+                             "native runs take their scientific options from "
+                             "the submitted configuration"}
         if mode == cur:
             return {"ok": False, "error": "already in that mode"}
         self.mode_requests[job_id] = mode
@@ -450,11 +968,299 @@ class JobManager:
                 return "aborted"
             time.sleep(0.25)
 
+    # ----- native engine worker (Milestone 5 PART 1: one task system,
+    # two real engines). Nothing here reimplements NeoAG's planner or
+    # scientific routing; native code decides routes and stages. -----
+    def _poll_flag(self, job_id: str):
+        return "cancel" if self._flag(job_id, "cancel") else None
+
+    def _cancel_native(self, job_id: str, note: str) -> None:
+        self.store.job_set(job_id, state="cancelled", finished_at=now(),
+                           error=note)
+        self.store.event_add(job_id, "state", f"cancelled: {note}")
+        self.publish({"type": "job", "id": job_id})
+
+    def _fail_native(self, job_id: str, outdir: str, profile: str,
+                     code: str, message: str, detail) -> None:
+        # register whatever the attempt really produced (forensics), then
+        # fail honestly - a failed native run is NEVER downgraded into a
+        # mock success.
+        arts, _un = native_mod.collect_artifacts(outdir)
+        self._register_native_artifacts(job_id, arts, profile)
+        err = f"NATIVE FAILURE {code}: {message}"[:500]
+        self.store.job_set(job_id, state="failed", finished_at=now(),
+                           outcome="generation_failed", error=err,
+                           result_json=json.dumps({
+                               "engine": "native",
+                               "engine_version": NATIVE_ENGINE_VERSION,
+                               "native_profile": profile, "ok": False,
+                               "failure_code": code,
+                               "failure_detail": str(detail or "")[:1500],
+                               "outdir": outdir}, ensure_ascii=False))
+        self.store.event_add(job_id, "state", f"failed: {err}")
+        self.publish({"type": "job", "id": job_id})
+
+    def _register_native_artifacts(self, job_id: str, arts: list,
+                                   profile: str) -> list:
+        """Register REAL files produced by native execution: path, size,
+        sha256, row counts for tables. Availability status is derived
+        from the file itself - never assumed."""
+        tmap = {"tsv": "candidate_table", "csv": "candidate_table",
+                "json": "json", "md": "plan_md", "log": "log",
+                "html": "report_html", "txt": "text",
+                "xls": "prediction_table", "vcf": "vcf",
+                "toml": "config"}
+        registered = []
+        for a in arts:
+            name = a["name"]
+            ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+            status = "available" if a["bytes"] > 0 else "empty"
+            rows = None
+            if ext in ("tsv", "csv") and 0 < a["bytes"] < 20_000_000:
+                try:
+                    with open(a["path"], "rb") as f:
+                        rows = sum(1 for _ in f) - 1
+                except OSError:
+                    rows = None
+                if rows is not None and rows <= 0:
+                    status = "empty"
+            registered.append(self.store.artifact_add(
+                job_id, tmap.get(ext, "file"), name, None, a["path"],
+                status, rows, a["sha256"][:16],
+                {"native": True, "profile": profile,
+                 "sha256_full": a["sha256"]}))
+        for a in registered[:60]:
+            self.store.event_add(
+                job_id, "log",
+                f"native artifact: {a['name']} [{a['status']}]"
+                + (f" {a['rows']} row(s), checksum {a['checksum']}"
+                   if a["rows"] else ""))
+        if len(registered) > 60:
+            self.store.event_add(job_id, "log",
+                                 f"({len(registered) - 60} more artifact "
+                                 "lines omitted from the event log)")
+        return registered
+
+    def _finalize_native(self, job_id: str, outdir: str, profile: str,
+                         params: dict, ok: bool, failure, gw) -> None:
+        arts, unreadable = native_mod.collect_artifacts(outdir)
+        registered = self._register_native_artifacts(job_id, arts, profile)
+
+        # Deliverable classes follow the NATIVE output layout (verified
+        # against the demo run's real files): generated HTML reports,
+        # the scoring/ranking tables and run provenance. Empty
+        # AUXILIARY tables (e.g. ccf_conflicts.tsv = "no conflicts")
+        # stay registered with their honest 'empty' status and are
+        # reported as warnings - a no-finding table must not silently
+        # vanish, but it also does not fake a delivery gap.
+        def _deliverable(name: str) -> bool:
+            return (name.startswith("reports/") and name.endswith(".html")
+                    or name.startswith("scoring/")
+                    or name.startswith("ranking/")
+                    or name == "provenance.json")
+        deliverables = [a for a in registered if _deliverable(a["name"])]
+        aux_empty = [a["name"] for a in registered
+                     if a["status"] == "empty" and not _deliverable(a["name"])]
+        warnings = []
+        if aux_empty:
+            warnings.append(
+                f"{len(aux_empty)} auxiliary table(s) legitimately contain "
+                "zero rows (no-finding outputs such as conflicts tables); "
+                "listed per artifact: " + ", ".join(aux_empty[:8])
+                + ("..." if len(aux_empty) > 8 else ""))
+        if profile == "demo":
+            warnings.append(
+                "native 'demo' profile: the REAL NeoAG pipeline runner "
+                "(neoag.cli run-demo) executed on the deployed repo's "
+                "bundled fixture inputs with predictors explicitly "
+                "stubbed - a genuine native execution and real artifacts, "
+                "but scientifically demo data, not a patient result")
+        if unreadable:
+            warnings.append(f"{len(unreadable)} produced file(s) could not "
+                            "be read for checksumming (listed in result)")
+        if ok:
+            outcome = classify_outcome(deliverables or registered)
+            result = {"engine": "native",
+                      "engine_version": NATIVE_ENGINE_VERSION,
+                      "native_profile": profile, "ok": True,
+                      "gateway_job_id": gw,
+                      "artifact_count": len(registered),
+                      "deliverable_count": len(deliverables),
+                      "unreadable": unreadable[:10],
+                      "warnings": warnings, "outdir": outdir,
+                      "inputs": params}
+            self.store.job_set(job_id, state="completed", finished_at=now(),
+                               outcome=outcome,
+                               result_json=json.dumps(result,
+                                                      ensure_ascii=False))
+            self.store.event_add(job_id, "state",
+                                 f"completed (native {profile}) - outcome "
+                                 f"{outcome}; {len(registered)} real "
+                                 f"artifact(s) registered under {outdir}")
+        else:
+            result = {"engine": "native",
+                      "engine_version": NATIVE_ENGINE_VERSION,
+                      "native_profile": profile, "ok": False,
+                      "gateway_job_id": gw,
+                      "failure_code": (failure or {}).get("code"),
+                      "failure_detail": (failure or {}).get("detail"),
+                      "artifact_count": len(registered),
+                      "warnings": warnings, "outdir": outdir,
+                      "inputs": params}
+            self.store.job_set(job_id, state="failed", finished_at=now(),
+                               outcome="generation_failed",
+                               error="NATIVE FAILURE "
+                                     f"{(failure or {}).get('code')}"[:200],
+                               result_json=json.dumps(result,
+                                                      ensure_ascii=False))
+            self.store.event_add(job_id, "state",
+                                 "failed: native execution reported failure "
+                                 f"({(failure or {}).get('code')}) - partial "
+                                 "outputs, if any, registered for forensics")
+        self.publish({"type": "job", "id": job_id})
+
+    def _run_native(self, job: dict, spec: dict) -> None:
+        job_id = job["id"]
+        profile = spec.get("native_profile", "demo")
+        params = dict(spec.get("native_params") or {})
+        params.setdefault("case_id", job["sample_id"])
+        sample_id = job["sample_id"]
+        cap = native_mod.probe()
+        outdir = native_mod.job_outdir(job_id)
+        # A5 snapshot, same write-once discipline as mock runs: freezes
+        # the toolchain coordinates this real run actually saw.
+        self.store.snapshot_add(job_id, {
+            "captured_at": now(), "job_id": job_id, "kind": job["kind"],
+            "sample_id": sample_id, "conv_id": job.get("conv_id") or "",
+            "engine": "native", "engine_version": NATIVE_ENGINE_VERSION,
+            "native_profile": profile, "native_params": params,
+            "requested_config": spec.get("requested_config") or {},
+            "execution_mode_at_start": "autonomous",
+            "policy_version": POLICY_VERSION,
+            "toolchain": cap.get("toolchain"),
+            "gateway_url": cap.get("gateway", {}).get("url"),
+            "cancel_supported_by_native_gateway":
+                cap.get("cancel_supported_by_native_gateway"),
+        })
+        self.store.job_set(job_id, state="running", started_at=now(),
+                           stage="native")
+        self.store.event_add(job_id, "state",
+                             f"running: NATIVE engine ({profile} profile) - "
+                             "no mock fallback exists; failures stay failed. "
+                             "Per-run snapshot recorded.")
+        self.publish({"type": "job", "id": job_id})
+        if not cap["available"]:
+            return self._fail_native(
+                job_id, outdir, profile, "NATIVE_UNAVAILABLE",
+                "native NeoAG source/python is not importable on this host; "
+                "the Web UI refuses to silently fall back to mock (Milestone "
+                "5 1.6)", cap)
+        if profile == "demo":
+            self.store.event_add(job_id, "log",
+                "native 'demo' profile: runs the real NeoAG pipeline "
+                "(neoag.cli run-demo) from the deployed source on bundled "
+                "fixtures, predictors stubbed; cancel works here because it "
+                "is our supervised subprocess")
+            res = native_mod.run_demo(outdir, sample_id=sample_id,
+                                      poll=lambda: self._poll_flag(job_id))
+            if res.get("status") == "DEMO_CANCELLED":
+                return self._cancel_native(
+                    job_id, "native demo process terminated (SIGTERM)")
+            return self._finalize_native(
+                job_id, outdir, profile, params, res["ok"],
+                None if res["ok"] else {
+                    "code": res.get("status") or f"rc={res.get('rc')}",
+                    "detail": (res.get("error")
+                               or res.get("log_tail", ""))[-800:]}, None)
+        # ---- gateway profile ----
+        self.store.event_add(job_id, "log",
+            "native 'gateway' profile: real native planner first "
+            "(read-only), then execution submitted through NeoAG's "
+            "controlled-execution gateway; failures are reported, never "
+            "rerouted to the mock engine")
+        plan = native_mod.run_plan(params, os.path.join(outdir, "plan"))
+        self.store.job_set(job_id,
+                           native_plan_json=json.dumps(plan)[:400000])
+        steps = plan.get("steps") or []
+        self.store.event_add(job_id, "log",
+            f"native plan: status={plan.get('status')} steps={len(steps)} "
+            f"run_id={plan.get('run_id')} (full plan stored on the job)")
+        for s in steps:
+            self.store.event_add(job_id, "log",
+                f"  plan step {s.get('step_id')} {s.get('name')}: "
+                f"{s.get('status')}"
+                + (f" - {str(s.get('detail'))[:160]}" if s.get("detail")
+                   else ""))
+        if plan.get("blocking_issues"):
+            self.store.event_add(job_id, "log",
+                "plan blocking issues: "
+                + ", ".join(str(b) for b in plan["blocking_issues"]))
+        self.publish({"type": "job", "id": job_id})
+        if not plan.get("ok"):
+            return self._fail_native(
+                job_id, outdir, profile,
+                "PLAN_" + str(plan.get("status")),
+                "native planner did not clear the run - NOTHING was "
+                "executed (plan outputs retained)", plan)
+        if self._flag(job_id, "cancel"):
+            return self._cancel_native(job_id,
+                "cancelled after planning, before any execution")
+        ex = native_mod.submit_execute(params, outdir,
+                                       stub=bool(spec.get("stub")))
+        if not ex.get("ok"):
+            return self._fail_native(job_id, outdir, profile,
+                str(ex.get("status")), "native gateway submission failed",
+                ex.get("detail"))
+        gw = ex["gw_job_id"]
+        self.store.job_set(job_id, gw_job_id=gw)
+        self.store.event_add(job_id, "log",
+            f"submitted to native gateway: job {gw} (risk "
+            f"{ex.get('risk')}). HONEST LIMITATION: the native gateway has "
+            "no cancel endpoint (verified against its source) - cancelling "
+            "this Web job will not stop the gateway job.")
+        self.publish({"type": "job", "id": job_id})
+        last = None
+        final = None
+        deadline = time.time() + 4 * 3600
+        while time.time() < deadline:
+            js = native_mod.gw_status(gw)
+            stt = js.get("status")
+            if stt != last:
+                self.store.event_add(job_id, "log",
+                                     f"gateway job {gw}: {stt}")
+                last = stt
+                self.publish({"type": "job", "id": job_id})
+            if stt not in ("QUEUED", "RUNNING", "STATUS_UNREACHABLE"):
+                final = js
+                break
+            if self._flag(job_id, "cancel"):
+                return self._cancel_native(job_id,
+                    f"Web job cancelled; GATEWAY JOB {gw} KEEPS RUNNING to "
+                    "completion (native gateway has no cancel route - "
+                    "verified). Its outputs remain on disk under "
+                    f"{outdir} and stay linked here.")
+            time.sleep(5)
+        if final is None:
+            return self._fail_native(job_id, outdir, profile,
+                "GATEWAY_MONITOR_TIMEOUT",
+                f"gateway job {gw} was still not terminal after 4h of "
+                "monitoring", None)
+        ok = final.get("status") == "PASS"
+        return self._finalize_native(
+            job_id, outdir, profile, params, ok,
+            None if ok else {"code": str(final.get("status")),
+                             "detail": str(final.get("failure_reason")
+                                           or "")[:600]}, gw)
+
     def _run(self, job_id: str) -> None:
         job = self.store.job_get(job_id)
         if not job:
             return
         spec = json.loads(job["spec_json"] or "{}")
+        if spec.get("engine") == "native":
+            return self._run_native(job, spec)
+        if spec.get("engine") == "benchmark":
+            return self._run_benchmark(job, spec)
         stage_ids = spec.get("stage_ids", [])
         exec_mode = spec.get("execution_mode", "controlled")
         rng = random.Random(job_id)

@@ -15,6 +15,7 @@ query, 15 s timeout) out of politeness to shared endpoints.
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -59,6 +60,8 @@ def pubmed_search(query: str, max_results: int = 8):
             r = (s.get("result") or {}).get(pid) or {}
             doi = next((a.get("value") for a in r.get("articleids", [])
                         if a.get("idtype") == "doi"), "")
+            pmc = next((a.get("value") for a in r.get("articleids", [])
+                        if a.get("idtype") == "pmc"), "")
             authors = ", ".join(a.get("name", "")
                                 for a in (r.get("authors") or [])[:3])
             out.append(_rec(
@@ -66,7 +69,7 @@ def pubmed_search(query: str, max_results: int = 8):
                 f"https://pubmed.ncbi.nlm.nih.gov/{pid}/",
                 r.get("title"), (r.get("pubdate") or "")[:4],
                 authors=authors, venue=r.get("fulljournalname") or "",
-                doi=doi))
+                doi=doi, pmcid=pmc))
         return out, None, {"total": total}
     except Exception as e:
         return [], f"{type(e).__name__}: {str(e)[:180]}", {}
@@ -90,6 +93,8 @@ def europepmc_search(query: str, max_results: int = 8):
                 authors=(r.get("authorString") or "")[:160],
                 venue=r.get("journalTitle") or "",
                 doi=r.get("doi") or "",
+                pmcid=r.get("pmcid") or "",
+                open_access=(r.get("isOpenAccess") == "Y"),
                 abstract=r.get("abstractText") or ""))
         return out, None, {"total": (j.get("hitCount"))}
     except Exception as e:
@@ -155,6 +160,163 @@ def github_repo_search(name: str, max_results: int = 3):
         return out, None, {"total": j.get("total_count")}
     except Exception as e:
         return [], f"{type(e).__name__}: {str(e)[:180]}", {}
+
+
+# -------- version-chain probes (M5 PART 4.2) --------
+# These use GitHub CORE requests (unauthenticated budget 60/hour per
+# host), so versions.py spends them through a measured budget and
+# records 'skipped (budget)' - never a fake 'unknown' - when the
+# budget is exhausted. The rate_limit probe itself is free.
+
+def github_rate_limit():
+    """Free probe of the unauthenticated core budget (does not count
+    against it). Returns {'core': int|None, 'reset_utc': 'HH:MM',
+    'checked_at': ...}."""
+    from .store import now as _now
+    out = {"core": None, "reset_utc": None, "checked_at": _now()}
+    try:
+        j = _http_json("https://api.github.com/rate_limit", timeout=10)
+        core = (j.get("resources") or {}).get("core") or {}
+        out["core"] = core.get("remaining")
+        ts = core.get("reset")
+        if ts:
+            import time as _t
+            out["reset_utc"] = _t.strftime(
+                "%Y-%m-%d %H:%M UTC", _t.gmtime(int(ts)))
+    except Exception:
+        pass
+    return out
+
+
+def github_releases_tags(full_name: str) -> dict:
+    """Releases list (INCLUDING pre-releases, unlike /releases/latest)
+    + tag list for one identified repository."""
+    out = {"releases": [], "tags": [], "error": None}
+    try:
+        rels = _http_json(
+            "https://api.github.com/repos/"
+            f"{full_name}/releases?per_page=10", timeout=12)
+        for r in rels if isinstance(rels, list) else []:
+            out["releases"].append({
+                "tag": r.get("tag_name"),
+                "prerelease": bool(r.get("prerelease")),
+                "published": r.get("published_at")})
+    except urllib.error.HTTPError as e:
+        # 404 on /releases means the repo has no releases AT ALL
+        if e.code != 404:
+            out["error"] = f"releases HTTP {e.code}"
+    except Exception as e:
+        out["error"] = f"releases {type(e).__name__}"
+    try:
+        tags = _http_json(
+            "https://api.github.com/repos/"
+            f"{full_name}/tags?per_page=10", timeout=12)
+        out["tags"] = [t.get("name") for t in
+                       (tags if isinstance(tags, list) else [])]
+    except Exception as e:
+        out["error"] = (out["error"] or "") + f" tags {type(e).__name__}"
+    return out
+
+
+def github_head_commit(full_name: str) -> dict:
+    try:
+        j = _http_json("https://api.github.com/repos/"
+                       f"{full_name}/commits?per_page=1", timeout=12)
+        c = (j or [{}])[0]
+        return {"sha": c.get("sha"),
+                "date": ((c.get("commit") or {}).get("committer")
+                         or {}).get("date"),
+                "url": c.get("html_url")}
+    except Exception:
+        return {}
+
+
+_VERSION_FILES = ("pyproject.toml", "setup.py", "VERSION", "version.txt")
+
+
+def github_version_file(full_name: str) -> dict:
+    """Read candidate version files through the contents API (the only
+    repository-file route reachable from this host - raw github was
+    measured NOT reachable). Returns the first file whose content
+    exposes a version, with the exact path as provenance."""
+    import base64
+    for fn in _VERSION_FILES:
+        try:
+            j = _http_json(
+                "https://api.github.com/repos/"
+                f"{full_name}/contents/{fn}", timeout=12)
+            raw = base64.b64decode(j.get("content") or "").decode(
+                "utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                continue
+            return {"error": f"contents HTTP {e.code}"}
+        except Exception:
+            continue
+        m = (re.search(r'^\s*version\s*=\s*["\']([^"\']+)["\']', raw,
+                       re.M)
+             or re.search(r'^\s*__version__\s*=\s*["\']([^"\']+)["\']',
+                          raw, re.M)
+             or re.search(r"^\s*version:\s*[\"']?([\w.\-]+)", raw,
+                          re.M)
+             or (raw.strip().splitlines() or [""])[0].strip()
+             if fn in ("VERSION", "version.txt") else None)
+        if isinstance(m, str):
+            m = re.match(r"[\w.\-]+", m)
+        if m:
+            return {"path": fn, "value": (m.group(1)
+                                          if hasattr(m, "group")
+                                          else str(m)).strip(),
+                    "url": f"https://github.com/{full_name}/blob/HEAD/{fn}"}
+    return {}
+
+
+def anaconda_bioconda(name: str, max_results: int = 1):
+    """bioconda channel via anaconda.org JSON API (measured reachable
+    2026-11-16). Many CLI tools ship only here, not on PyPI."""
+    slug = name.strip().lower().replace("_", "-")
+    try:
+        j = _http_json(f"https://api.anaconda.org/package/bioconda/"
+                       f"{urllib.parse.quote(slug)}", timeout=12)
+        versions = sorted((j.get("versions") or []), reverse=True)
+        return [_rec("bioconda", slug,
+                     f"https://anaconda.org/bioconda/{slug}",
+                     j.get("name"), None,
+                     version=j.get("latest_version") or
+                             (versions[0] if versions else None),
+                     versions=versions[:5],
+                     license=j.get("license") or "Not verified")], \
+            None, {}
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return [], "not-on-bioconda", {}
+        return [], f"HTTP {e.code}", {}
+    except Exception as e:
+        return [], f"{type(e).__name__}: {str(e)[:180]}", {}
+
+
+def pmc_fulltext(pmcid: str, max_bytes: int = 600_000):
+    """Full-text XML via NCBI efetch db=pmc (open-access subset).
+    Chosen because Europe PMC's fullTextXML sub-endpoint is NOT
+    reachable from this host (measured: 404 even for the
+    documentation's canonical example). Returns (text, error)."""
+    pid = re.sub(r"(?i)^pmc", "", str(pmcid or ""))
+    if not pid.isdigit():
+        return None, "no PMCID on the citation"
+    try:
+        req = urllib.request.Request(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+            f"efetch.fcgi?db=pmc&id={pid}&retmode=xml",
+            headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            raw = r.read(max_bytes).decode("utf-8", "replace")
+        if "<article" not in raw and "No PMC Records Found" in raw:
+            return None, "full text not in the open-access subset"
+        if "<article" not in raw:
+            return None, "efetch returned no article XML for this PMCID"
+        return raw, None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {str(e)[:150]}"
 
 
 def pypi_package(name: str, max_results: int = 1):

@@ -41,17 +41,28 @@ CONFIRM_RE = re.compile(
     r"NEOAG_CONFIRM_REQUIRED op=([0-9a-f]{24}) :: (.+?) "
     r"This operation is classified", re.S)
 
-# Official read-only task-query helper (B1): the agent queries the SAME
-# backend records the UI shows, through the API, instead of ad-hoc SQL
-# or chat memory. A dedicated GET-only token (settings-backed) is
+# Official task-query helper (B1 + Milestone 5 routing): the agent
+# queries the SAME backend records the UI shows, through the API,
+# instead of ad-hoc SQL or chat memory; it is also the ONLY sanctioned
+# way for the agent shell to register a formal run (job submit). A
+# dedicated settings-backed token grants GET on the query routes plus
+# POST /api/jobs only - everything else stays Basic-auth. The token is
 # deployed into the workspace next to the helper.
 TASKQUERY_SRC = '''#!/usr/bin/env python3
-"""NeoAG Web official task-query helper (read-only).
+"""NeoAG Web official task-query helper.
 
 Endpoints are the interface's OWN public query API; the token file
-next to this script grants GET access to task/research/skill routes
-ONLY (never writes, never chat, never secrets). The persisted backend
-records - not chat memory - are authoritative for what has run.
+next to this script grants GET access to task/research routes plus
+exactly ONE write: registering a FORMAL run via `job submit` (POST
+/api/jobs only - never chat, never settings, never secrets). The
+persisted backend records - not chat memory - are authoritative for
+what has run.
+
+Formal NeoAG executions (open-neo run --mode execute, neoag.cli run/
+run-full/run-demo, gateway posts) are BLOCKED by the execution gate
+in this shell; that is by design. Register them here instead - the
+job then appears as the same task in the interface and starts only
+after the human approval card.
 
 usage:
   taskquery.py list [n]          recent formal tasks
@@ -64,19 +75,46 @@ usage:
                                  clarifying question if several match)
   taskquery.py research [n]      discovery/research report index
   taskquery.py research get <id> full report incl. provenance/coverage
+  taskquery.py job submit '<json>'  register a formal run (blocked
+                                 until the user approves the card).
+                                 JSON body, e.g.
+                                 {"sample_id": "DEMO-P001"} - mock engine;
+                                 {"engine": "native",
+                                  "native_profile": "demo",
+                                  "sample_id": "NATIVE-1"} - safe
+                                 synthetic native run;
+                                 {"engine": "native",
+                                  "native_profile": "gateway",
+                                  "native_params": {"sample_id": "...",
+                                    "somatic_vcf": "...",
+                                    "hla_alleles": ["A*02:01"]}} - real
+                                 native plan + execute via the gateway.
+  taskquery.py job status <id>   state/outcome of one registered job
+  taskquery.py job events <id>   the job's event log
 """
-import json, os, sys, urllib.request
+import json, os, sys, urllib.error, urllib.request
 
 BASE = os.environ.get("NEOAG_WEB_BASE", "http://127.0.0.1:8712")
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-def _get(path):
-    tok = open(os.path.join(HERE, ".taskquery-token")).read().strip()
+def _tok():
+    return open(os.path.join(HERE, ".taskquery-token")).read().strip()
+
+
+def _req(path, obj=None):
     req = urllib.request.Request(
-        BASE + path, headers={"X-NeoAG-Task-Token": tok})
-    with urllib.request.urlopen(req, timeout=15) as r:
+        BASE + path,
+        data=None if obj is None else json.dumps(obj).encode(),
+        method="GET" if obj is None else "POST",
+        headers={"X-NeoAG-Task-Token": _tok(),
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read().decode("utf-8"))
+
+
+def _get(path):
+    return _req(path)
 
 
 def main():
@@ -85,23 +123,39 @@ def main():
         print(__doc__)
         return 1
     cmd = a[0]
-    if cmd == "list":
-        n = a[1] if len(a) > 1 else "20"
-        out = _get(f"/api/tasks?limit={n}")
-    elif cmd == "get":
-        out = _get("/api/tasks/" + a[1])
-    elif cmd == "snapshot":
-        out = _get(f"/api/tasks/{a[1]}/snapshot")
-    elif cmd == "active":
-        out = _get("/api/tasks/active" +
-                   (f"?conv_id={a[1]}" if len(a) > 1 else ""))
-    elif cmd == "research":
-        if len(a) > 1 and a[1] == "get":
-            out = _get("/api/research/" + a[2])
+    try:
+        if cmd == "list":
+            n = a[1] if len(a) > 1 else "20"
+            out = _get(f"/api/tasks?limit={n}")
+        elif cmd == "get":
+            out = _get("/api/tasks/" + a[1])
+        elif cmd == "snapshot":
+            out = _get(f"/api/tasks/{a[1]}/snapshot")
+        elif cmd == "active":
+            out = _get("/api/tasks/active" +
+                       (f"?conv_id={a[1]}" if len(a) > 1 else ""))
+        elif cmd == "research":
+            if len(a) > 1 and a[1] == "get":
+                out = _get("/api/research/" + a[2])
+            else:
+                out = _get("/api/research")
+        elif cmd == "job" and len(a) > 2:
+            if a[1] == "submit":
+                out = _req("/api/jobs", json.loads(a[2]))
+            elif a[1] == "status":
+                out = _get("/api/tasks/" + a[2])
+            elif a[1] == "events":
+                out = _get("/api/tasks/" + a[2]).get("events", [])
+            else:
+                print(__doc__)
+                return 1
         else:
-            out = _get("/api/research")
-    else:
-        print(__doc__)
+            print(__doc__)
+            return 1
+    except urllib.error.HTTPError as e:
+        print(json.dumps({"error": e.code,
+                          "detail": e.read().decode("utf-8", "replace")
+                          [:400]}))
         return 1
     print(json.dumps(out, indent=1, ensure_ascii=False))
     return 0
@@ -113,8 +167,10 @@ if __name__ == "__main__":
 
 
 def ensure_task_gateway(store) -> bool:
-    """Generate (once) the GET-only task token and deploy the helper +
-    token into the agent workspace."""
+    """Generate (once) the task-query token and deploy the helper +
+    token into the agent workspace. The helper is refreshed whenever
+    the embedded source changes (content compare), so routing upgrades
+    actually reach existing workspaces."""
     import secrets as _secrets
     tok = store.setting("task_token", "")
     if not tok:
@@ -122,7 +178,11 @@ def ensure_task_gateway(store) -> bool:
         store.setting_set("task_token", tok)
     os.makedirs(TASKQ_DIR, exist_ok=True)
     helper = os.path.join(TASKQ_DIR, "taskquery.py")
-    if not os.path.exists(helper):
+    try:
+        cur = open(helper).read()
+    except OSError:
+        cur = ""
+    if cur != TASKQUERY_SRC:
         with open(helper, "w") as f:
             f.write(TASKQUERY_SRC)
         os.chmod(helper, 0o755)
@@ -511,6 +571,19 @@ class DemoAgent:
         """A gate CONFIRM denial in tool output => create a confirmation
         card (approval record) so the human decides."""
         out = str(upd.get("rawOutput") or "")
+        if upd.get("status") == "failed" and "NEOAG_FORMAL_JOB_REQUIRED" in out:
+            # auditable classification (Milestone 5 routing): the gate
+            # intercepted a formal-run launch attempt. No approval path
+            # exists by design; the agent must register via
+            # taskquery.py job submit. Logged once per distinct attempt.
+            import hashlib
+            h = hashlib.sha256(out[:600].encode()).hexdigest()[:24]
+            if h not in st["ops"]:
+                st["ops"].add(h)
+                self.store.audit("agent", "gate.formal_job_blocked",
+                                 conv_id,
+                                 {"op": h,
+                                  "note": out[:300].replace("\n", " ")})
         m = CONFIRM_RE.search(out)
         if not m or upd.get("status") != "failed":
             return
@@ -519,11 +592,35 @@ class DemoAgent:
             return
         st["ops"].add(op)
         from .server import publish
+        # structured consent card (Milestone 5 PART 3): the gate writes
+        # a sidecar for dataset-download confirmations so the card can
+        # state dataset / operation / resource scope / destination /
+        # job instead of one prose line.
+        structured = {}
+        try:
+            with open(os.path.join(APPROVALS_DIR, "pending",
+                                   op + ".json")) as sf:
+                structured = json.load(sf)
+        except Exception:
+            structured = {}
+        risk = "dataset" if structured.get("class") == \
+            "dataset_download" else "destructive"
+        detail = {"op": op, "conv_id": conv_id, "note": note,
+                  "job_id": st["job"]}
+        if structured:
+            detail["structured"] = {
+                "kind": structured.get("class"),
+                "dataset": structured.get("dataset", ""),
+                "operation": structured.get("operation", "download"),
+                "resource_scope": ("this source -> this destination "
+                                   "only, 72 h (bounded; no blanket "
+                                   "downloads)"),
+                "destination": structured.get("destination", ""),
+                "job_id": st["job"] or ""}
         aid = new_id("apm")
         self.store.approval_create(
-            aid, "", "gate_op", "destructive",
-            json.dumps({"op": op, "conv_id": conv_id, "note": note,
-                        "job_id": st["job"]}, ensure_ascii=False))
+            aid, "", "gate_op", risk,
+            json.dumps(detail, ensure_ascii=False))
         self.store.audit("gate", "gate.confirm_required", aid,
                          {"op": op, "conv": conv_id})
         publish({"type": "approval", "id": aid})
@@ -545,6 +642,56 @@ class DemoAgent:
                 json.dump({"op": op, "granted_at": time.time(),
                            "approval_id": appr["id"]}, fh)
             os.chmod(f, 0o600)
+            strd = info.get("structured") or {}
+            if strd.get("kind") == "dataset_download":
+                # BOUNDED scope grant (Milestone 5 PART 3): same source
+                # -> same destination, 72 h, no blanket download permit.
+                # This is what keeps a multi-file download from becoming
+                # per-file prompting while still being consented, scoped
+                # and time-limited.
+                try:
+                    sf = os.path.join(APPROVALS_DIR, "dataset-scope.json")
+                    scopes = []
+                    try:
+                        with open(sf) as fh:
+                            scopes = json.load(fh)
+                        if not isinstance(scopes, list):
+                            scopes = []
+                    except Exception:
+                        scopes = []
+                    scopes = [s for s in scopes
+                              if float(s.get("expires", 0)) > time.time()]
+                    src = str(strd.get("dataset") or "")
+                    dst = str(strd.get("destination") or "")
+                    # the SCOPE is a directory root, never a single
+                    # file: sibling files of the same approved download
+                    # keep flowing (no per-file prompting), anything
+                    # outside the root still asks.
+                    root = dst.rstrip("/")
+                    last = root.rsplit("/", 1)[-1]
+                    if "/" in root and "." in last:
+                        root = root.rsplit("/", 1)[0] or "/"
+                    if src and dst:
+                        scopes.append({
+                            "dataset": src, "destination": dst,
+                            "destination_root": root,
+                            "granted_at": time.time(),
+                            "expires": time.time() + 72 * 3600,
+                            "approval_id": appr["id"]})
+                        with open(sf, "w") as fh:
+                            json.dump(scopes, fh)
+                        os.chmod(sf, 0o600)
+                        self.store.audit(
+                            "user", "dataset.scope_granted", appr["id"],
+                            {"dataset": src[:160], "destination": dst,
+                             "ttl_hours": 72})
+                except OSError:
+                    pass
+                try:
+                    os.unlink(os.path.join(APPROVALS_DIR, "pending",
+                                           op + ".json"))
+                except OSError:
+                    pass
         try:
             client = self._ensure_client()
             if job_id:

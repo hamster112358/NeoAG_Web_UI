@@ -280,3 +280,79 @@ NEVER_TOUCH_BY_DEFAULT = [
     "tools_manifest", "reference_manifest", "asset roots",
     "nextflow configs", "container images", "predictor homes",
 ]
+
+# ---------------------------------------------------------------------------
+# Milestone 5 PART 2: the SAME code-grounded facts, reorganised into the
+# four user-facing concerns. Concern assignment is a design statement
+# (labelled as such); the parameter rows, defaults and CLI flags are the
+# code facts already cited above - nothing new is invented here.
+#   inputs     A: inputs & sample (agent-managed; planner auto-discovers)
+#   science    B: scientific configuration, grouped by NeoAG module
+#   execution  C: execution & environment settings (hidden by default)
+#   managed    set by the approval/execution flow, never a user form field
+CONCERN_BY_GROUP = {
+    "Run basics": "execution",
+    "Input data (DNA / RNA)": "inputs",
+    "Precomputed evidence overrides": "inputs",
+    "RNA branch routing": "science",
+    "SV branch": "science",
+    "Reference data": "execution",
+    "Ranking and reporting": "science",
+    "Tool routing policy": "execution",
+}
+CONCERN_BY_ITEM = {  # overrides inside mixed groups
+    "sample_id": "inputs", "case_id": "inputs",
+    "approved": "managed", "mode": "execution",
+    "outdir": "execution", "allow_partial": "execution",
+    "timeout": "execution",
+}
+# module label/purpose for concern B; the tools column is NOT stated
+# here - it is derived at request time from the code-grounded inventory
+# (load_inventory stages), so it can never drift from the repo.
+SCIENCE_MODULES = {
+    "RNA branch routing": {
+        "id": "rna_fusion_splice",
+        "label": "RNA quantification, fusion & splice evidence",
+        "purpose": "Transcript-level evidence: gene expression, fusion "
+                   "calls and splice junctions feeding the RNA peptide "
+                   "branches.",
+        "stages": ["rna_expression", "fusion_discovery",
+                   "splice_discovery"]},
+    "SV branch": {
+        "id": "structural_variants",
+        "label": "Structural variants",
+        "purpose": "SV calling branch feeding SV-derived peptide evidence.",
+        "stages": ["sv"]},
+    "Ranking and reporting": {
+        "id": "ranking_reporting",
+        "label": "Ranking & reporting",
+        "purpose": "Final candidate ranking (top-N windows) and the "
+                   "report bundles written at run end.",
+        "stages": ["ranking", "reports"]},
+}
+
+
+def params_view() -> list[dict]:
+    """PARAM_GROUPS enriched with concern + module + CLI flag fields.
+    Additive: every original key (group/expert/items/source/...) stays,
+    so existing consumers keep working."""
+    import re as _re
+    out = []
+    for g in PARAM_GROUPS:
+        gg = dict(g)
+        concern = CONCERN_BY_GROUP.get(g["group"], "execution")
+        gg["concern"] = concern
+        mod = SCIENCE_MODULES.get(g["group"])
+        if mod:
+            gg["module"] = dict(mod)
+        items = []
+        for it in g["items"]:
+            ii = dict(it)
+            ii["concern"] = CONCERN_BY_ITEM.get(it["id"], concern)
+            m = _re.search(r"'(--[\w-]+)'", str(it.get("source") or ""))
+            if m:
+                ii["cli"] = m.group(1)
+            items.append(ii)
+        gg["items"] = items
+        out.append(gg)
+    return out

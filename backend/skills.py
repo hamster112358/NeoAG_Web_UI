@@ -149,6 +149,34 @@ in the run directory; keep commands.sh so runs are reconstructable.
 """
 
 
+def slugify(text: str) -> str:
+    """M5 PART 3 usability: slugs are derived, not typed."""
+    s = re.sub(r"-{2,}", "-", re.sub(r"[^a-z0-9]+", "-",
+                                     (text or "").lower()).strip("-"))
+    s = s[:61].strip("-")
+    if not re.match(r"^[a-z]", s):
+        s = ("skill-" + s)[:61].strip("-")
+    if len(s) < 3:
+        s = (s + "-skill")[:61]
+    return s
+
+
+def autofrontmatter(slug: str, title: str, content: str) -> str:
+    """M5 PART 3 usability: authors write the knowledge, the editor
+    generates the mechanical frontmatter. Content that already carries
+    a complete frontmatter is returned byte-for-byte unchanged."""
+    body = (content or "").lstrip()
+    if body.startswith("---"):
+        fm = body.split("---", 2)
+        if len(fm) >= 3 and re.search(r"^name:\s*\S+", fm[1], re.M):
+            return content
+        ins = f"name: {slug}\ndescription: {(title or slug)[:180]}\n"
+        return ("---\n" + ins + (fm[1].lstrip("\n") if len(fm) > 1 else "")
+                + "---" + (fm[2] if len(fm) > 2 else ""))
+    return (f"---\nname: {slug}\ndescription: {(title or slug)[:180]}\n"
+            f"---\n\n# {title or slug}\n\n{content}")
+
+
 def validate_skill(slug: str, content: str, title: str = "") -> list[str]:
     """Editor-side validation. Returns a list of human-readable errors
     (empty list = acceptable)."""

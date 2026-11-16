@@ -58,6 +58,7 @@ def _cleanup():
     import shutil as _sh
     for _d in ("/tmp/neoag-battery-skills", "/tmp/neoag-battery-taskq"):
         _sh.rmtree(_d, ignore_errors=True)
+    _sh.rmtree(ROOT / "data" / "exports-batterytest", ignore_errors=True)
 
 
 atexit.register(_cleanup)
@@ -818,19 +819,41 @@ check("77 outcome taxonomy: five distinct honest states",
       _co([{"status": "failed_generation"}]) == "generation_failed" and
       _co([]) == "no_artifacts")
 # never over-claim: if an artifact disappears, results must DOWNGRADE and
-# say so (tested by removing one artifact row from the isolated test DB)
+# say so. The mock consensus arm may legitimately produce an empty table
+# on some seeds (the run then already stores 'partial'), so the scenario
+# is made DETERMINISTIC: the persisted claim is first pinned to a
+# delivered run whose artifacts are all available (a row-count/
+# status update - no re-run), then one REQUESTED artifact row is removed.
 import sqlite3 as _s3
 _db = ROOT / "data" / "batterytest.sqlite3"
-_with = _s3.connect(str(_db)).execute(
-    "SELECT COUNT(*) FROM artifacts WHERE job_id=?", (jid_f,)).fetchone()[0]
 _c = _s3.connect(str(_db))
-_c.execute("DELETE FROM artifacts WHERE job_id=? AND strategy='evidence-consensus'",
-           (jid_f,))
+_rows78 = _c.execute("SELECT strategy, status FROM artifacts WHERE job_id=?",
+                     (jid_f,)).fetchall()
+_with = len(_rows78)
+_req78 = (((res_f.get("manifest") or {}).get("effective_config") or {})
+          .get("ranking_artifacts") or [r[0] for r in _rows78 if r[0]])
+_del78 = next((s for s in _req78
+               if any(r[0] == s and r[1] == "available" for r in _rows78)),
+              "evidence-consensus")
+_res78 = json.loads(_c.execute(
+    "SELECT result_json FROM jobs WHERE id=?", (jid_f,)).fetchone()[0])
+_res78["outcome"] = "delivered"
+_c.execute("UPDATE jobs SET result_json=?, outcome='delivered' WHERE id=?",
+           (json.dumps(_res78, ensure_ascii=False), jid_f))
+_c.execute("UPDATE artifacts SET status='available', rows=5 "
+           "WHERE job_id=? AND strategy IS NOT NULL", (jid_f,))
+_c.execute("DELETE FROM artifacts WHERE job_id=? AND strategy=?",
+           (jid_f, _del78))
 _c.commit()
 _c.close()
 _, res_drift = call("/api/results/" + jid_f)
-check("78 missing artifact -> outcome downgraded + drift disclosed (was %d artifacts)" % _with,
-      res_drift["outcome"] == "partial" and "outcome_drift" in res_drift,
+check("78 a run that CLAIMED delivered but lost a requested artifact "
+      "row (here %s) is served as 'partial' with the drift disclosed "
+      "(was %d artifacts; stored result never re-runs the pipeline)"
+      % (_del78, _with),
+      res_drift["outcome"] == "partial" and "outcome_drift" in res_drift
+      and _del78 in res_drift.get("outcome_drift", "")
+      and _del78 in (res_drift.get("missing_artifacts") or []),
       str(res_drift["outcome"]) + " " + str(res_drift.get("outcome_drift"))[:80])
 # read-only task token: opens GET task routes ONLY
 _tok = json.loads(_s3.connect(str(_db)).execute(
@@ -877,8 +900,11 @@ st_bad2 = _status("/api/skills", {"slug": "no-fm", "category":
                      skl["categories"][0], "content": "plain text"})
 st_bad3 = _status("/api/skills", {"slug": "valid-slug", "category":
                      "nope", "content": "---\nname: valid-slug\n---\ny"})
-check("81 protected names / missing frontmatter / bad category refused",
-      st_bad1 == 400 and st_bad2 == 400 and st_bad3 == 400)
+# 2026-11-16 (M5 PART 3): missing frontmatter is no longer refused - the
+# author writes knowledge, the backend auto-fills the frontmatter (the
+# acceptance side is check 99). Protected names and bad categories still 400.
+check("81 protected names / bad category refused; missing frontmatter now auto-completed",
+      st_bad1 == 400 and st_bad2 == 201 and st_bad3 == 400)
 _body1 = "---\nname: battery-probe\ndescription: t\n---\nbody one\n"
 _body2 = "---\nname: battery-probe\ndescription: t\n---\nbody two\n"
 st_mk, _ = call("/api/skills", {"slug": "battery-probe",
@@ -912,6 +938,744 @@ on_disk_probe = open(
     "/tmp/neoag-battery-skills/battery-probe/SKILL.md").read()
 check("86 deployed file content == saved skill content (byte-for-byte)",
       on_disk_probe == _body1, "")
+
+# ---------- 87-95 Milestone-5 formal-job routing (PART 1, P0) ---------
+def _tokpost(path, obj, token=None, auth=False):
+    req = urllib.request.Request(
+        BASE + path, data=json.dumps(obj).encode(), method="POST",
+        headers={"Content-Type": "application/json",
+                 **({"X-NeoAG-Task-Token": token} if token else {}),
+                 **({"Authorization": AUTH_HEADER} if auth else {})})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as _r:
+            return _r.status, json.loads(_r.read().decode() or "{}")
+    except urllib.error.HTTPError as _e:
+        try:
+            return _e.code, json.loads(_e.read().decode() or "{}")
+        except Exception:
+            return _e.code, {}
+
+
+st87, r87 = _tokpost("/api/jobs", {"sample_id": "BATTERY-AGENT-1"},
+                     token=_tok)
+_jid87 = r87.get("job_id")
+check("87 task token POST /api/jobs registers a job (202, blocked+approval)",
+      st87 == 202 and bool(_jid87) and bool(r87.get("approval_id")),
+      f"{st87} {str(r87)[:120]}")
+st87b, t87 = call("/api/tasks/" + (_jid87 or "x"))
+_ap87 = t87.get("approval_id")
+check("88 token-created job starts BLOCKED behind the same approval card",
+      t87.get("state") == "blocked" and bool(_ap87),
+      str(t87)[:140])
+st87c, aud87 = call("/api/audit")
+_rows87 = aud87 if isinstance(aud87, list) else aud87.get("entries", [])
+check("89 scoped-token creation is auditable (agent + scoped_token row)",
+      any(a.get("actor") == "agent"
+          and a.get("action") == "job.create.scoped_token"
+          and a.get("object") == _jid87
+          for a in _rows87),
+      str(_rows87)[:140])
+_st_chat = _tokpost("/api/chat", {"text": "x"}, token=_tok)[0]
+_st_appr = _tokpost("/api/approvals/" + (_ap87 or "x"),
+                    {"approve": True}, token=_tok)[0]
+_st_mode = _tokpost("/api/agent/mode", {"mode": "real"}, token=_tok)[0]
+check("90 token grants POST on /api/jobs ONLY (chat/approvals/mode 401)",
+      _st_chat == 401 and _st_appr == 401 and _st_mode == 401,
+      f"{_st_chat} {_st_appr} {_st_mode}")
+st87d, _ = call(f"/api/approvals/{_ap87}", {"approve": True})
+_fin87 = {}
+for _ in range(180):
+    _, t87f = call("/api/tasks/" + _jid87)
+    if t87f.get("state") in ("completed", "failed", "cancelled"):
+        _fin87 = t87f
+        break
+    for d in t87f.get("decisions") or []:
+        # same decision-point ceremony a GUI job goes through
+        if d.get("status") == "pending":
+            opts = d.get("options") or []
+            ch = next((o["id"] for o in opts if o.get("policy_default")),
+                      opts[0]["id"] if opts and isinstance(opts[0], dict)
+                      else None)
+            if ch:
+                call(f"/api/decisions/{d['id']}/resolve", {"choice": ch})
+    time.sleep(0.5)
+check("91 chat/GUI parity: agent-registered job completes through the "
+      "same approval->runner path",
+      st87d == 200 and _fin87.get("state") == "completed",
+      str(_fin87)[:120])
+
+_helper = "/tmp/neoag-battery-taskq/taskquery.py"
+_hsrc = open(_helper).read() if os.path.exists(_helper) else ""
+check("92 deployed helper refreshed with job submit/status/events "
+      "(single sanctioned registration path)",
+      "job submit" in _hsrc and "job events" in _hsrc
+      and "_req(\"/api/jobs\"" in _hsrc, str(len(_hsrc)))
+_e87 = dict(os.environ, NEOAG_WEB_BASE=BASE)
+_r87a = subprocess.run([sys.executable, _helper, "job", "submit",
+                        '{"sample_id": "BATTERY-HELPER-1"}'],
+                       capture_output=True, text=True, env=_e87,
+                       timeout=30)
+_r87j = json.loads(_r87a.stdout or "{}")
+_r87b = subprocess.run(
+    [sys.executable, _helper, "job", "status", _r87j.get("job_id", "x")],
+    capture_output=True, text=True, env=_e87, timeout=30)
+check("93 helper end-to-end: job submit -> id, job status -> that task",
+      _r87a.returncode == 0 and _r87j.get("job_id") and
+      _r87b.returncode == 0 and
+      json.loads(_r87b.stdout or "{}").get("id") == _r87j.get("job_id"),
+      f"{_r87a.returncode} {_r87a.stdout[:100]}{_r87a.stderr[:100]}")
+
+import importlib.util as _ilu
+_gspec = _ilu.spec_from_file_location(
+    "gate_m5", str(ROOT / "agent_workspace_assets" / ".codebuddy" /
+                   "gate.py"))
+_gate = _ilu.module_from_spec(_gspec)
+_gspec.loader.exec_module(_gate)
+_gcases = [
+    ("open-neo run --mode execute --case-id C1", "deny"),
+    ("open-neo run --mode plan --case-id C1 --outdir /tmp/p", None),
+    ("bash -c \"open-neo run --mode execute\"", "deny"),
+    ("grep -r 'open-neo run' docs/", None),
+    ("python3 -m neoag.cli run-demo --outdir /tmp/d", "deny"),
+    ("python3 -m neoag.open_neo.cli run --mode execute --outdir /tmp",
+     "deny"),
+    ("curl -s -X POST -d '{}' http://127.0.0.1:8760/open/run", "deny"),
+    ("python3 -m neoag.controlled_execution.gateway --port 8760", "deny"),
+    ("python3 .neoag/taskquery.py job submit '{\"sample_id\":\"S\"}'", None),
+    ("open-neo doctor --json", None),
+]
+_gbad = [c for c, want in _gcases
+         if (("deny" if (lambda d: d and d[0] == "deny")(
+             _gate.decide({"tool_name": "Bash",
+                           "tool_input": {"command": c}})) else None)
+             != want)]
+_gtok = _gate.decide({"tool_name": "Bash", "tool_input": {
+    "command": "open-neo run --mode execute"}})
+check("94 gate classifies formal launches DENY-FORMAL (no approval path, "
+      "plan-mode and docs-greps stay allowed)",
+      not _gbad and _gtok and "NEOAG_FORMAL_JOB_REQUIRED" in _gtok[1],
+      str(_gbad)[:160])
+import io as _io
+import contextlib as _cl
+import tempfile
+_tmpa = tempfile.mkdtemp(prefix="neoag-routing-audit-")
+_gate.APPROVALS = _tmpa
+_ev = {"tool_name": "Bash", "tool_input": {
+    "command": "open-neo run --mode execute --case-id X"},
+    "session_id": "batt"}
+import sys as _sys
+_old_in, _old_out = _sys.stdin, _sys.stdout
+_sys.stdin, _sys.stdout = _io.StringIO(json.dumps(_ev)), _io.StringIO()
+try:
+    _gate.main()
+finally:
+    _sys.stdin, _sys.stdout = _old_in, _old_out
+_routing = os.path.join(_tmpa, "routing.jsonl")
+check("95 every routing interception is audit-logged (class FORMAL_JOB)",
+      os.path.isfile(_routing) and
+      json.loads(open(_routing).readline())["class"] == "FORMAL_JOB",
+      str(open(_routing).readline())[:140] if
+      os.path.isfile(_routing) else "no routing.jsonl")
+import shutil as _sh87
+_sh87.rmtree(_tmpa, ignore_errors=True)
+
+# ---------- 96-98 Milestone-5 scientific config redesign (PART 2) ----
+st96, pv96 = call("/api/params")
+_conc96 = {i.get("concern") for g in pv96["groups"] for i in g["items"]}
+_mods96 = [g["module"] for g in pv96["groups"] if g.get("module")]
+check("96 the SAME code-cited options are split into the four concerns "
+      "(inputs/science/execution/managed) with per-module views",
+      st96 == 200 and {"inputs", "science", "execution",
+                       "managed"} <= _conc96 and
+      len(_mods96) >= 3 and
+      all(m.get("purpose") and m.get("tools") and
+          m.get("tools_provenance") for m in _mods96),
+      f"{sorted(str(c) for c in _conc96)} mods={len(_mods96)}")
+check("97 module tools are DERIVED from the inventory capture (never "
+      "asserted in the params module), capture timestamp disclosed",
+      pv96.get("inventory_captured_at") and
+      all(any(t for t in m["tools"]) for m in _mods96) and
+      all(i.get("source") for g in pv96["groups"] for i in g["items"]),
+      str(pv96.get("inventory_captured_at")))
+_ncli = sum(1 for g in pv96["groups"] for i in g["items"] if i.get("cli"))
+check("98 CLI mapping shown per option (only flags the code actually "
+      "exposes)", _ncli >= 15, f"cli rows={_ncli}")
+
+# ---------- 99-102 Milestone-5 skills usability + dataset consent -----
+st99a, sk99 = call("/api/skills", {
+    "title": "Battery Auto Slug Probe", "category": "NeoAG Operation",
+    "content": "Just the knowledge text - no frontmatter written."})
+check("99 skills usability: slug generated from title + frontmatter "
+      "auto-filled when absent (author writes only knowledge)",
+      st99a == 201 and sk99["slug"] == "battery-auto-slug-probe" and
+      sk99["content"].startswith("---") and
+      "name: battery-auto-slug-probe" in sk99["content"],
+      f"{st99a} {str(sk99)[:120]}")
+st99b, sk99d = call("/api/skills/battery-auto-slug-probe/deploy", {})
+_w = [r for r in sk99d.get("results", []) if r.get("state") == "written"]
+check("100 save+deploy is one click-able path (Save & Apply semantics)",
+      st99b == 200 and len(_w) == 1 and
+      open("/tmp/neoag-battery-skills/battery-auto-slug-probe/"
+           "SKILL.md").read() == sk99["content"],
+      str(sk99d)[:120])
+_ds_cmd = ("wget -O /tmp/neoag-dl-consent-test/expr.h5ad "
+           "https://figshare.com/ndownloader/files/12345")
+_gd = _gate.decide({"tool_name": "Bash",
+                    "tool_input": {"command": _ds_cmd}})
+_gpaper = _gate.decide({"tool_name": "Bash", "tool_input": {
+    "command": "curl -sL https://arxiv.org/pdf/2101.00001 "
+               "-o /tmp/paper.pdf"}})
+check("101 dataset download -> structured consent card (dataset, "
+      "operation, scope, destination) while literature reads stay free",
+      _gd and _gd[0] == "confirm" and
+      _gd[2].get("class") == "dataset_download" and
+      _gd[2].get("dataset") and _gd[2].get("destination") and
+      all(w in _gd[1] for w in ("dataset=", "operation=", "destination=",
+                                "scope")) and
+      _gpaper is None,
+      str(_gd)[:160])
+_tmpa2 = tempfile.mkdtemp(prefix="neoag-scope-")
+_gate.APPROVALS = _tmpa2
+json.dump([{"dataset": "https://figshare.com/ndownloader/files/12345",
+            "destination_root": "/tmp/neoag-dl-consent-test",
+            "expires": time.time() + 60, "approval_id": "appr-x"}],
+          open(os.path.join(_tmpa2, "dataset-scope.json"), "w"))
+_in_scope = _gate.decide({"tool_name": "Bash", "tool_input": {
+    "command": "wget -O /tmp/neoag-dl-consent-test/next-file.h5ad "
+               "https://figshare.com/ndownloader/files/67890"}})
+_out_scope = _gate.decide({"tool_name": "Bash", "tool_input": {
+    "command": "wget -O /tmp/somewhere-else/x.h5ad "
+               "https://figshare.com/ndownloader/files/67890"}})
+_gate.APPROVALS = os.path.join(WS if (WS := "/data1/neoag/agents/neoag_agent_ws") else "", ".neoag-approvals")
+check("102 consent is BOUNDED: sibling files inside the approved "
+      "destination need no re-prompt; anything outside it still asks",
+      _in_scope is None and _out_scope
+      and _out_scope[0] == "confirm",
+      f"in={_in_scope} out={bool(_out_scope)}")
+_sh87.rmtree(_tmpa2, ignore_errors=True)
+
+# ---------- 103-105 M5 PART 4: version chain + evidence context -------
+from backend import evidence as _ev4                                  # noqa: E402
+from backend import research as _res4                                  # noqa: E402
+from backend import versions as _ver4                                  # noqa: E402
+_none = lambda n: ([], "not-on-pypi", {})                              # noqa: E731
+_bc = lambda n: ([], "not-on-bioconda", {})                            # noqa: E731
+_vf = lambda r: {}                                                     # noqa: E731
+_hd = lambda r: {"sha": "beef1234567890", "date": "2026-11-01",
+                 "url": "h"}                                           # noqa: E731
+_c_tags = _ver4.resolve("ToolX", repo="a/x", probes={
+    "releases_tags": lambda r: {"releases": [],
+                                "tags": ["v3.2.1", "3.1.0", "nightly-9"],
+                                "error": None},
+    "pypi": _none, "bioconda": _bc, "version_file": _vf,
+    "head_commit": _hd}, budget={"core": 10})
+_c_pre = _ver4.resolve("ToolY", repo="a/y", probes={
+    "releases_tags": lambda r: {"releases": [
+        {"tag": "2.0rc1", "prerelease": True,
+         "published": "2026-09-01T00:00:00Z"},
+        {"tag": "1.9", "prerelease": False,
+         "published": "2026-01-01T00:00:00Z"}],
+        "tags": ["2.0rc1", "1.9"], "error": None},
+    "pypi": _none, "bioconda": _bc, "version_file": _vf,
+    "head_commit": _hd}, budget={"core": 5})
+_c_dev = _ver4.resolve("ToolZ", repo="a/z", probes={
+    "releases_tags": lambda r: {"releases": [], "tags": [], "error": None},
+    "pypi": _none, "bioconda": _bc, "version_file": _vf,
+    "head_commit": _hd}, budget={"core": 9})
+_c_bud = _ver4.resolve("ToolW", repo="a/w", probes={
+    "releases_tags": lambda r: (_ for _ in ()).throw(
+        AssertionError("budget-0 must not call the adapter")),
+    "pypi": _none, "bioconda": _bc, "version_file": _vf,
+    "head_commit": _hd}, budget={"core": 0})
+check("103 version chain: tags fallback (no false unknown despite empty "
+      "releases), stable-vs-prerelease split, commit fallback labelled "
+      "DEVELOPMENT, budget-skipped steps keep their reason",
+      _c_tags["display"].startswith("v3.2.1 (stable; git tag")
+      and _c_pre["values"]["latest_stable"]["value"] == "1.9"
+      and _c_pre["values"]["latest_release"]["value"] == "2.0rc1"
+      and "DEVELOPMENT" in _c_dev["display"]
+      and any("budget" in c["outcome"] for c in _c_bud["chain"]),
+      _c_dev["display"][:60])
+
+_r01 = _ev4.metric_rows(
+    "MHCflurry",
+    "On the ICBC cohort MHCflurry v1.4 achieved an AUROC of 0.91 against "
+    "mass spectrometry eluted ligands over 12,000 peptides. Earlier work "
+    "reports accuracy of 87%.",
+    citation={"id": "PMID:1", "title": "MHCflurry improvements",
+              "year": "2021", "url": "u", "source": "pubmed"},
+    level="abstract")
+check("104 performance evidence is CONTEXT-GATED: the contextual row "
+      "keeps metric+dataset+version, the contextless number is quoted "
+      "but excluded, and the cross-version caveat blocks credit transfer",
+      len(_r01) >= 2 and _r01[0]["context_established"]
+      and _r01[0]["dataset"] == "ICBC" and _r01[0]["value"] == "0.91"
+      and not _r01[1]["context_established"]
+      and "must NOT be credited" in _ev4.cross_version_caveat(_r01[0],
+                                                              "1.9")
+      and "1 of 2" in _ev4.comparability_note(_r01))
+
+def _cand4(nm, role="named in retrieved title (pubmed)",
+           cat="software (registry-verified)", ev=()):
+    return {"name": nm, "task": "Presentation & APPM Scoring",
+            "role_in_neoag": role, "category": cat,
+            "artifact_class": "algorithm (method implementation)",
+            "verified_version": "1.0", "license": "MIT",
+            "maintenance": "active (last push 2026-06-01)",
+            "availability": ("found on PyPI, GitHub"
+                             if cat == "software (registry-verified)"
+                             else "Not verified"),
+            "evidence_gaps": ["exact version",
+                              "input/output format"],
+            "installed_version": "n/a",
+            "published_benchmark_evidence": list(ev)}
+_cur4 = _cand4("mhcflurry", role="configured NeoAG workflow TOML")
+_row4 = {"metric": "AUROC", "value": "0.9", "dataset": "ICBC",
+         "context_established": True, "tested_version": "v1.0",
+         "evidence_level": "abstract: independent comparative text"}
+_t4 = {"id": "presentation", "label": "Presentation & APPM Scoring"}
+_concl4 = [_res4._module_conclusion(_t4, a) for a in (
+    [], [_cur4], [_cur4, _cand4("A")], [_cur4, _cand4("B", ev=[_row4])],
+    [_cand4("C", cat="mentioned in literature only")])]
+_tc4 = _res4._task_comparisons(
+    [_t4], [_cur4, _cand4("B", ev=[_row4]),
+            dict(_cand4("W"), artifact_class="workflow wrapper")], {})
+def _cnd155(nm, task, role, ev=(), cat="software (registry-verified)"):
+    return {"name": nm, "task": task, "role_in_neoag": role,
+            "category": cat,
+            "artifact_class": "algorithm (method implementation)",
+            "verified_version": "1.0 (stable; PyPI)", "license": "MIT",
+            "maintenance": "active (last push 2026-06-01)",
+            "availability": "found on PyPI", "installed_version": "n/a",
+            "compatibility": "Not verified",
+            "version_chain": {"values": {}},
+            "published_benchmark_evidence": list(ev),
+            "performance_summary": "x", "evidence_gaps": ["exact version"],
+            "independent_validation": bool(ev)}
+_inv155 = {"stages": [{"id": "presentation", "name": "P",
+                       "current_tools": ["mhcflurry"]},
+                      {"id": "sv", "name": "S", "current_tools": []},
+                      {"id": "reports", "name": "R",
+                       "current_tools": []}],
+           "limitations": [], "repo": "r", "code_verified": True,
+           "git_commit": "x", "captured_at": "t"}
+_rt155 = [{"id": "presentation", "label": "Presentation & APPM Scoring"},
+          {"id": "sv", "label": "Sv"}]
+_row155 = {"metric": "AUROC", "value": "0.9", "dataset": "ICBC",
+           "context_established": True, "tested_version": "v1.0",
+           "evidence_level": "abstract: independent comparative text"}
+_rep155 = _res4._live_report(
+    "res_t", {"targets": _rt155}, _inv155, {}, "completed",
+    candidates=[_cnd155("mhcflurry", "Presentation & APPM Scoring",
+                        "configured NeoAG workflow TOML"),
+                _cnd155("ALT", "Presentation & APPM Scoring",
+                        "named in title", ev=[_row155])],
+    citations=[], resolved_targets=_rt155)
+_cov155 = _rep155["coverage_accounting"]
+_mc155 = _rep155["module_conclusions"]["presentation"]
+check("105 evidence COVERAGE is accounted per inventory module "
+      "(identified/researched/sufficient/thin/missing+reason); completion "
+      "means coverage, not 'queries returned'",
+      _cov155["identified_modules"] == 3 and
+      _cov155["researched_modules"] == 2 and
+      _cov155["completeness"] == "partial" and
+      "presentation" in _cov155["sufficient_evidence"] and
+      {m["id"] for m in _cov155["not_researched"]} == {"reports"}
+      and _rep155["status"] == "completed",
+      str(_cov155)[:150])
+check("106 every conclusion explains evidence/advantage/comparability/"
+      "usability/remaining-verification and insufficient evidence yields "
+      "a CONCRETE evaluation instead of a guess; Open Questions are gone",
+      set(_mc155["explanation"]) == {
+          "what_evidence_supports_it", "expected_advantage",
+          "directly_comparable", "directly_comparable_note",
+          "usable_in_current_deployment", "remains_to_verify"}
+      and "ALT: AUROC 0.9 on ICBC" in _mc155["explanation"]["expected_advantage"]
+      and _mc155.get("recommended_evaluation", "").startswith(
+          "Controlled comparison on THIS deployment")
+      and "open_questions" not in _rep155
+      and _rep155["recommended_next_actions"]
+      and _rep155["recommended_next_actions"][0].startswith("[presentation]")
+      and any("reports" in a
+              for a in _rep155["recommended_next_actions"]))
+_rep155b = _res4._live_report(
+    "res_t2", {"targets": _rt155}, _inv155, {}, "cancelled",
+    candidates=[], resolved_targets=_rt155, reached_ids=set())
+check("107 a run stopped mid-way publishes NO premature conclusions: "
+      "unreached modules are listed with the stop reason and resume note",
+      _rep155b["module_conclusions"] == {}
+      and all(("run stopped" in m["reason"] and "resume" in m["reason"])
+              for m in _rep155b["coverage_accounting"]["not_researched"])
+      and _rep155b["coverage_accounting"]["completeness"] == "partial")
+
+check("108 conclusions use ONLY the fixed vocabulary and never invent a "
+      "winner from one-sided evidence; task comparisons group by artifact "
+      "kind, compare within one task, and gate performance by context",
+      all(c["conclusion"] in _res4.CONCLUSION_VOCABULARY
+          for c in _concl4)
+      and all(c["conclusion"] !=
+              "Candidate appears superior under specified conditions"
+              for c in _concl4)
+      and set(_tc4[0]["alternatives_by_kind"]) == {
+          "algorithm (method implementation)", "workflow wrapper"}
+      and "AUROC=0.9 on ICBC" in [r for r in _tc4[0]["rows"]
+                                  if r["tool"] == "B"][0]
+      ["published_performance"]
+      and "no value with established" in [
+          r for r in _tc4[0]["rows"] if r["tool"] == "W"][0]
+      ["published_performance"],
+      str([c["conclusion"] for c in _concl4])[:150])
+
+# ---------- 109-115 M5 PART 7: downloadable exports -----------------------
+import io as _io4                                                # noqa: E402
+import zipfile as _zip4                                          # noqa: E402
+import tempfile as _tf4                                          # noqa: E402
+from backend import exports as _exp4                             # noqa: E402
+
+
+def _raw(path, token=None, auth=True):
+    req = urllib.request.Request(BASE + path)
+    if auth:
+        req.add_header("Authorization", AUTH_HEADER)
+    if token:
+        req.add_header("X-NeoAG-Task-Token", token)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, dict(r.headers), r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers or {}), e.read()
+
+
+_expdir = ROOT / "data" / "exports-batterytest"
+_st1, _hd1, _hb1 = _raw(f"/api/research/{rid}/export/html")
+_st1b, _hd1b, _hb1b = _raw(f"/api/research/{rid}/export/html")
+check("109 research HTML export: first download renders once + persists, "
+      "re-download serves byte-identical pinned bytes from disk (never "
+      "re-generated)",
+      _st1 == 200 and _hd1.get("X-Export-Version") == "1"
+      and "attachment" in _hd1.get("Content-Disposition", "")
+      and _hd1.get("X-Export-Sha256") == hashlib.sha256(_hb1).hexdigest()
+      and _st1b == 200 and _hb1b == _hb1
+      and _hd1b.get("X-Export-Version") == "1"
+      and b"tool-research report" in _hb1
+      and any(p.is_file() for p in _expdir.rglob("*.html")),
+      str(_st1) + " " + str(_hd1.get("X-Export-Version")))
+_sj, _hdj, _bj = _raw(f"/api/research/{rid}/export/json")
+_sx, _hdx, _bx = _raw(f"/api/research/{rid}/export/tsv")
+_sp, _hdp, _bp = _raw(f"/api/research/{rid}/export/pdf")
+_rj = json.loads(_bj or b"{}")
+_rt = _bx.decode("utf-8", "replace")
+check("110 JSON export carries the stored provenance + export envelope; "
+      "TSV sections parse; PDF is a valid stdlib PDF that declares itself "
+      "text-only",
+      _sj == 200 and _rj["provenance"]["engine"] == "example-mock"
+      and _rj["export"]["report_id"] == rid and _rj["comparison"]
+      and _sx == 200 and "# ===== section: comparison" in _rt
+      and all("\t" in ln for ln in _rt.splitlines()
+              if ln and not ln.startswith("#"))
+      and _sp == 200 and _bp.startswith(b"%PDF-1.")
+      and _bp.rstrip().endswith(b"%%EOF") and b"text-only" in _bp,
+      f"j{_sj} x{_sx} p{_sp}")
+_c2 = _s3.connect(str(_db))
+_rrow = _c2.execute("SELECT report_json FROM research WHERE id=?",
+                    (rid,)).fetchone()
+_rv = json.loads(_rrow[0])
+_rv["disclaimer"] = _rv["disclaimer"] + " [amended for export versioning]"
+_c2.execute("UPDATE research SET report_json=? WHERE id=?",
+            (json.dumps(_rv, ensure_ascii=False), rid))
+_c2.commit()
+_c2.close()
+_st1c, _hd1c, _hb1c = _raw(f"/api/research/{rid}/export/html")
+_lv = call(f"/api/research/{rid}/exports")[1]["exports"]
+check("111 a changed stored report yields export VERSION 2 pinned to the "
+      "new content while version 1 stays listed and on disk (versioned, "
+      "not overwritten)",
+      _st1c == 200 and _hd1c.get("X-Export-Version") == "2"
+      and _hb1c != _hb1 and b"amended for export versioning" in _hb1c
+      and sorted(e["version"] for e in _lv if e["format"] == "html")
+      == [1, 2]
+      and len(list(_expdir.rglob("research-*.html"))) >= 2)
+_szz, _hzz, _z1 = _raw(f"/api/results/{jid_f}/bundle")
+_zf = _zip4.ZipFile(_io4.BytesIO(_z1))
+_znames = _zf.namelist()
+_zman = json.loads(_zf.read("manifest.json"))
+_szz2, _hzz2, _z1b = _raw(f"/api/results/{jid_f}/bundle")
+check("112 results bundle ZIP is built from persisted job state (result, "
+      "decision history, immutable snapshot, artifacts, ranking tables, "
+      "provenance), re-downloads byte-identically, and records its scope "
+      "rules",
+      _szz == 200 and _hzz.get("X-Export-Version") == "1"
+      and _szz2 == 200 and _z1b == _z1
+      and {"README.txt", "job.json", "result.json", "snapshot.json",
+           "decisions.json", "artifacts.json", "manifest.json",
+           "events.json"} <= set(_znames)
+      and any(n.startswith("tables/") and n.endswith(".tsv")
+              for n in _znames)
+      and "fastq" in json.dumps(_zman["scope_rules"]).lower()
+      and all(f.get("sha256") for f in _zman["files"])
+      and b"raw sequencing/alignment" in _zf.read("README.txt"),
+      str(_szz) + " " + str(sorted(_znames))[:160])
+_c3 = _s3.connect(str(_db))
+_c3.execute("INSERT INTO artifacts(id,job_id,created_at,type,name,"
+            "strategy,path,status,rows,checksum,meta_json) "
+            "VALUES('art-export-late',?, '2026-11-16T00:00:00','table',"
+            "'late_artifact.tsv',NULL,'/tmp/x','available',1,'deadbeef',"
+            "'{}')", (jid_f,))
+_c3.commit()
+_c3.close()
+_szz3, _hzz3, _z3 = _raw(f"/api/results/{jid_f}/bundle")
+_ljb = call(f"/api/results/{jid_f}/exports")[1]["exports"]
+check("113 bundle re-versions ONLY when persisted job state changes "
+      "(added artifact row -> version 2; old version still listed; the "
+      "pipeline was never re-run to serve a download)",
+      _szz3 == 200 and _hzz3.get("X-Export-Version") == "2"
+      and _z3 != _z1 and
+      sorted(e["version"] for e in _ljb) == [1, 2])
+_sna, _, _ = _raw(f"/api/research/{rid}/export/json", auth=False)
+_stk, _, _ = _raw(f"/api/research/{rid}/export/tsv", token=_tok)
+_skb, _, _ = _raw(f"/api/results/{jid_f}/bundle", token=_tok)
+_snc, _, _eb = _raw(f"/api/results/{jid6}/bundle")
+check("114 exports are access-controlled (no credentials -> 401; the "
+      "read-only task token may download what it can already read) and a "
+      "non-completed run is refused with 409 rather than generated",
+      _sna == 401 and _stk == 200 and _skb == 200 and _snc == 409
+      and b"cancelled" in _eb, str(_sna) + str(_stk) + str(_snc))
+_nd = _tf4.mkdtemp()
+open(os.path.join(_nd, "keep.tsv"), "w").write("a\tb\n")
+os.makedirs(os.path.join(_nd, "sub"))
+open(os.path.join(_nd, "sub", "reads_R1.fastq.gz"), "wb").write(b"x" * 100)
+open(os.path.join(_nd, "huge.tsv"), "wb").write(
+    b"y" * (2 * 1024 * 1024 + 10))
+_keep, _exc = _exp4.plan_native_files(_nd)
+shutil.rmtree(_nd, ignore_errors=True)
+check("115 bundle scope planner: raw FASTQ/BAM-class inputs and oversized "
+      "files are EXCLUDED with recorded reasons - a .fastq.gz can never "
+      "enter a results bundle regardless of size",
+      [f["name"] for f in _keep] == ["keep.tsv"]
+      and {e["name"] for e in _exc} == {"sub/reads_R1.fastq.gz",
+                                        "huge.tsv"}
+      and any("raw sequencing" in e["reason"] for e in _exc)
+      and any("per-file cap" in e["reason"] for e in _exc),
+      str(_keep) + " " + str(_exc)[:200])
+
+# ---------- 116-120 M5 PART 6: benchmark jobs + discovery actions --------
+def _post(path, body):
+    """POST that also returns structured 4xx bodies (a refused benchmark
+    brief is a result, not a transport error)."""
+    try:
+        return call(path, body)
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode() or "{}")
+        except Exception:
+            return e.code, {}
+
+
+_BENCH_BRIEF = {
+    "hypothesis": "a looser stability gate (5.8 vs 3.0) keeps borderline "
+                  "peptides inside the weighted top-12 on the synthetic "
+                  "pool",
+    "tools": {"candidate": "NetMHCpan-4.1", "baseline": "netMHCcons"},
+    "candidate_strategy": "weighted",
+    "config": {"baseline_gate": 3.0, "candidate_gate": 5.8},
+    "metrics": ["top_k_overlap", "rank_correlation_spearman",
+                "candidate_set_fraction"],
+    "compute_estimate": "seconds, in-process, same pool",
+    "risks": ["synthetic pool only - not a biological claim"],
+    "dataset": {"source": "demo_fixture"},
+    "top_n": 12}
+_s116a, _p116a = _post("/api/jobs", {"kind": "benchmark",
+                                     "benchmark": {"hypothesis": "h"}})
+_s116, _p116 = _post("/api/jobs", {"kind": "benchmark",
+                                   "benchmark": _BENCH_BRIEF})
+_jid116 = _p116.get("job_id", "")
+_aid116 = _p116.get("approval_id", "")
+_b116 = call("/api/bootstrap")[1]
+_j116 = next((j for j in _b116["jobs"] if j["id"] == _jid116), {})
+_a116 = next((a for a in _b116["approvals"] if a["id"] == _aid116), {})
+check("116 a benchmark is a FORMAL job: brief validated at submit, the "
+      "job starts blocked and its approval card carries the full brief "
+      "(hypothesis, both tools, every metric, no-download statement) - "
+      "nothing runs before approval",
+      _s116a == 400 and "hypothesis" in str(_p116a) and \
+      "invalid kind" not in str(_p116a)
+      and _s116 == 202 and _j116.get("kind") == "benchmark"
+      and _j116.get("state") == "blocked"
+      and "looser stability gate" in _a116.get("action", "")
+      and "NetMHCpan-4.1" in _a116.get("action", "")
+      and "top_k_overlap" in _a116.get("action", "")
+      and "No dataset downloads" in _a116.get("detail", ""),
+      f"{_s116a}/{_s116} {_j116.get('state')}")
+try:
+    call(f"/api/approvals/{_aid116}", {"approve": True})
+except urllib.error.HTTPError as e:
+    check("117a approval accepted (prerequisite)", False, str(e.code))
+_res117 = None
+_t117 = time.time()
+while time.time() - _t117 < 90:
+    _s117, _, _b117 = _raw(f"/api/results/{_jid116}")
+    if _s117 == 200:
+        _res117 = json.loads(_b117)
+        break
+    time.sleep(0.5)
+_m117 = (_res117 or {}).get("metrics") or {}
+_c117 = _m117.get("computed") or {}
+_r117 = (_res117 or {}).get("reproducibility") or {}
+check("117 after approval the harness runs BOTH arms for real on the "
+      "identical seeded pool: metrics are COMPUTED from the produced "
+      "tables (never asserted), with a reproducibility record (seed, pool "
+      "sha, environment, honest ground-truth statement) and files on disk",
+      _res117 and _res117.get("engine") == "benchmark"
+      and all(k in _c117 for k in ("top_k_overlap",
+                                   "rank_correlation_spearman",
+                                   "candidate_set_fraction"))
+      and "COMPUTED" in _m117.get("note", "")
+      and _r117.get("seed") and _r117.get("input_pool_sha256")
+      and _r117.get("environment", {}).get("python")
+      and "identical-input property" in _r117.get("ground_truth", "")
+      and "MOCK FIXTURE" in _res117.get("disclaimer", "")
+      and os.path.isfile(os.path.join(_res117["outdir"],
+                                      "arm_baseline.tsv")),
+      json.dumps({k: _c117.get(k, {}).get("value") for k in _c117})[:120])
+_s118a, _p118a = _post("/api/jobs", {"kind": "benchmark", "benchmark": {
+    **_BENCH_BRIEF, "dataset": {"source": "public_repo",
+                                "id": "SOMETHING-ELSECAT"}}})
+_s118b, _p118b = _post("/api/jobs", {"kind": "benchmark", "benchmark": {
+    **_BENCH_BRIEF,
+    "dataset": {"source": "public_repo", "id": "SOMETHING-ELSECAT",
+                "consent_approval_id": _aid116}}})
+_cid118 = "appr-consent-batt-" + str(int(time.time()))
+_c118 = _s3.connect(str(_db))
+_c118.execute(
+    "INSERT INTO approvals(id,created_at,job_id,action,risk,detail,"
+    "state,decided_by) VALUES(?,?,?,?,?,?,'approved','operator')",
+    (_cid118, "2026-11-16T00:00:00", "", "gate_op", "dataset",
+     json.dumps({"structured": {"kind": "dataset_download",
+                                "dataset": "SEED-BENCH-1"}})))
+_c118.commit()
+_c118.close()
+_s118c, _p118c = _post("/api/jobs", {"kind": "benchmark", "benchmark": {
+    **_BENCH_BRIEF,
+    "dataset": {"source": "public_repo", "id": "SEED-BENCH-2",
+                "consent_approval_id": _cid118}}})
+_s118d, _p118d = _post("/api/jobs", {"kind": "benchmark", "benchmark": {
+    **_BENCH_BRIEF,
+    "dataset": {"source": "public_repo", "id": "SEED-BENCH-1",
+                "consent_approval_id": _cid118}}})
+check("118 dataset consent is enforced the PART 3 way: an external "
+      "dataset needs an APPROVED dataset-download consent card naming "
+      "that dataset; free prose mentioning 'dataset' (even an approved "
+      "benchmark card) is NOT consent; the synthetic fixture stays free",
+      _s118a == 400 and "consent" in str(_p118a)
+      and _s118b == 400 and "consent" in str(_p118b)
+      and _s118c == 400 and "consent" in str(_p118c)
+      and _s118d == 202,
+      f"{_s118a}/{_s118b}/{_s118c}/{_s118d}")
+_c119 = _s3.connect(str(_db))
+_rep119 = json.loads(_c119.execute(
+    "SELECT report_json FROM research WHERE id=?", (rid2,)).fetchone()[0])
+_c119.close()
+_rep119["candidates"] = [{
+    "name": "BatteryProbeTool", "license": "MIT",
+    "verified_version": "9.9", "maintenance": "active",
+    "artifact_class": "algorithm (method implementation)"}]
+_rep119["inventory"] = {"stages": [{
+    "id": "stability", "current_tools": ["battery-probe-cli"],
+    "provenance": "battery fixture"}]}
+_rep119["module_conclusions"] = {"stability": {
+    "conclusion": "keep current tools"}}
+_c119b = _s3.connect(str(_db))
+_c119b.execute("UPDATE research SET report_json=? WHERE id=?",
+               (json.dumps(_rep119, ensure_ascii=False), rid2))
+_c119b.commit()
+_c119b.close()
+_s119a, _, _b119a = _raw(f"/api/research/{rid2}/compatibility"
+                         "?candidate=BatteryProbeTool&target=stability")
+_p119a = json.loads(_b119a)
+_s119b, _, _b119b = _raw(f"/api/research/{rid2}/compatibility"
+                         "?candidate=TotallyInventedTool&target=stability")
+_s119c, _, _b119c = _raw(f"/api/research/{rid2}/adoption-plan"
+                         "?candidate=batteryprobetool&target=stability")
+_p119c = json.loads(_b119c)
+_s119d, _, _ = _raw(f"/api/research/{rid2}/adoption-plan"
+                    "?candidate=TotallyInventedTool")
+check("119 discovery follow-up actions derive ONLY from the stored "
+      "report: compatibility of a reported candidate reports presence/"
+      "version/license without claiming interface verification; a "
+      "candidate the report never retrieved is a 404 (never an invented "
+      "row); the adoption plan APPLIES nothing and gates on fresh numbers",
+      _s119a == 200 and "Not verified" in _p119a.get("interface", "")
+      and "installed_version_probe" in _p119a.get("on_this_host", {})
+      and _p119a.get("license_caution") and _p119a.get("current_stage",
+                                                       {}).get(
+                                                           "configured_tools")
+      == ["battery-probe-cli"]
+      and _s119b == 404 and b"never retrieved" in _b119b
+      and _s119c == 200 and _p119c.get("applied") is False
+      and "HUMAN" in _p119c.get("statement", "")
+      and len(_p119c.get("steps") or []) >= 5
+      and _p119c.get("verification_gate")
+      and _s119d == 404,
+      f"{_s119a}/{_s119b}/{_s119c}/{_s119d}")
+_s120, _h120, _z120 = _raw(f"/api/results/{_jid116}/bundle")
+_zf120 = _zip4.ZipFile(_io4.BytesIO(_z120))
+_n120 = _zf120.namelist()
+_s120b, _h120b, _z120b = _raw(f"/api/results/{_jid116}/bundle")
+check("120 the results bundle ships the benchmark's reproducibility files "
+      "under native/ (arm tables, reproducibility record, input pool) "
+      "with the README stating benchmark runs are in scope, and "
+      "re-downloads byte-identically",
+      _s120 == 200
+      and {"native/arm_baseline.tsv", "native/arm_candidate.tsv",
+           "native/reproducibility.json",
+           "native/input_pool.json"} <= set(_n120)
+      and b"BENCHMARK" in _zf120.read("README.txt")
+      and _h120.get("X-Export-Sha256") == _h120b.get("X-Export-Sha256")
+      and _z120b == _z120
+      and not any(n.lower().endswith((".fastq", ".fq", ".bam", ".sam",
+                                      ".cram")) for n in _n120),
+      f"{_s120} {str(sorted(_n120))[:150]}")
+shutil.rmtree(os.path.join(str(ROOT / "data"), "benchmarks", _jid116),
+              ignore_errors=True)
+_s121, _p121 = _post("/api/jobs", {"kind": "benchmark",
+                                   "benchmark": _BENCH_BRIEF})
+_jid121 = _p121.get("job_id", "")
+try:
+    _sd121, _ = call("/api/approvals/" + _p121.get("approval_id", ""),
+                     {"approve": False})
+except urllib.error.HTTPError as e:
+    _sd121 = e.code
+_b121 = next((j for j in call("/api/bootstrap")[1]["jobs"]
+              if j["id"] == _jid121), {})
+_s121r, _, _b121r = _raw(f"/api/results/{_jid121}")
+check("121 a DENIED benchmark dies there: the job is cancelled with the "
+      "reason recorded, no result exists, no harness directory was ever "
+      "created and the pipeline was never started",
+      _sd121 == 200 and _b121.get("state") == "cancelled"
+      and "denied" in str(_b121.get("error", ""))
+      and _s121r == 409
+      and not os.path.isdir(os.path.join(str(ROOT / "data"),
+                                         "benchmarks", _jid121)),
+      f"decide={_sd121} state={_b121.get('state')} results={_s121r}")
+
+_s127, _p127 = call("/api/settings", {"top_n": 7,
+                                      "task_token": "evil-token",
+                                      "gate_grants": {"anything": True}})
+_c127 = _s3.connect(str(_db))
+_tok_after = json.loads(_c127.execute(
+    "SELECT value_json FROM settings WHERE key='task_token'").fetchone()[0])
+_c127.close()
+check("127 the demo control panel writes ONLY whitelisted UI keys: a "
+      "settings POST cannot reach the task token or any other stored "
+      "setting (auth material is not user-editable), and the read-only "
+      "token keeps working untouched",
+      _s127 == 200 and _p127.get("top_n") == 7
+      and "task_token" not in _p127 and "gate_grants" not in _p127
+      and _tok_after == _tok
+      and _tokget("/api/tasks", token="evil-token") == 401
+      and _tokget("/api/tasks", token=_tok) == 200,
+      f"{_s127} tok_changed={_tok_after != _tok}")
+call("/api/settings", {"top_n": 12})
 
 print()
 print(f"RESULT: {len(PASS)} passed, {len(FAIL)} failed")

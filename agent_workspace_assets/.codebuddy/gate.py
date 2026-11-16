@@ -17,6 +17,16 @@ through the demo's approval cards instead):
   DENY-SELF     this enforcement layer itself          - no approval path
   DENY-FROZEN   operator-invariant immutable trees     - no approval path
                 (reads/copies FROM them are fine; writes INTO them are not)
+  DENY-FORMAL   launching a FORMAL NeoAG analysis outside the unified
+                job system (open-neo run --mode execute, neoag.cli
+                run/run-full/run-demo, direct gateway /open/run posts,
+                ad-hoc gateway launches)  - no approval path: the job
+                must be REGISTERED instead, via
+                .neoag/taskquery.py job submit, so approval, snapshot,
+                artifact ledger and outcome taxonomy all apply. Pure
+                planning/inspection (open-neo run --mode plan, doctor,
+                --help, reads) stays allowed. Each interception is
+                audit-logged to .neoag-approvals/routing.jsonl.
   CONFIRM       destructive / outside-workspace writes - a grant file
                 matching the exact op-hash unlocks ONE retry
   ALLOW         everything else: routine reads, and routine writes /
@@ -78,7 +88,136 @@ WRITE_BASH_RE = re.compile(
     r"\b(?:cp|mv|rsync|ln|touch|mkdir|tee)\b|\bsed\b[^|;&]*\s-i|"
     r"\bgit\b[^|;&]*\b(?:apply|checkout|restore)\b|>>?\s*[\"'~/.]", re.I)
 
-MUT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+# FORMAL-JOB routing (Milestone 5 PART 1: enforceable, not skill prose).
+# These patterns launch NeoAG's real execution engine straight from the
+# agent's shell, which would bypass the unified job system (approval
+# gate, run snapshot, artifact ledger, outcome taxonomy, Task History).
+# The sanctioned path registers the same work through the task API:
+#   python3 <workspace>/.neoag/taskquery.py job submit '<json>'
+# Pure planning/inspection (open-neo run --mode plan / doctor / --help)
+# is deliberately NOT matched: it executes nothing (verified against
+# the deployed planner: plan mode writes a plan + input QC only).
+FORMAL_RUN_PATTERNS = (
+    # the lookahead (CLI flags follow the subcommand) keeps prose/docs
+    # greps like `grep 'open-neo run' f.md` out, while quoted wrappers
+    # (bash -c "open-neo run --mode ...") still match - no cheap bypass.
+    (re.compile(r"\bopen-neo\s+run\b(?=[\s;&|]+--|[\s;&|]*$)", re.I),
+     "open-neo run"),
+    (re.compile(r"-m\s+neoag\.open_neo\.cli\s+run\b", re.I),
+     "neoag.open_neo.cli run"),
+    (re.compile(r"-m\s+neoag\.cli\s+(?:run|run-full|run-demo|"
+                r"sv-run-full\S*)\b", re.I), "neoag.cli run*"),
+    (re.compile(r"-m\s+neoag\.pipeline\b", re.I), "neoag.pipeline import"),
+    (re.compile(r"(?:curl|wget)\b[^|;&]*/open/run\b|"
+                r"/open/run\b[^|;&]*(?:curl|wget)", re.I),
+     "direct gateway /open/run post"),
+    (re.compile(r"neoag\.controlled_execution\.gateway\b", re.I),
+     "ad-hoc gateway launch"),
+)
+# planning/inspection escape hatch - only meaningful for the CLI
+# entries above; `--mode plan` executes nothing.
+PLAN_MODE_RE = re.compile(r"--mode[\s=]+plan\b", re.I)
+
+# DATASET CONSENT (Milestone 5 PART 3, consent-enforced). Reading
+# literature stays free; pulling a DATASET is an explicit resource
+# event. A download-class command that targets dataset sources asks
+# once through a structured confirmation card (dataset, operation,
+# resource scope, destination); the approval ALSO writes a bounded
+# scope grant (dataset + destination, TTL-capped) so a multi-file
+# download never degrades into per-file prompting. Blanket "allow all
+# downloads" does not exist: every scope names its destination.
+# Known limitation: a bespoke python script that downloads internally
+# is not classifiable from its command line (same-uid honesty stated
+# in the header); command-line download tools are covered.
+DOWNLOAD_TOOL_RE = re.compile(
+    r"(?:^|[\s;&|(])(?:curl|wget|aria2c|gdown|axel|rsync|scp|aws\s+s3\s+"
+    r"(?:cp|sync)|gsutil\s+(?:cp|rsync))\b", re.I)
+PAPER_READ_RE = re.compile(
+    r"(arxiv\.org|biorxiv|medrxiv|doi\.org|pubmed|ncbi\.nlm\.nih\.gov|"
+    r"europepmc|nature\.com|science\.org|cell\.com|springer|"
+    r"acm\.org|ieee\.org|openreview|aclanthology|pnas|jmir|jacionet)", re.I)
+DATASET_SOURCE_RE = re.compile(
+    r"(ftp\.ncbi\.nlm\.nih\.gov|trace\.ncbi\.nlm\.nih\.gov|sra\.|"
+    r"dbgap|dbGaP|ega\.eu-c|cancer\.sanger|gdac\.|gdc\.cancer\.gov|"
+    r"portal\.gdc|cancerstorage\.nci\.tcga|tcga|"
+    r"geo\.ncbi|10xgenomics\.com|cf\.10xgenomics|cbioportal|"
+    r"hgdownload[.\w]*\.ucsc\.edu|refdata\.genome\.ucsc|"
+    r"ftp\.ensembl|download\.ensembl|refseq\.|genome\.ucsc|"
+    r"zenodo\.org|figshare|huggingface\.co|hf-mirror|"
+    r"hcb\.illumina\.com|icgc\.or\.kr|gtexportal|opengap)", re.I)
+DATASET_EXT_RE = re.compile(
+    r"\.(fastq|fq|fasta|fa|fna|vcf|bcf|bam|cram|sra|maf|bed.gz|gtf|"
+    r"counts|tpm|h5|hd5|10x|rds|rdata|npy|npz|pkl|h5ad)(?:\.(?:gz|bz2|"
+    r"zst|tar))?(?=$|[\s\"'])|\bdataset[s]?[/_.]|/references/", re.I)
+SCOPE_TTL_SECONDS = 72 * 3600
+
+
+def _src_key(u: str) -> str:
+    """Source family key: host + first path segments. Approving one
+    zenodo record's file does NOT match a different record, but does
+    cover every file of the SAME record - the multi-file download
+    stays one consented scope instead of per-file prompting."""
+    u = re.sub(r"^https?://", "", (u or "")).strip("/")
+    return "/".join(u.split("/")[:3])
+
+
+def dataset_scope_ok(urlish: str, dest: str) -> str:
+    """Bounded scope grant lookup: returns the approval id of a live
+    (source family, destination root) scope, else ''. TTL-capped,
+    destination-naming - never a blanket download permit."""
+    try:
+        with open(os.path.join(APPROVALS, "dataset-scope.json")) as fh:
+            scopes = json.load(fh)
+    except Exception:
+        return ""
+    np = norm(dest or "")
+    for sc in scopes if isinstance(scopes, list) else []:
+        try:
+            src = str(sc.get("dataset") or "")
+            dst = str(sc.get("destination_root")
+                      or sc.get("destination") or "")
+            exp = float(sc.get("expires", 0))
+        except Exception:
+            continue
+        if not src or not dst or time.time() > exp:
+            continue
+        sk, pk = _src_key(src), _src_key(urlish or "")
+        nd = norm(dst)
+        dest_ok = np == nd or np.startswith(nd.rstrip("/") + "/")
+        if (sk and (sk == pk or sk in pk or pk in sk)) and dest_ok:
+            return str(sc.get("approval_id") or "scoped")
+    return ""
+
+
+def dataset_intent(cmd: str):
+    """Return (source_label, destination, why) when the command is a
+    dataset download; None for literature reads and plain diagnostics."""
+    if not DOWNLOAD_TOOL_RE.search(cmd):
+        return None
+    if PAPER_READ_RE.search(cmd) and not DATASET_EXT_RE.search(cmd):
+        return None                       # reading a paper is not a dataset
+    if not (DATASET_SOURCE_RE.search(cmd) or DATASET_EXT_RE.search(cmd)):
+        return None                       # ordinary small fetch/diagnostic
+    urls = re.findall(r"https?://[^\s'\"]+", cmd)
+    src = urls[0] if urls else ""
+    dest = ""
+    m = re.search(r"(?:-o|--output-document|--output-dir|-P|-O)\s+(\S+)",
+                  cmd)
+    if m:
+        dest = m.group(1).strip("\"'")
+    if not dest:
+        # output path may be a -P dir or trailing path token
+        m2 = REDIR_RE.findall(cmd)
+        if m2:
+            dest = m2[0][1]
+        else:
+            toks = [t for t in PATH_TOKEN_RE.findall(cmd) if "/" in t
+                    and not t.startswith("http")]
+            dest = toks[-1] if toks else os.getcwd()
+    label = src or DATASET_SOURCE_RE.search(cmd).group(0)
+    return label, dest, ("known dataset source"
+                         if DATASET_SOURCE_RE.search(cmd)
+                         else "dataset-format file/destination")
 READ_TOOLS = {"Read", "Glob", "Grep", "LS", "list_dir", "NotebookRead"}
 TOOL_PATH_KEYS = ("file_path", "notebook_path", "path", "file")
 # path-like shell tokens: absolute (/... or ~/...), or relative tokens
@@ -198,6 +337,44 @@ def decide(ev: dict):
         return None
 
     if tool == "Bash" and cmd:
+        for pat, label in FORMAL_RUN_PATTERNS:
+            if pat.search(cmd):
+                if label in ("open-neo run", "neoag.open_neo.cli run") \
+                        and PLAN_MODE_RE.search(cmd):
+                    continue      # planning/inspection: executes nothing
+                return ("deny",
+                        f"NEOAG_FORMAL_JOB_REQUIRED :: this command "
+                        f"launches a formal NeoAG analysis ({label}) "
+                        "outside the unified job system. Formal runs "
+                        "MUST be registered through the task API so "
+                        "approval, the run snapshot, the artifact "
+                        "ledger and the outcome taxonomy all apply: "
+                        "run python3 .neoag/taskquery.py job submit "
+                        "'<json body>' (GET details with taskquery.py "
+                        "job status <id>). The registration appears "
+                        "as the same task in the interface and starts "
+                        "only after the human approval card. There is "
+                        "no approval path for raw launches and you "
+                        "must not paraphrase around this rule. Pure "
+                        "planning is fine: open-neo run --mode plan.",
+                        "NeoAG gate: formal run must go through the "
+                        "task API (job submit)")
+        ds = dataset_intent(cmd)
+        if ds:
+            label, dest, why = ds
+            if dataset_scope_ok(label, dest):
+                return None    # inside an approved bounded download scope
+            return ("confirm",
+                    "DATASET DOWNLOAD requires explicit consent :: "
+                    f"dataset={label[:160]} | operation=download | "
+                    f"reason={why} | destination={dest} | resource "
+                    "scope=THIS source into THIS destination only, 72h. "
+                    "Approving lets further files from the same source "
+                    "into the same destination through without asking "
+                    "again; it NEVER allows downloads anywhere else.",
+                    {"tool": "Bash", "command": cmd,
+                     "class": "dataset_download", "dataset": label,
+                     "operation": "download", "destination": dest})
         dele = bool(DELETE_RE.search(cmd))
         force = bool(FORCE_RE.search(cmd))
         mut = bool(WRITE_BASH_RE.search(cmd))
@@ -255,6 +432,23 @@ def main():
     if d is None:
         return                              # allow (default-mode grant)
     if d[0] == "deny":                      # ("deny", reason, user_msg)
+        if "NEOAG_FORMAL_JOB_REQUIRED" in d[1]:
+            # auditable classification: every routing interception is
+            # logged (self-protected dir) for the review reports.
+            try:
+                os.makedirs(APPROVALS, exist_ok=True)
+                ti = ev.get("tool_input") or {}
+                with open(os.path.join(APPROVALS, "routing.jsonl"),
+                          "a") as fh:
+                    fh.write(json.dumps({
+                        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        "class": "FORMAL_JOB",
+                        "reason": d[1].split("::")[-1][:200],
+                        "command": str(ti.get("command") or "")[:400],
+                        "session_id": ev.get("session_id") or "",
+                    }, ensure_ascii=False) + "\n")
+            except OSError:
+                pass
         emit("deny", d[1], d[2])
         return
     detail, payload = d[1], d[2]            # ("confirm", detail, payload)
@@ -264,6 +458,18 @@ def main():
              system_msg=f"NeoAG gate: one-time user approval applied "
                         f"({detail[:80]})")
         return
+    if payload.get("class") == "dataset_download":
+        # structured consent card: the backend reads this sidecar to
+        # show dataset / operation / scope / destination fields, and to
+        # write the BOUNDED scope grant on approval.
+        try:
+            os.makedirs(os.path.join(APPROVALS, "pending"), exist_ok=True)
+            fn = os.path.join(APPROVALS, "pending", h + ".json")
+            with open(fn, "w") as fh:
+                json.dump(payload, fh)
+            os.chmod(fn, 0o600)
+        except OSError:
+            pass
     confirm(detail, payload)
 
 

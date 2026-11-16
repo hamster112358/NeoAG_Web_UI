@@ -36,7 +36,14 @@ Complements the always-loaded workspace rules; do not restate them.
   you to compute.
 
 ## Running work
-- Prefer the documented CLI (read the repo's README and
+- Formal pipeline executions are registered, not launched: use
+  `python3 .neoag/taskquery.py job submit '<json>'` (the execution
+  gate blocks raw `open-neo run --mode execute` / `neoag.cli run*`
+  calls - no approval path; `job status <id>` / `job events <id>`
+  track the registered run). Planning first is encouraged and NOT
+  blocked: `open-neo run --mode plan ...` executes nothing and shows
+  the real route/steps.
+- Prefer the documented CLI for inspection (read the repo's README and
   configs/workflows/production_workflow.example.toml for the current
   interface; do not guess flags - check --help and the example TOML).
 - Non-patient test fixtures (e.g. HCC1395 public fixture, the dev

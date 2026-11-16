@@ -98,6 +98,16 @@ CREATE TABLE IF NOT EXISTS skill_versions(
   id INTEGER PRIMARY KEY AUTOINCREMENT, skill_id TEXT, version INTEGER,
   content TEXT, created_at TEXT, source TEXT
 );
+-- Downloadable exports (Milestone 5 PART 7): each row pins one rendered
+-- export FILE on disk to the exact stored content it was rendered from
+-- (source_hash). Downloads serve the persisted bytes - re-downloading
+-- never re-renders science; a new version row exists only when the
+-- stored report/job content itself changed.
+CREATE TABLE IF NOT EXISTS exports(
+  id TEXT PRIMARY KEY, kind TEXT, object_id TEXT, format TEXT,
+  filename TEXT, path TEXT, bytes INTEGER, sha256 TEXT, source_hash TEXT,
+  version INTEGER, created_at TEXT, meta_json TEXT
+);
 """
 
 JOB_STATES = {"queued", "running", "paused", "blocked", "completed", "failed",
@@ -118,6 +128,14 @@ class Store:
         self.lock = threading.RLock()
         db_name = os.environ.get("NEOAG_DEMO_DB") or DB_NAME
         self.db_path = str(data_dir / db_name)
+        self.data_dir = data_dir
+        # export files live next to the db they were rendered from and are
+        # isolated per database, so parallel verification batteries never
+        # read each other's persisted exports
+        _stem = Path(db_name).stem
+        self.export_dir = data_dir / (
+            "exports" if _stem == "state" else f"exports-{_stem}")
+        self.export_dir.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.db_path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         with self.lock:
@@ -128,6 +146,8 @@ class Store:
                 # Milestone 4 migrations (each idempotent via except):
                 "ALTER TABLE jobs ADD COLUMN conv_id TEXT DEFAULT ''",
                 "ALTER TABLE jobs ADD COLUMN outcome TEXT",
+                "ALTER TABLE jobs ADD COLUMN native_plan_json TEXT",
+                "ALTER TABLE jobs ADD COLUMN gw_job_id TEXT DEFAULT ''",
                 "ALTER TABLE decisions ADD COLUMN key TEXT",
                 "ALTER TABLE decisions ADD COLUMN category "
                 "TEXT DEFAULT 'pipeline'",
@@ -433,6 +453,12 @@ class Store:
         return {"id": appr_id, "created_at": now(), "decided_at": None,
                 "job_id": job_id, "action": action, "risk": risk, "detail": detail,
                 "state": "pending", "decided_by": None}
+
+    def approval_get(self, appr_id: str) -> dict | None:
+        with self.lock:
+            row = self.db.execute("SELECT * FROM approvals WHERE id=?",
+                                  (appr_id,)).fetchone()
+        return dict(row) if row else None
 
     def approval_decide(self, appr_id: str, approve: bool, decided_by: str) -> dict | None:
         with self.lock:
@@ -750,6 +776,68 @@ class Store:
             return None
         return {"job_id": row["job_id"], "created_at": row["created_at"],
                 "snapshot": json.loads(row["snapshot_json"] or "{}")}
+
+    # ---------- downloadable exports (M5 PART 7) ----------
+    def export_add(self, kind: str, object_id: str, fmt: str,
+                   filename: str, path: str, size: int, sha: str,
+                   source_hash: str, meta: dict | None = None) -> dict:
+        eid = new_id("exp")
+        with self.lock:
+            v = self.db.execute(
+                "SELECT COALESCE(MAX(version),0)+1 AS v FROM exports "
+                "WHERE kind=? AND object_id=? AND format=?",
+                (kind, object_id, fmt)).fetchone()["v"]
+            self.db.execute(
+                "INSERT INTO exports(id,kind,object_id,format,filename,"
+                "path,bytes,sha256,source_hash,version,created_at,"
+                "meta_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (eid, kind, object_id, fmt, filename, path, size, sha,
+                 source_hash, v, now(),
+                 json.dumps(meta or {}, ensure_ascii=False)))
+            self.db.commit()
+        return self.export_get(eid)
+
+    def export_get(self, eid: str) -> dict | None:
+        with self.lock:
+            row = self.db.execute("SELECT * FROM exports WHERE id=?",
+                                  (eid,)).fetchone()
+        if not row:
+            return None
+        e = dict(row)
+        e["meta"] = json.loads(e.pop("meta_json") or "{}")
+        return e
+
+    def export_versions(self, kind: str, object_id: str,
+                        fmt: str) -> list[dict]:
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT * FROM exports WHERE kind=? AND object_id=? AND "
+                "format=? ORDER BY version ASC",
+                (kind, object_id, fmt)).fetchall()
+        out = []
+        for r in rows:
+            e = dict(r)
+            e["meta"] = json.loads(e.pop("meta_json") or "{}")
+            out.append(e)
+        return out
+
+    def export_latest(self, kind: str, object_id: str,
+                      fmt: str) -> dict | None:
+        vs = self.export_versions(kind, object_id, fmt)
+        return vs[-1] if vs else None
+
+    def export_list(self, kind: str, object_id: str) -> list[dict]:
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT * FROM exports WHERE kind=? AND object_id=? "
+                "ORDER BY format ASC, version ASC",
+                (kind, object_id)).fetchall()
+        out = []
+        for r in rows:
+            e = dict(r)
+            e["meta"] = json.loads(e.pop("meta_json") or "{}")
+            out.append(e)
+        return out
 
     # ---------- agent skills (advisory, PART C) ----------
     def skill_create(self, slug: str, name: str, title: str, category: str,

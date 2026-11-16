@@ -23,12 +23,23 @@ import random
 import re
 import threading
 import time
+from collections import Counter
 
-from . import inventory, mock_data, sources
+from . import evidence, inventory, mock_data, sources, versions
 from .store import Store, new_id, now
 from .mock_data import DEMO_DATASET_VERSION
 
-LIVE_ENGINE_VERSION = "live-retrieval-2026.11-r1"
+LIVE_ENGINE_VERSION = "live-retrieval-2026.11-r2"
+
+# 4.5: the ONLY conclusions a module may receive (fixed vocabulary).
+CONCLUSION_VOCABULARY = [
+    "Retain current method",
+    "Consider candidate alternative",
+    "Recommend independent benchmark",
+    "Candidate appears superior under specified conditions",
+    "Evidence insufficient to recommend replacement",
+    "Not applicable to NeoAG's actual workflow",
+]
 
 AVAILABILITY = ("open-source | freely available with restrictions | "
                 "license-required | commercial | unavailable | unclear")
@@ -354,9 +365,26 @@ def run_live(rid, scope, targets, store, resume):
           f"{inv['repo']} (code_verified={inv['code_verified']}, "
           f"commit {str(inv['git_commit'])[:10]})", prog,
           {"inventory": inv})
+    # measured, not assumed: the unauthenticated GitHub core budget
+    # (60/hour) gates the version-chain depth; exhausted budget is a
+    # RECORDED SKIP reason, never a fake 'version unknown'
+    budget = dict(sources.github_rate_limit())
+    _step(store, publish, rid,
+          f"GitHub API budget at start: {budget.get('core')} "
+          f"core requests left"
+          + (f" (resets {budget['reset_utc']})" if budget.get("reset_utc")
+             else ""), prog,
+          {"github_budget": budget})
+    vcache, ft_budget = {}, {"n": 6}  # per-run chain cache + full-text cap
+    def _attempted_ids():
+        """targets that had at least one retrieval query (fresh or
+        persisted) - what a stopped run may honestly claim as reached"""
+        got = {e.get("target") for e in queries_log if e.get("target")}
+        return {t["id"] for t in resolved_targets if t["id"] in got}
     if cancelled():
         store.research_set(rid, "cancelled",
-                           _live_report(rid, prog, inv, [], "cancelled"),
+                           _live_report(rid, prog, inv, [], "cancelled",
+                                        reached_ids=set()),
                            finished=True)
         publish({"type": "research", "id": rid})
         return
@@ -399,9 +427,12 @@ def run_live(rid, scope, targets, store, resume):
                          "coverage": {"per_source": per_source,
                                       "failures": failures}})
     if cancelled():
+        # literature phase interrupted: no conclusions yet - only
+        # retrieval facts; candidate work never ran
         store.research_set(rid, "cancelled",
                            _live_report(rid, prog, inv, lit_by_target,
-                                        "cancelled"), finished=True)
+                                        "cancelled", reached_ids=set()),
+                           finished=True)
         publish({"type": "research", "id": rid})
         return
 
@@ -426,6 +457,7 @@ def run_live(rid, scope, targets, store, resume):
 
     tool_hits = []
     candidates = []
+    done_targets = set()  # targets whose full candidate work completed
     for target in resolved_targets:
         if cancelled():
             break
@@ -469,12 +501,21 @@ def run_live(rid, scope, targets, store, resume):
         for n in uniq[:6]:
             c = _verify_candidate(n, target, citations, per_source,
                                   failures, queries_log, done, store,
-                                  publish, rid)
+                                  publish, rid, vcache=vcache,
+                                  budget=budget, ft=ft_budget)
             candidates.append(c)
+        done_targets.add(tid)
     if cancelled():
+        # a cancel after candidate work still publishes what was
+        # honestly established so far - never discards evidence
         store.research_set(rid, "cancelled",
                            _live_report(rid, prog, inv, lit_by_target,
-                                        "cancelled"), finished=True)
+                                        "cancelled",
+                                        candidates=candidates,
+                                        citations=citations,
+                                        resolved_targets=resolved_targets,
+                                        reached_ids=done_targets),
+                           finished=True)
         publish({"type": "research", "id": rid})
         return
 
@@ -497,11 +538,14 @@ def run_live(rid, scope, targets, store, resume):
 
 
 def _verify_candidate(n, target, citations, per_source, failures,
-                      queries_log, done, store, publish, rid):
-    """Standardized candidate schema (D5). Unverifiable fields say
-    'Not verified' - they are never filled with plausible estimates."""
+                      queries_log, done, store, publish, rid,
+                      vcache=None, budget=None, ft=None):
+    """Standardized candidate schema (D5, extended by M5 PART 4).
+    Unverifiable fields say 'Not verified' - they are never filled with
+    plausible estimates. New in PART 4: the version verification chain
+    (4.2), full-context performance evidence (4.3) and artifact
+    classification (4.4)."""
     tid = target["id"]
-    gh, py, bt = [], [], []
     # Probe registry name: for GitHub-derived "owner/repo" candidates use
     # the repo part; otherwise the first word of the candidate name.
     base = (n["name"].split("/")[-1].split() or [""])[0]
@@ -516,6 +560,10 @@ def _verify_candidate(n, target, citations, per_source, failures,
     q_bt, e_bt, _ = sources.biotools_search(base, 2)
     _record(per_source, failures, queries_log, "biotools",
             f"verify:{base}", len(q_bt), e_bt, tid)
+    q_bc, e_bc, _ = sources.anaconda_bioconda(slug)
+    _record(per_source, failures, queries_log, "bioconda",
+            f"verify:{slug}", len(q_bc), e_bc, tid,
+            skip_ok_error="not-on-bioconda")
 
     # A registry hit only counts as evidence about THIS candidate when
     # the record is actually named after it - never a topically near
@@ -528,38 +576,115 @@ def _verify_candidate(n, target, citations, per_source, failures,
     py = [r for r in q_py if (r.get("id") or "") == slug
           or base.lower() in (r.get("title") or "").lower()]
     bt = [r for r in q_bt if _about(r)]
-    # benchmark evidence from ALREADY retrieved citations for this target
-    ev = []
+    bc = [r for r in q_bc if (r.get("id") or "") == slug]
+
+    # ---- citations naming this candidate (evidence sources) ----
     name_l = n["name"].lower()
-    for c in citations:
-        blob = (c.get("title") or "") + " " + (c.get("abstract") or "")
-        if name_l and name_l in blob.lower():
-            ms = [m.group(0)[:120] for m in _METRIC_RE.finditer(
-                c.get("abstract") or "")][:3]
-            own = name_l in (c.get("title") or "").lower()
-            comp = bool(re.search(r"benchmark|comparat|evaluation|assess",
-                                  blob, re.I))
-            ev.append({
-                "citation": {"title": c["title"], "year": c.get("year"),
-                             "url": c.get("url"), "id": c.get("id"),
-                             "source": c.get("source")},
-                "quoted_metrics": ms or ["no explicit metric in abstract"],
-                "evidence_level": (
-                    "author-reported (abstract)" if own and not comp else
-                    "independent published - abstract-level" if comp and
-                    not own else "contextual (abstract mention)"),
-                "note": "extracted from retrieved abstract text; "
-                        "full-text benchmark context NOT verified"})
+    named_cits = [c for c in citations
+                  if name_l and name_l in
+                  ((c.get("title") or "") + " " +
+                   (c.get("abstract") or "")).lower()]
+
+    # ---- 4.2 version verification chain ----
+    vchain = versions.resolve(
+        n["name"], repo=(gh[0]["id"] if gh else None),
+        citations=named_cits,
+        probes={"pypi": lambda _s: (q_py, e_py, {})},
+        budget=budget, cache=vcache)
+    stable_val = (vchain["values"].get("latest_stable") or {}).get("value")
+    if stable_val and str(stable_val).startswith("commit"):
+        stable_val = None  # a dev commit is not a stable to compare to
+
+    # ---- 4.3 performance evidence WITH context ----
+    ev = []
+    for c in named_cits:
+        cite = {"title": c["title"], "year": c.get("year"),
+                "url": c.get("url"), "id": c.get("id"),
+                "source": c.get("source")}
+        rows = evidence.metric_rows(n["name"], c.get("abstract") or "",
+                                    citation=cite, level="abstract")
+        if not rows:
+            rows = [{"metric": None, "value": None,
+                     "quote": "names the tool; no explicit metric in "
+                              "the retrieved abstract",
+                     "citation": cite,
+                     "evidence_level": (
+                         "abstract: author-reported"
+                         if name_l in (c.get("title") or "").lower()
+                         else "abstract: contextual mention"),
+                     "context_established": False,
+                     "tested_version": "not stated by source",
+                     "extracted_at": now()}]
+        for r in rows:
+            r.setdefault("citation", cite)
+            r["quoted_metrics"] = ([f"{r['metric']} {r['value']}"]
+                                   if r.get("metric")
+                                   else ["no explicit metric in abstract"])
+        ev.extend(rows[:3])
+    # one full-text attempt per candidate (bounded run budget): the
+    # efetch route works for open-access PMC deposits; Europe PMC's
+    # fullTextXML sub-endpoint is unreachable from this host (measured)
+    ft_note = ""
+    if ft is not None and ft.get("n", 0) > 0:
+        pcid = next((c.get("pmcid") for c in named_cits
+                     if c.get("pmcid")), "")
+        if pcid:
+            ft["n"] -= 1
+            xml, err = sources.pmc_fulltext(pcid)
+            if xml:
+                ftxt = evidence.xml_to_text(xml)
+                for r in evidence.metric_rows(
+                        n["name"], ftxt,
+                        citation={"title": "full text via efetch db=pmc "
+                                  f"(PMCID:{pcid})", "id": f"PMC:{pcid}",
+                                  "url": f"https://pmc.ncbi.nlm.nih.gov"
+                                         f"/articles/{pcid}/",
+                                  "source": "ncbi-pmc"},
+                        level="full text", max_rows=3):
+                    r["from_fulltext"] = True
+                    r["citation"] = {"id": f"PMC:{pcid}",
+                                     "url": f"https://pmc.ncbi.nlm.nih"
+                                            f".gov/articles/{pcid}/",
+                                     "title": "full text (efetch)",
+                                     "year": None,
+                                     "source": "ncbi-pmc"}
+                    r["quoted_metrics"] = ([f"{r['metric']} "
+                                            f"{r['value']}"]
+                                           if r.get("metric") else
+                                           ["no metric sentence"])
+                    ev.append(r)
+            else:
+                ft_note = f"full-text attempt failed: {err}"
+    # cross-version guard: a number never transfers across versions
+    for r in ev:
+        if r.get("tested_version") or r.get("metric"):
+            r["version_caveat"] = evidence.cross_version_caveat(
+                r, stable_val)
+    perf_summary = evidence.comparability_note(ev)
+    # 4.4 what KIND of artifact is this?
+    cls = versions.classify(
+        [(gh[0].get("description") if gh else ""),
+         (bt[0].get("summary") if bt else ""),
+         (py[0].get("summary") if py else "")],
+        archived=bool(gh and gh[0].get("archived")))
+    # installed version: only meaningful for tools THIS deployment runs
+    if "configured NeoAG workflow" in (n.get("origin") or ""):
+        iv = versions.installed_version(base)
+        installed = (f"{iv['value']} (evidence: {iv['evidence']})"
+                     if iv.get("value") else
+                     f"Not verified - {iv.get('reason', 'no evidence')}")
+    else:
+        installed = "n/a - not part of this deployment (alternative " \
+                    "under consideration)"
     # None-coalescing through the `or` chain: a registry record that
     # exists but carries a null/blank field must print "Not verified",
     # never None and never an empty cell.
-    verified_version = ((py[0].get("version") if py else None)
-                        or (gh[0].get("latest_release") if gh else None)
-                        or "Not verified")
+    verified_version = vchain["display"]
     license_ = (gh[0].get("license") if gh and
                 gh[0].get("license") not in (None, "NOASSERTION") else
                 (py[0].get("license") if py else
-                 (bt[0].get("license") if bt else "Not verified")))
+                 (bc[0].get("license") if bc else
+                  (bt[0].get("license") if bt else "Not verified"))))
     maintenance = "Not verified"
     if gh:
         pushed = str(gh[0].get("pushed_at") or "")[:10]
@@ -570,41 +695,58 @@ def _verify_candidate(n, target, citations, per_source, failures,
         elif pushed:
             maintenance = f"low activity (last push {pushed})"
     gaps = [f for f, miss in (
-        ("exact version", verified_version == "Not verified"),
+        ("current stable version", not vchain["values"].get(
+            "latest_stable")),
         ("license", not license_ or license_ == "Not verified"),
-        ("published benchmark metric", not ev),
+        ("performance value WITH established experimental context",
+         not any(r.get("context_established") for r in ev)),
         ("independent validation", not any(
-            "independent" in e["evidence_level"] for e in ev)),
+            "independent" in e.get("evidence_level", "")
+            for e in ev)),
         ("input/output format", True),  # never verified by these sources
     ) if miss]
+    if ft_note:
+        gaps.append(ft_note[:120])
     return {
         "name": n["name"],
         "verified_version": verified_version,
+        "version_chain": vchain,
+        "installed_version": installed,
+        "classification": cls,
         "task": target["label"],
         "role_in_neoag": n["origin"],
-        "category": ("software (registry-verified)" if (gh or py or bt)
+        "category": ("software (registry-verified)"
+                     if (gh or py or bt or bc)
                      else "mentioned in literature only"),
+        "artifact_class": cls["class"],
         "io_formats": "Not verified",
         "dependencies": "Not verified",
         "availability": ("found on " + ", ".join(
             s for s, ok in (("GitHub", gh), ("PyPI", py),
-                            ("bio.tools", bt)) if ok)
-            if (gh or py or bt) else "Not verified"),
+                            ("bio.tools", bt), ("bioconda", bc))
+            if ok) if (gh or py or bt or bc) else "Not verified"),
         "license": license_ or "Not verified",
-        "latest_release": ((gh[0].get("latest_release") if gh else None)
+        "latest_release": ((vchain["values"].get("latest_release")
+                            or {}).get("value")
                            or (py[0].get("version") if py else None)
+                           or (bc[0].get("version") if bc else None)
                            or "Not verified"),
         "maintenance": maintenance,
         "primary_references": [e["citation"] for e in ev][:4] or
         "Not verified (no retrieved citation naming this tool)",
         "published_benchmark_evidence": ev or "Not verified",
+        "performance_summary": perf_summary,
+        "benchmark_versions": vchain["values"]["benchmark_versions"],
         "independent_validation": bool(
-            [e for e in ev if "independent" in e["evidence_level"]]),
+            [e for e in ev if "independent" in e.get("evidence_level",
+                                                     "")]),
         "compatibility": "Not verified (integration surface not assessed "
                          "by these retrievals)",
         "strengths": "Not verified",
-        "limitations": ("only registry metadata + abstracts were retrieved"
-                        ),
+        "limitations": ("registry metadata + abstracts"
+                        + (" + one full text" if any(
+                            r.get("from_fulltext") for r in ev) else
+                           " (full-text attempt unavailable)")),
         "evidence_gaps": gaps or ["none of the standard fields missing"],
         "next_action": ("run it on the deployment's own validation fixture "
                         "and compare on identical inputs - literature "
@@ -612,7 +754,8 @@ def _verify_candidate(n, target, citations, per_source, failures,
         "verification_hits": {
             "github": [h.get("url") for h in gh][:2],
             "pypi": [h.get("url") for h in py][:1],
-            "biotools": [h.get("url") for h in bt][:2]},
+            "biotools": [h.get("url") for h in bt][:2],
+            "bioconda": [h.get("url") for h in bc][:1]},
     }
 
 
@@ -630,6 +773,241 @@ def _record(per_source, failures, queries_log, source, query, count, err,
         per_source[source]["ok"] += 1
 
 
+# ---------------------------------------------------------------------------
+# 4.4 systematic within-task comparison + 4.5 fixed-vocabulary conclusions
+# ---------------------------------------------------------------------------
+
+def _task_comparisons(resolved_targets, candidates, stages_by_id):
+    """One comparison block PER scientific task. Candidates are compared
+    only against the current tool of their own target - tools that solve
+    different problems never share a table. Alternatives are grouped by
+    what kind of artifact they are (algorithm vs wrapper vs pipeline...),
+    because a wrapper is not a like-for-like replacement for an
+    algorithm."""
+    out = []
+    for t in resolved_targets:
+        tid = t["id"]
+        stage = stages_by_id.get(tid) or {}
+        current = [c for c in candidates
+                   if c["task"] == t["label"]
+                   and "configured NeoAG workflow" in c["role_in_neoag"]]
+        alts = [c for c in candidates
+                if c["task"] == t["label"] and c not in current]
+        groups = {}
+        for c in alts:
+            groups.setdefault(c["artifact_class"], []).append(c["name"])
+        rows = []
+        for c in alts:
+            usable = [r for r in c["published_benchmark_evidence"]
+                      if isinstance(r, dict)
+                      and r.get("context_established")]
+            rows.append({
+                "tool": c["name"],
+                "artifact_class": c["artifact_class"],
+                "version": c["verified_version"],
+                "license": c["license"],
+                "maintenance": c["maintenance"],
+                "published_performance": (
+                    "; ".join(
+                        f"{r['metric']}={r['value']} on {r['dataset']}"
+                        f" [{r['tested_version']}]"
+                        + (" (author-reported)"
+                           if r.get("author_reported") or
+                           "author-reported" in r.get("evidence_level", "")
+                           else " (independent)"
+                           if r.get("independent") or "independent" in
+                           r.get("evidence_level", "") else "")
+                        for r in usable)
+                    or "no value with established experimental context "
+                       "(quotes in candidate row, not comparable)"),
+                "runtime_memory": "Not verified (not retrievable from "
+                                  "registry metadata/abstracts)",
+                "neoag_compatibility": "Not verified (integration "
+                                       "surface not assessed)",
+                "integration_cost": "Not verified (depends on the "
+                                    "compatibility check above)",
+                "evidence_quality": (
+                    f"{len([r for r in c['published_benchmark_evidence'] if isinstance(r, dict)])}"
+                    f" retrieved row(s), {len(usable)} comparable, "
+                    f"{len([r for r in c['published_benchmark_evidence'] if isinstance(r, dict) and 'independent' in r.get('evidence_level', '')])} independent"),
+            })
+        out.append({
+            "target": t["label"], "target_id": tid,
+            "current_tools": current and [
+                {"name": c["name"], "version": c["verified_version"],
+                 "installed": c["installed_version"]} for c in current]
+            or [{"name": "(no tool name configured in the workflow "
+                         "TOML for this stage)", "version": "n/a",
+                 "installed": "n/a"}],
+            "alternatives_by_kind": groups,
+            "rows": rows,
+            "note": ("comparison is WITHIN this scientific task only; "
+                     "kind groups are not interchangeable units - a "
+                     "wrapper/collection wraps tools rather than "
+                     "competing with them"),
+        })
+    return out
+
+
+def _conclusion_explanation(mine, alts, current, comparable, independent,
+                            metrics, conclusion_text):
+    """The 4.5 five-part explanation that accompanies every conclusion -
+    each part derived from THIS module's retrieved rows, never
+    templated prose. Plus one concrete recommended evaluation whenever
+    the conclusion does not simply retain (recommending a specific
+    evaluation is the brief's mandated alternative to guessing)."""
+    alt_rows = [r for c in alts for r in c["published_benchmark_evidence"]
+                if isinstance(r, dict)]
+    claimed = [f"{c['name']}: {r['metric']} {r['value']} on "
+               f"{r['dataset']} [{r.get('tested_version', 'version not stated')}]"
+               for c in alts for r in c["published_benchmark_evidence"]
+               if isinstance(r, dict) and r.get("context_established")]
+    first_metric = (metrics.get("metrics") or ["the task's published "
+                  "benchmark metric"])[0]
+    cur_names = [c["name"] for c in current]
+    usable = []
+    for c in alts:
+        notes = []
+        if (c.get("availability") or "").startswith("found on"):
+            notes.append(c["availability"])
+        if c["license"] != "Not verified":
+            notes.append(f"license {c['license']}")
+        notes.append(c["maintenance"])
+        usable.append(f"{c['name']}: " + ", ".join(notes))
+    remains = []
+    for c in alts[:3]:
+        for g in c["evidence_gaps"][:3]:
+            remains.append(f"{c['name']}: {g}")
+    ev = {
+        "what_evidence_supports_it":
+            f"{len(mine)} candidate row(s); {len(alts)} registry-verified "
+            f"alternative(s); {len(comparable)} context-established "
+            f"performance row(s) ({len(independent)} independent); "
+            f"details in candidate rows + task comparison",
+        "expected_advantage": "; ".join(claimed) or
+            "NO advantage established by retrieved evidence - all "
+            "retrieved mentions lack experimental context "
+            "(context_established=false)",
+        "directly_comparable": bool(comparable) and bool(current),
+        "directly_comparable_note": (
+            "comparison needs a context-established number for BOTH the "
+            "alternative and the current tool on identical labels - "
+            + ("such paired numbers were NOT retrieved"
+               if not (comparable and current) else
+               "still gated by each row's version caveat")),
+        "usable_in_current_deployment": "; ".join(usable) or
+            "no registry-verified alternative to assess",
+        "remains_to_verify": remains or
+            ["no alternative candidates to verify"],
+    }
+    if conclusion_text in ("Retain current method",
+                           "Not applicable to NeoAG's actual workflow"):
+        return ev, None
+    eval_names = ", ".join(c["name"] for c in alts[:3]) \
+        or "(name a candidate first)"
+    warn = metrics.get("warning") or \
+        "keep metrics within their published definitions"
+    protocol = (
+        f"Controlled comparison on THIS deployment: run {eval_names} "
+        f"against {', '.join(cur_names) or 'the stage function'} on "
+        f"identical inputs from the deployment's own validation fixture; "
+        f"measure {first_metric}; pin every tool's version; compare only "
+        f"identical label sets; {warn}")
+    return ev, protocol
+
+
+def _module_conclusion(target, candidates, metrics=None):
+    """Fixed-vocabulary conclusion per module (4.5). The strictest
+    vocabulary entry that the RETRIEVED evidence actually licenses is
+    chosen; guessing a winner is prohibited by construction, because
+    'Candidate appears superior' requires a context-established,
+    independent, same-metric comparison against the current tool's own
+    context-established number - abstract/registry retrieval cannot
+    produce that."""
+    metrics = metrics or _DEFAULT_METRICS
+    tid = target["id"]
+    mine = [c for c in candidates if c["task"] == target["label"]]
+    verified = [c for c in mine
+                if c["category"] == "software (registry-verified)"]
+    alts = [c for c in verified
+            if "configured NeoAG workflow" not in c["role_in_neoag"]]
+    current = [c for c in verified
+               if "configured NeoAG workflow" in c["role_in_neoag"]]
+    comparable = [r for c in alts for r in c["published_benchmark_evidence"]
+                  if isinstance(r, dict) and r.get("context_established")]
+    independent = [r for r in comparable
+                   if "independent" in r.get("evidence_level", "")]
+    current_has_current_tool = current or any(
+        "configured NeoAG workflow" in c["role_in_neoag"] for c in mine)
+
+    def _mk(text, why, basis):
+        assert text in CONCLUSION_VOCABULARY
+        expl, protocol = _conclusion_explanation(
+            mine, alts, current, comparable, independent, metrics, text)
+        out = {"conclusion": text, "why": why, "evidence_basis": basis,
+               "explanation": expl}
+        if protocol:
+            out["recommended_evaluation"] = protocol
+        return out
+
+    if not mine:
+        return _mk(
+            "Not applicable to NeoAG's actual workflow",
+            "the retrieval found nothing verifiable that maps onto this "
+            "stage",
+            {"candidates": 0})
+    if not alts:
+        if not current_has_current_tool:
+            return _mk(
+                "Not applicable to NeoAG's actual workflow",
+                "no configured tool is named for this stage and no "
+                "registry-verified alternative was found",
+                {"candidates": len(mine), "registry_verified":
+                 len(verified)})
+        return _mk(
+            "Evidence insufficient to recommend replacement",
+            "the current tool was found; every retrieved alternative "
+            "remains unverified or is not named after the candidate "
+            "(registry identity checks failed)",
+            {"candidates": len(mine), "registry_verified":
+             len(verified)})
+    if independent and comparable:
+        # still never declares a winner without same-conditions numbers
+        # for the CURRENT tool - which retrieval cannot supply:
+        return _mk(
+            "Recommend independent benchmark",
+            f"{len(independent)} independent context-established "
+            f"performance row(s) exist for alternatives, but no "
+            f"context-established number for the CURRENT tool was "
+            f"retrieved - superiority cannot be concluded from "
+            f"one-sided evidence",
+            {"alternatives": len(alts), "comparable_rows":
+             len(comparable), "independent_rows": len(independent)})
+    if comparable:
+        return _mk(
+            "Recommend independent benchmark",
+            f"{len(comparable)} alternative performance row(s) carry an "
+            f"explicit dataset/ground-truth context but none is "
+            f"independent, and none shares a metric basis with the "
+            f"current tool",
+            {"alternatives": len(alts), "comparable_rows":
+             len(comparable)})
+    active = [c for c in alts
+              if c["maintenance"].startswith("active")]
+    if active:
+        return _mk(
+            "Consider candidate alternative",
+            f"{len(active)} registry-verified alternative(s) are "
+            f"actively maintained, but no performance figure with "
+            f"established experimental context was retrieved",
+            {"alternatives": len(alts), "active": len(active)})
+    return _mk(
+        "Evidence insufficient to recommend replacement",
+        "alternatives exist on registries but show low maintenance "
+        "activity and no usable performance context",
+        {"alternatives": len(alts)})
+
+
 def _live_status(per_source) -> str:
     ok = sum(v["ok"] for v in per_source.values())
     fail = sum(v["fail"] for v in per_source.values())
@@ -640,9 +1018,88 @@ def _live_status(per_source) -> str:
     return "completed"
 
 
+def _coverage_accounting(inv, resolved_targets, module_conclusions,
+                         candidates, status):
+    """4.7: completion is EVIDENCE COVERAGE over the inventory, never
+    'all scheduled queries returned 200'. Every inventory stage is
+    accounted for: researched-with-sufficient-evidence,
+    researched-but-thin, or not-researched WITH its reason. A run that
+    stopped early lists the missing modules and points at resume."""
+    researched = {t["id"]: t.get("label") for t in resolved_targets}
+    stopped_early = status in ("cancelled", "incomplete", "failed")
+    sufficient, insufficient, missing = [], [], []
+    for s in inv["stages"]:
+        sid = s["id"]
+        if sid not in researched:
+            missing.append({
+                "id": sid,
+                "reason": ("run stopped (" + status + ") before this "
+                           "module - resume keeps persisted queries"
+                           if stopped_early else
+                           "not part of this run's scope")})
+            continue
+        mc = module_conclusions.get(sid) or {}
+        mine = [c for c in candidates if c["task"] == researched[sid]]
+        verified = [c for c in mine if c["category"] ==
+                    "software (registry-verified)"]
+        ctx_rows = [r for c in mine
+                    for r in c["published_benchmark_evidence"]
+                    if isinstance(r, dict) and r.get("context_established")]
+        if verified and ctx_rows:
+            sufficient.append(sid)
+        else:
+            insufficient.append({
+                "id": sid,
+                "reason": (f"{len(verified)} registry-verified candidate(s), "
+                           f"{len(ctx_rows)} context-established "
+                           f"performance row(s) - conclusion: "
+                           f"'{mc.get('conclusion', '?')}'")})
+    complete = not missing
+    return {
+        "identified_modules": len(inv["stages"]),
+        "researched_modules": len(researched),
+        "sufficient_evidence": sufficient,
+        "insufficient_evidence": insufficient,
+        "not_researched": missing,
+        "completeness": "complete" if complete else "partial",
+        "note": ("status 'completed' means every issued query returned; "
+                 "EVIDENCE completeness is THIS block. A partial review "
+                 "is honest partial - and resumable."),
+    }
+
+
+def _next_actions(module_conclusions, coverage):
+    """Recommended Next Actions replace the old generic Open Questions:
+    each is tied to one module decision, decision-priority ordered."""
+    prio = {"Candidate appears superior under specified conditions": 0,
+            "Recommend independent benchmark": 1,
+            "Consider candidate alternative": 2,
+            "Evidence insufficient to recommend replacement": 3,
+            "Retain current method": 4,
+            "Not applicable to NeoAG's actual workflow": 5}
+    acts = []
+    for tid, mc in module_conclusions.items():
+        if mc.get("recommended_evaluation"):
+            acts.append((prio.get(mc["conclusion"], 9),
+                         f"[{tid}] {mc['conclusion']} -> "
+                         f"{mc['recommended_evaluation']}"))
+        elif mc["conclusion"] == "Retain current method":
+            acts.append((4, f"[{tid}] Retain current method - no action "
+                            "beyond ordinary maintenance."))
+    if coverage["not_researched"] and coverage["completeness"] == "partial":
+        acts.append((1, "Coverage: resume or re-run to cover "
+                     f"{len(coverage['not_researched'])} unresearched "
+                     "module(s): "
+                     + ", ".join(m["id"] for m in
+                                 coverage["not_researched"][:8])))
+    acts.sort(key=lambda x: x[0])
+    return [a[1] for a in acts]
+
+
 def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
                  citations=None, resolved_targets=None, dedup_removed=0,
-                 no_id_excluded=0, per_source=None, failures=None):
+                 no_id_excluded=0, per_source=None, failures=None,
+                 reached_ids=None):
     candidates = candidates or []
     citations = citations or []
     resolved_targets = resolved_targets or (prog.get("targets") or [])
@@ -657,6 +1114,30 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
         benchmarks[t["id"]] = TASK_METRICS.get(
             t["id"] if not t["id"].startswith("custom:") else "",
             _DEFAULT_METRICS)
+    stages_by_id = {s["id"]: s for s in inv["stages"]}
+    reached = (resolved_targets if reached_ids is None else
+               [t for t in resolved_targets if t["id"] in reached_ids])
+    task_comparisons = _task_comparisons(reached, candidates,
+                                         stages_by_id)
+    module_conclusions = {
+        t["id"]: _module_conclusion(
+            t, candidates,
+            TASK_METRICS.get(t["id"], _DEFAULT_METRICS))
+        for t in reached}
+    coverage = _coverage_accounting(inv, reached,
+                                    module_conclusions, candidates,
+                                    status)
+    next_actions = _next_actions(module_conclusions, coverage)
+    version_license_findings = [
+        {"tool": c["name"], "target": c["task"],
+         "version_verdict": c["verified_version"],
+         "is_development": bool((c["version_chain"]["values"].get(
+             "latest_stable") or {}).get("development")),
+         "unresolved_version": c["verified_version"] == "Not verified",
+         "license": c["license"],
+         "compatibility": c["compatibility"]}
+        for c in candidates]
+    gb = prog.get("github_budget") or {}
     return {
         "engine": "live-retrieval",
         "engine_version": LIVE_ENGINE_VERSION,
@@ -674,12 +1155,20 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
         "targets": [{"id": t["id"], "label": t["label"]}
                     for t in resolved_targets],
         "executive_summary": [
+            "decisions: " + (", ".join(
+                f"{n} x {c}" for c, n in sorted(
+                    Counter(m["conclusion"] for m in
+                            module_conclusions.values()).items(),
+                    key=lambda kv: kv[1], reverse=True)) or "none"),
             f"{len(candidates)} candidate rows assembled and verified "
             f"against live registries for {len(resolved_targets)} target(s)",
             f"{len(citations)} unique literature citations retrieved "
             f"(abstract/metadata level only)",
             f"coverage: {total_ok} successful queries, {total_fail} failed "
             f"queries - {status}",
+            f"per-module conclusions (fixed vocabulary): "
+            + ", ".join(sorted({v["conclusion"] for v in
+                                module_conclusions.values()})) or "none",
             "no execution or independent benchmarking performed - any "
             "adoption decision requires runs on the deployment's own "
             "fixtures (see recommended_benchmarks)"],
@@ -689,8 +1178,12 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
                       "captured_at": inv["captured_at"],
                       "stages": inv["stages"]},
         "candidates": candidates,
+        "task_comparisons": task_comparisons,
+        "module_conclusions": module_conclusions,
+        "conclusion_vocabulary": CONCLUSION_VOCABULARY,
         "comparison": [
             {"target": c["task"], "tool": c["name"],
+             "artifact_class": c["artifact_class"],
              "verified_version": c["verified_version"],
              "license": c["license"], "maintenance": c["maintenance"],
              "benchmark_evidence": (
@@ -698,6 +1191,7 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
                  f"mention(s)" if isinstance(
                      c["published_benchmark_evidence"], list) else
                  "Not verified"),
+             "performance_summary": c["performance_summary"],
              "independently_validated": c["independent_validation"],
              "evidence_gaps": "; ".join(c["evidence_gaps"])}
             for c in candidates],
@@ -708,15 +1202,15 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
             for c in citations[:60]],
         "license_constraints": sorted({c["license"] for c in candidates
                                        if c["license"] != "Not verified"}),
-        "open_questions": [
-            "Do candidate metrics replicate on THIS deployment's data?",
-            "Are retrieved licenses current for the pinned versions?",
-            "Which candidates integrate with the existing output schema?"],
+        "coverage_accounting": coverage,
+        "recommended_next_actions": next_actions,
+        "version_license_findings": version_license_findings,
         "recommended_benchmarks": benchmarks,
         "provenance": {
             "queries": (prog.get("queries") or [])[:400],
             "sources_consulted": sorted(per_source),
             "query_counts": per_source,
+            "github_budget_at_start": gb or "not measured",
             "dedup_removed": dedup_removed,
             "exclusions": [
                 {"reason": "duplicate record (normalised title)",
@@ -733,20 +1227,42 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
             "Scope -> code-grounded inventory of the configured NeoAG "
             "repository -> per-target multi-query retrieval across "
             "literature sources (Europe PMC, PubMed, OpenAlex) and "
-            "software registries (GitHub, PyPI, bio.tools) -> "
-            "per-candidate existence/version/license verification from "
-            "registries -> abstract-level benchmark evidence extraction "
-            "-> standardised comparison rows. Full query log persisted "
-            "in provenance.queries."),
+            "software registries (GitHub, PyPI, bio.tools, bioconda) -> "
+            "per-candidate VERSION CHAIN (official releases -> git tags "
+            "-> registries -> repository version file -> papers, each "
+            "step recorded with source + date; commit fallback when no "
+            "formal release; budget-skipped steps keep their reason) -> "
+            "performance evidence extraction with a context gate "
+            "(abstracts plus bounded open-access full texts via NCBI "
+            "efetch; numbers without dataset/ground-truth context are "
+            "quoted but excluded from comparison) -> artifact "
+            "classification (algorithm vs wrapper/pipeline/collection/"
+            "reimplementation/model/archived) -> within-task comparison "
+            "tables + fixed-vocabulary module conclusions. Full query "
+            "log persisted in provenance.queries."),
         "limitations": [
-            "abstracts/metadata only - full texts were not read; quoted "
-            "metrics lack full benchmark context until checked",
+            "abstracts/metadata are the evidence floor; full texts were "
+            "attempted ONLY for open-access PMC deposits via efetch "
+            "(Europe PMC's fullTextXML sub-endpoint is unreachable from "
+            "this host - measured 2026-11-16); metrics without an "
+            "established dataset/ground-truth context are quoted but "
+            "excluded from comparisons",
             "NOT an exhaustive search of the literature",
             "no tool was executed: NO independent benchmark numbers exist "
             "in this report ('our own experiments' column is empty by "
             "design)",
             "source failures, if any, are listed in provenance.failures; "
             "status 'incomplete' means coverage gaps",
+            "GitHub version-chain depth is gated by the shared "
+            "unauthenticated 60 req/h budget"
+            + (f" ({gb.get('core')} left at run start, resets "
+               f"{gb.get('reset_utc')})" if gb.get("reset_utc") else
+               "; steps skipped for budget keep their reason in each "
+               "candidate's version_chain")
+            + "; a skipped step is a recorded gap, never a fake 'version "
+              "unknown'",
+            "artifact classification is a labelled heuristic over short "
+            "retrieved blurbs, not a code audit",
             ] + inv["limitations"],
         "availability_classes_legend": AVAILABILITY,
         "timestamps": {"started": (prog.get("steps") or [""])[0:1],

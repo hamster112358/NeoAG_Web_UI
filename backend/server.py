@@ -14,18 +14,22 @@ import os
 import queue
 import secrets
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from . import skills as skills_mod
+from . import native as native_mod
+from . import exports as exports_mod
+from . import versions as versions_mod
 from .agent import DemoAgent, ensure_task_gateway
 from .help_docs import DOCS as HELP_DOCS, get as help_get
 from .inventory import load_inventory, targets_for_ui
 from .jobs import JobManager, DECISION_POINTS as RUN_DECISION_POINTS
 from .mock_data import SAMPLES, STAGES, DEMO_DATASET_VERSION
 from .neoag_params import (PARAM_GROUPS, STAGE_GRAPH, DECISION_POINTS,
-                           HUMAN_REQUIRED)
+                           HUMAN_REQUIRED, params_view)
 from .policies import POLICIES, POLICY_VERSION
 from .research import (TARGETS as EXAMPLE_TARGETS, submit_research,
                        resume_research, sweep_interrupted_research,
@@ -120,7 +124,23 @@ def task_detail(store, job: dict) -> dict:
             "effect_class", "downstream", "ts", "decided_at")})
     t["decisions"] = ds
     t["artifacts"] = store.artifact_list(job["id"])
+    if job.get("kind") == "neoag-native-run":
+        spec = json.loads(job.get("spec_json") or "{}")
+        t["native"] = {
+            "engine": "native",
+            "engine_version": res.get("engine_version"),
+            "profile": spec.get("native_profile"),
+            "gateway_job_id": (job.get("gw_job_id")
+                               or res.get("gateway_job_id") or ""),
+            "gateway_cancel_supported": False,
+            "native_params": spec.get("native_params") or {},
+            "plan": json.loads(job.get("native_plan_json") or "null"),
+            "failure_code": res.get("failure_code"),
+            "failure_detail": res.get("failure_detail"),
+            "outdir": res.get("outdir"),
+        }
     evs = store.event_list(job["id"], 0, 1000)
+    t["events"] = evs
     t["failures"] = [e for e in evs if "fail" in str(e.get("kind")) or
                      "error" in str(e.get("kind"))]
     t["events_url"] = f"/api/jobs/{job['id']}/events"
@@ -184,12 +204,162 @@ class Handler(BaseHTTPRequestHandler):
     # (deployed by agent.ensure_task_gateway) instead of the operator's
     # Basic credentials. It ONLY opens the task/research query routes and
     # ONLY for GET - it can never mutate, read chats, or reach admin.
+    # This includes the persisted export/bundle downloads under those
+    # prefixes (M5 PART 7): they serve the same read-only content the
+    # token already sees through /api/results and /api/research.
     TASK_QUERY_PREFIXES = ("/api/tasks", "/api/results/", "/api/research")
 
     def _task_token_ok(self) -> bool:
         tok = store.setting("task_token", "")
         given = self.headers.get("X-NeoAG-Task-Token", "")
         return bool(tok) and bool(given) and hmac.compare_digest(given, tok)
+
+    # ---------- exported files (M5 PART 7) ----------
+    def _file(self, data: bytes, filename: str, ctype: str,
+              inline: bool = False, extra: dict | None = None) -> None:
+        """Serves persisted export bytes (never regenerated per request).
+        The sha256 header lets any client verify that re-downloads return
+        byte-identical files."""
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition",
+                         ("inline" if inline else "attachment") +
+                         f'; filename="{filename}"')
+        self.send_header("X-Export-Sha256",
+                         hashlib.sha256(data).hexdigest())
+        for k, v in (extra or {}).items():
+            self.send_header(k, str(v))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _serve_export(self, kind: str, oid: str, fmt: str, q) -> None:
+        """Render-once-serve-forever: the first request for a (object,
+        format) persists the file pinned to the stored content hash;
+        every later request serves those exact bytes."""
+        fmt = fmt.lower()
+        if fmt not in exports_mod.FORMATS:
+            return self._json(404, {"error": "unknown export format",
+                                    "available": sorted(
+                                        exports_mod.FORMATS)})
+        try:
+            if kind == "research":
+                row = exports_mod.ensure_research_export(store, oid, fmt)
+            else:
+                row = exports_mod.ensure_job_bundle(store, oid)
+            data = exports_mod.read_export(store, row)
+        except LookupError as e:
+            return self._json(404, {"error": str(e)})
+        except exports_mod.Conflict as e:
+            return self._json(409, {"error": str(e)})
+        self._file(data, row["filename"], exports_mod.FORMATS[fmt][1],
+                   inline=(q.get("inline") or ["0"])[0] == "1",
+                   extra={"X-Export-Version": row["version"]})
+
+    def _research_action(self, rid: str, action: str, q) -> None:
+        """M5 PART 6 discovery follow-up actions - read-only derivations
+        from the STORED report (no retrieval, no execution, no mutation).
+        A candidate that is not in the report is a 404, never an
+        invented row. Adoption is a HUMAN action: this endpoint produces
+        a plan and explicitly applies nothing."""
+        cand = (q.get("candidate") or [""])[0].strip()
+        tid = (q.get("target") or [""])[0].strip()
+        r = store.research_get(rid)
+        if not r or not r.get("report"):
+            return self._json(404, {"error": "no stored report to act on"})
+        rep = r["report"]
+        match = [c for c in rep.get("candidates") or []
+                 if str(c.get("name", "")).lower() == cand.lower()]
+        if not cand or not match:
+            return self._json(
+                404, {"error": f"candidate '{cand}' is not a row of this "
+                               "report - this app will not plan for a "
+                               "tool it never retrieved"})
+        c = match[0]
+        stage = next((s for s in (rep.get("inventory") or {}).get(
+            "stages") or [] if s.get("id") == tid), None)
+        cur = (stage or {}).get("current_tools") or []
+        if action == "compatibility":
+            probe = versions_mod.installed_version(str(c.get("name")))
+            cur_probe = {t: versions_mod.installed_version(t) for t in cur}
+            return self._json(200, {
+                "candidate": c.get("name"), "target": tid or None,
+                "artifact_class": c.get("artifact_class"),
+                "reported": {
+                    "version": c.get("verified_version"),
+                    "license": c.get("license"),
+                    "maintenance": c.get("maintenance")},
+                "on_this_host": {
+                    "installed_version_probe": probe,
+                    "note": ("read-only probe of the deployed tools "
+                             "layout; a value here means the app SAW a "
+                             "version record - it did not run anything")},
+                "current_stage": {
+                    "stage": tid or None, "configured_tools": cur,
+                    "installed": cur_probe,
+                    "config_provenance": (stage or {}).get("provenance")},
+                "interface": ("Not verified - this check covers PRESENCE, "
+                              "VERSION RECORD and LICENSE visibility only; "
+                              "I/O compatibility with the NeoAG workflow "
+                              "was not assessed and requires the "
+                              "adoption plan's manual verification"),
+                "license_caution": (
+                    "license terms were NOT legally reviewed by this app"
+                    if str(c.get("license", "")).lower() not in
+                    ("mit", "bsd", "apache-2.0", "not verified") else
+                    "no known restriction among permissive OSS ids; "
+                    "still verify the actual LICENSE file")})
+        # adoption plan
+        supported = bool(stage and cur)
+        plan = {
+            "candidate": c.get("name"), "target": tid or None,
+            "applied": False,
+            "statement": (
+                "Adoption is executed by a HUMAN on the configured repo. "
+                "This app never patches production config, never "
+                "installs tools, and records no silent substitution. "
+                + ("The stage HAS a configurable tool slot in the "
+                   "workflow config - the plan below points at it."
+                   if supported else
+                   "The stage has NO evidenced tool slot in the workflow "
+                   "config - replacement is therefore a CODE/INTEGRATION "
+                   "change by an engineer with a review, not a config "
+                   "switch; this app will not pretend otherwise.")),
+            "current_stage": {
+                "stage": tid or None, "configured_tools": cur,
+                "config_provenance": (stage or {}).get("provenance")},
+            "evidence": {
+                "report": rid,
+                "conclusion": (rep.get("module_conclusions") or {}).get(
+                    tid, {}).get("conclusion"),
+                "performance_summary": c.get("performance_summary"),
+                "evidence_gaps": c.get("evidence_gaps")},
+            "steps": [
+                f"1. Review the stored evidence (report {rid}) - note "
+                "that NO winner is asserted without paired numbers.",
+                "2. Propose the benchmark as a FORMAL job (kind=benchmark "
+                "through the unified API) with the candidate vs the "
+                "configured tool and explicit metrics; a human approves "
+                "the card before anything runs.",
+                f"3. Verify licensing for the intended use "
+                f"(candidate reports '{c.get('license')}') - legal review "
+                "is a human responsibility, not this app's.",
+                "4. If the candidate must be installed: that is an "
+                "authorized operator action (production tool installs "
+                "are out of scope for this app); pin the exact version.",
+                "5. Run the deployment's own validation fixture through "
+                "both configurations; compare ranking artifacts and the "
+                "stated metrics on identical inputs.",
+                "6. Record the outcome as a decision in this app's "
+                "decision history; adoption applies only after that.",
+                "7. Keep the previous configuration recoverable until "
+                "the verification above passes (rollback = restore "
+                "config)."],
+            "verification_gate": ("adopt ONLY if the benchmark on THIS "
+                                  "deployment's inputs improves the "
+                                  "stated metrics - published numbers "
+                                  "from other versions do not count")}
+        return self._json(200, plan)
 
     # ---------- GET ----------
     def do_GET(self) -> None:
@@ -256,10 +426,33 @@ class Handler(BaseHTTPRequestHandler):
                 "settings": store.setting("ui", {"mode": "auto"}),
             })
         if path == "/api/params":
-            return self._json(200, {"groups": PARAM_GROUPS,
+            groups = params_view()
+            # science-module tools are DERIVED here from the code-grounded
+            # inventory (never stored in the params module itself), so the
+            # configuration view can never drift from the configured repo.
+            inv = load_inventory()
+            by_stage = {s["id"]: s for s in inv["stages"]}
+            for g in groups:
+                mod = g.get("module")
+                if not mod:
+                    continue
+                tools, prov = [], []
+                for sid in mod.get("stages") or []:
+                    s = by_stage.get(sid)
+                    if s:
+                        tools += s.get("current_tools") or []
+                        prov.append(s["provenance"])
+                mod["tools"] = sorted(set(tools)) or [
+                    "not evidenced in the workflow TOML - the UI does "
+                    "not invent tools here"]
+                mod["tools_provenance"] = prov or [
+                    "no [stages.*] entry matched in the workflow TOML"]
+            return self._json(200, {"groups": groups,
                                    "stage_graph": STAGE_GRAPH,
                                    "decision_points": DECISION_POINTS,
-                                   "human_required": HUMAN_REQUIRED})
+                                   "human_required": HUMAN_REQUIRED,
+                                   "inventory_captured_at":
+                                       inv["captured_at"]})
         if path == "/api/audit":
             return self._json(200, store.audit_list(300))
         if path == "/api/conversations":
@@ -369,6 +562,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, task_detail(store, job))
         if path == "/api/inventory":
             return self._json(200, load_inventory())
+        if path == "/api/native/capability":
+            return self._json(200, native_mod.probe(force=True))
+        if path == "/api/native/gateway":
+            return self._json(200, native_mod.gateway_status())
         # ---------- skills (PART C) ----------
         if path == "/api/skills":
             return self._json(200, {"skills": skills_mod.activation_state(
@@ -400,6 +597,19 @@ class Handler(BaseHTTPRequestHandler):
                 after = int((q.get("after") or ["0"])[0])
                 return self._json(200, {"events": store.research_events(
                     rid, after)})
+            if len(parts) > 3 and parts[3] == "exports":
+                # what exists on disk for this report, pinned per content
+                return self._json(200, {"exports": [
+                    {k: e[k] for k in
+                     ("id", "kind", "object_id", "format", "filename",
+                      "bytes", "sha256", "source_hash", "version",
+                      "created_at")}
+                    for e in store.export_list("research", rid)]})
+            if len(parts) > 4 and parts[3] == "export":
+                return self._serve_export("research", rid, parts[4], q)
+            if len(parts) > 3 and parts[3] in ("compatibility",
+                                               "adoption-plan"):
+                return self._research_action(rid, parts[3], q)
             r = store.research_get(rid)
             if not r:
                 return self._json(404, {"error": "no such report"})
@@ -411,7 +621,19 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/results/"):
             # A3: Results are read from the ARTIFACT MANIFEST - the live
             # artifact rows are authoritative, never a stored claim.
-            jid = path.split("/")[-1]
+            parts = path.strip("/").split("/")  # api/results/<id>[/bundle]
+            jid = parts[2]
+            if len(parts) > 3 and parts[3] == "bundle":
+                # M5 PART 7: scoped results ZIP built from persisted job
+                # state; re-download serves the pinned bytes
+                return self._serve_export("job", jid, "zip", q)
+            if len(parts) > 3 and parts[3] == "exports":
+                return self._json(200, {"exports": [
+                    {k: e[k] for k in
+                     ("id", "kind", "object_id", "format", "filename",
+                      "bytes", "sha256", "source_hash", "version",
+                      "created_at")}
+                    for e in store.export_list("job", jid)]})
             job = store.job_get(jid)
             if not job:
                 return self._json(404, {"error": "no such job"})
@@ -449,13 +671,24 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- POST ----------
     def do_POST(self) -> None:
-        if not self._authorized():
-            return self._unauthorized()
         path = urlparse(self.path).path.rstrip("/")
+        # Milestone 5 formal-job routing (PART 1, enforceable): the
+        # task-query token grants exactly ONE write - creating a job
+        # via POST /api/jobs. It is never sufficient for any other
+        # endpoint (chat, settings, approvals, skills, admin all keep
+        # Basic auth only). A token-created job still starts BLOCKED
+        # behind the same human approval card as a GUI-submitted one.
+        scoped = (path == "/api/jobs" and not self._authorized()
+                  and self._task_token_ok())
+        if not self._authorized() and not scoped:
+            return self._unauthorized()
         try:
             body = self._body()
         except ValueError as e:
             return self._json(400, {"error": str(e)})
+        if scoped:
+            body["requested_by"] = "agent"
+            body["requested_by_kind"] = "task_query_token"
         try:
             if path == "/api/chat":
                 text = str(body.get("text", ""))[:4000]
@@ -550,11 +783,58 @@ class Handler(BaseHTTPRequestHandler):
                 publish({"type": "manifest", "id": mid})
                 return self._json(200, m2)
             if path == "/api/jobs":
+                if str(body.get("engine", "mock")) == "native":
+                    profile = str(body.get("native_profile", "demo"))
+                    nparams = body.get("native_params") or {}
+                    if not isinstance(nparams, dict):
+                        return self._json(400, {"error": "native_params must "
+                                                         "be an object"})
+                    sid = str(nparams.get("sample_id")
+                              or body.get("sample_id") or "")
+                    if not sid:
+                        return self._json(400, {"error": "native jobs need "
+                                                         "sample_id"})
+                    nparams.setdefault("sample_id", sid)
+                    try:
+                        res = jobs.submit_native(
+                            sid, profile=profile, native_params=nparams,
+                            stub=bool(body.get("stub")),
+                            requested_by=str(body.get("requested_by",
+                                                      "user")),
+                            conv_id=str(body.get("conv_id", "") or ""))
+                    except ValueError as e:
+                        return self._json(400, {"error": str(e)})
+                    if scoped:
+                        store.audit("agent", "job.create.scoped_token",
+                                    res.get("job_id", ""),
+                                    {"engine": "native",
+                                     "profile": profile, "sample_id": sid})
+                    return self._json(202, res)
                 stage_ids = body.get("stage_ids") or [
                     s["id"] for s in STAGES if s["required"]]
                 kind = str(body.get("kind", "analysis"))
-                if kind not in ("analysis", "discovery", "diagnostic"):
+                if kind not in ("analysis", "discovery", "diagnostic",
+                                "benchmark"):
                     return self._json(400, {"error": "invalid kind"})
+                if kind == "benchmark":
+                    # M5 PART 6: the brief is validated BEFORE anything is
+                    # queued; the job blocks on an approval card that
+                    # carries the full experiment. Nothing runs on submit.
+                    try:
+                        res = jobs.submit_benchmark(
+                            body.get("benchmark") or {},
+                            sample_id=str(body.get("sample_id")
+                                          or "DEMO-BENCH"),
+                            requested_by=str(body.get("requested_by",
+                                                      "user")),
+                            conv_id=str(body.get("conv_id", "") or ""))
+                    except ValueError as e:
+                        return self._json(400, {"error": str(e)})
+                    if scoped:
+                        store.audit("agent", "job.create.scoped_token",
+                                    res.get("job_id", ""),
+                                    {"kind": "benchmark"})
+                    return self._json(202, res)
                 rcfg = body.get("requested_config")
                 if rcfg is not None and not isinstance(rcfg, dict):
                     return self._json(400, {"error": "requested_config must be an object"})
@@ -569,8 +849,41 @@ class Handler(BaseHTTPRequestHandler):
                                   manifest_id=body.get("manifest_id"),
                                   requested_config=rcfg,
                                   conv_id=str(body.get("conv_id", "")
-                                              or ""))
+                                              or ""),
+                                  requested_by=str(
+                                      body.get("requested_by", "user")))
+                if scoped:
+                    store.audit("agent", "job.create.scoped_token",
+                                res.get("job_id", ""),
+                                {"engine": "mock", "kind": kind,
+                                 "sample_id": body.get("sample_id", "")})
                 return self._json(202, res)
+            if path == "/api/jobs/native/preview":
+                # Real native planning/preflight WITHOUT executing: the
+                # planner decides routes; we only display them. Read-only
+                # on inputs; writes only into the scratch preview dir.
+                nparams = body.get("native_params") or {}
+                if not isinstance(nparams, dict):
+                    return self._json(400, {"error": "native_params must be "
+                                                     "an object"})
+                sid = str(nparams.get("sample_id")
+                          or nparams.get("case_id") or "")
+                if not sid:
+                    return self._json(400, {"error": "native_params.sample_id "
+                                                     "required"})
+                nparams.setdefault("sample_id", sid)
+                nparams.setdefault("case_id", sid)
+                if not native_mod.probe()["available"]:
+                    return self._json(200, {
+                        "ok": False, "status": "NATIVE_UNAVAILABLE",
+                        "detail": "native NeoAG not importable on this "
+                                  "host - preview is honestly unavailable, "
+                                  "not faked"})
+                outdir = native_mod.job_outdir(
+                    "preview-" + time.strftime("%Y%m%d%H%M%S"))
+                plan = native_mod.run_plan(nparams, outdir)
+                plan["outdir"] = outdir
+                return self._json(200, plan)
             if path.startswith("/api/jobs/") and path.endswith("/cancel"):
                 jid = path.split("/")[3]
                 ok = jobs.request_cancel(jid)
@@ -682,10 +995,20 @@ class Handler(BaseHTTPRequestHandler):
                                                  "unknown id)"})
             # ---------- skills (PART C: advisory instructions only) ----
             if path == "/api/skills":
+                title0 = str(body.get("title", "")).strip()
+                content0 = str(body.get("content", ""))
                 slug = str(body.get("slug", "")).strip()
-                errs = skills_mod.validate_skill(
-                    slug, str(body.get("content", "")),
-                    str(body.get("title", "")))
+                # usability (M5 PART 3): slug derived from the title when
+                # omitted, mechanical frontmatter generated when missing -
+                # the author only writes the knowledge itself.
+                if not slug:
+                    slug = skills_mod.slugify(
+                        title0 or (content0.strip().splitlines()
+                                   or ["skill"])[0])
+                if content0.strip():
+                    content0 = skills_mod.autofrontmatter(slug, title0,
+                                                          content0)
+                errs = skills_mod.validate_skill(slug, content0, title0)
                 if errs:
                     return self._json(400, {"errors": errs})
                 cat = str(body.get("category", ""))
@@ -695,9 +1018,8 @@ class Handler(BaseHTTPRequestHandler):
                                            skills_mod.CATEGORIES)})
                 if store.skill_get(slug, by_slug=True):
                     return self._json(409, {"error": "slug already exists"})
-                s = store.skill_create(slug, slug,
-                                       str(body.get("title", slug)), cat,
-                                       str(body.get("content", "")))
+                s = store.skill_create(slug, slug, title0 or slug, cat,
+                                       content0)
                 store.audit("user", "skill.create", slug, {"category": cat})
                 publish({"type": "skills_changed"})
                 return self._json(201, s)

@@ -54,6 +54,37 @@ otherwise destructive. When that happens:
 Credential/config paths and frozen reference trees are blocked without
 any approval path - never attempt them.
 
+## Data, benchmarks and consent
+- Reading literature (papers, preprints, docs) needs no approval -
+  just do it.
+- Downloading any dataset (public benchmark data, reference sets,
+  sequencing data) requires an explicit consent card, and the gate
+  enforces this: before the download is allowed you must have told
+  the user, in your reply, the dataset name and source, what is being
+  fetched, the destination directory, and why the task needs it.
+  Approving a card bounds ONE source into ONE destination for 72
+  hours - files of that download then proceed without re-asking.
+- Never paraphrase around a dataset block (renaming hosts, chunking,
+  or bespoke downloader scripts); the approval flow exists precisely
+  so downloads are visible decisions.
+- Running a benchmark is a FORMAL run: get the dataset consent first,
+  then register the job via taskquery job submit - never run the
+  comparison silently in chat.
+
+## Formal NeoAG runs go through the task API (enforced)
+Launching the real pipeline from your shell (`open-neo run --mode
+execute`, `neoag.cli run/run-full/run-demo`, direct gateway posts) is
+blocked with "NEOAG_FORMAL_JOB_REQUIRED" - there is no approval path
+for raw launches. Register the work instead:
+`python3 .neoag/taskquery.py job submit '<json>'` (see the helper's
+usage for the body shapes; native demo / native gateway / mock engines
+are all supported). The job appears as the same task in the interface,
+stays blocked until the human approves the card, and then runs under
+the unified system with approval, snapshot, artifact ledger and outcome
+tracking. Watch it with `taskquery.py job status <id>` / `job events
+<id>`. Pure planning and inspection are NOT blocked: `open-neo run
+--mode plan ...`, doctor, --help, reads and diagnostics run normally.
+
 ## Decisions and provenance
 For every scientifically consequential choice (tool or reference
 version, thresholds, filtering decisions, parameter overrides),

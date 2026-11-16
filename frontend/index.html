@@ -93,8 +93,49 @@
           </div>
 
           <details class="adv" open id="prep-details">
-            <summary>Sample, stages and mode</summary>
+            <summary>Engine, sample, stages and mode</summary>
             <div class="block">
+              <label class="lbl">Execution engine (one task system, two real engines)</label>
+              <div class="mode-row" id="nj-engine-row">
+                <label class="mode-opt">
+                  <input type="radio" name="njengine" value="mock" checked>
+                  <div><b>Demo engine (mock)</b><span>seeded simulation for UI/workflow testing - clearly labelled, never real science</span></div>
+                </label>
+                <label class="mode-opt">
+                  <input type="radio" name="njengine" value="native">
+                  <div><b>Native NeoAG</b><span>the deployed NeoAG's own planner and runner decide the stages - real execution</span></div>
+                </label>
+              </div>
+              <div id="native-box" class="hidden">
+                <div id="native-cap" class="mnote">checking native capability&hellip;</div>
+                <label class="lbl">Native profile</label>
+                <div class="mode-row">
+                  <label class="mode-opt">
+                    <input type="radio" name="njnative" value="demo" checked>
+                    <div><b>Demo dataset</b><span>real pipeline code (neoag.cli run-demo) on the repo's bundled fixtures, predictors stubbed - safe, completes, real artifacts</span></div>
+                  </label>
+                  <label class="mode-opt">
+                    <input type="radio" name="njnative" value="gateway">
+                    <div><b>My inputs via native gateway</b><span>real planner, then execution through NeoAG's controlled gateway (requires working toolchain)</span></div>
+                  </label>
+                </div>
+                <label class="lbl">Case / sample id</label>
+                <input type="text" id="nj-n-case" placeholder="e.g. NATIVE-1" value="NATIVE-1">
+                <div id="native-gw-box" class="hidden">
+                  <label class="lbl">Somatic VCF (absolute path)</label>
+                  <input type="text" id="nj-n-vcf" placeholder="/path/to/somatic.vcf">
+                  <label class="lbl">HLA alleles (comma-separated)</label>
+                  <input type="text" id="nj-n-hla" placeholder="A*02:01, B*07:02">
+                  <label class="chk" id="nj-stub-wrap" style="display:none"><input type="checkbox" id="nj-n-stub"> stub predictor outputs (developer control - testing only, flagged in every record)</label>
+                  <div class="btnrow">
+                    <button id="nj-native-preview" class="btn ghost">Preview native plan (read-only)</button>
+                    <span class="hint">runs the REAL NeoAG planner; executes nothing</span>
+                  </div>
+                  <div id="native-preview"></div>
+                </div>
+                <p class="hint">Native runs execute outside the browser: the native gateway offers NO cancel (verified); the demo profile is our supervised subprocess and CAN be cancelled. Both are recorded honestly in the job.</p>
+              </div>
+              <div id="mock-box">
               <label class="lbl">Sample</label>
               <select id="nj-sample"></select>
               <label class="lbl">Stage plan</label>
@@ -110,18 +151,29 @@
                   <div><b>Autonomous</b><span>validated defaults applied on its own, every choice recorded</span></div>
                 </label>
               </div>
+              </div>
             </div>
           </details>
 
           <details class="adv" id="adv-block">
-            <summary>Advanced configuration <span id="adv-count" class="count"></span></summary>
-            <div id="adv-params"></div>
-            <p class="hint">Advanced options map onto real <code>open-neo run</code> flags. The demo engine does not consume them; they are stored with the job for review and reused verbatim when the real gateway is connected.</p>
+            <summary>Scientific configuration &amp; inputs <span id="adv-count" class="count"></span></summary>
+            <div id="cfg-inputs"></div>
+            <div id="cfg-science"></div>
+            <details class="adv" id="cfg-exec-block">
+              <summary>Execution &amp; environment (usually left unchanged)</summary>
+              <div id="cfg-exec"></div>
+            </details>
+            <div id="cfg-managed" class="hint"></div>
+            <p class="hint">Every option shown exists in the configured NeoAG code (each row cites its file) and maps to a real <code>open-neo run</code> flag. The demo engine records them in the run snapshot without consuming them; native gateway jobs forward the subset the gateway accepts. Nothing here is a decorative placeholder.</p>
           </details>
 
-          <details class="adv">
-            <summary>Demonstration controls</summary>
-            <label class="chk"><input type="checkbox" id="nj-fail"> simulate missing stability tool (demo failure path)</label>
+          <details class="adv" id="dev-block">
+            <summary>Demo / developer controls</summary>
+            <label class="chk"><input type="checkbox" id="devmode-toggle"> Show demo &amp; developer controls</label>
+            <div id="dev-controls" class="hidden">
+              <label class="chk"><input type="checkbox" id="nj-fail"> simulate missing stability tool (demo failure path - clearly labelled in the job)</label>
+              <p class="hint">Developer controls never change scientific results; they exercise demo paths only and are recorded in every artifact and report.</p>
+            </div>
           </details>
 
           <div class="btnrow">

@@ -548,29 +548,59 @@ function renderTasks() {
       ${s.required ? '<span class="req">required</span>' : ""}
       <span class="dep">${esc(dep)}</span></label>`;
   }).join("");
-  $("adv-count").textContent =
-    `${state.params ? state.params.groups.length : 0} parameter groups from the real pipeline code`;
+  $("adv-count").textContent = state.params
+    ? `${state.params.groups.flatMap((g) => g.items).length} options, all cited to the real pipeline code`
+    : "inventory unavailable";
   renderAdvanced();
 }
 
 function renderAdvanced() {
-  const host = $("adv-params");
-  if (!state.params) { host.innerHTML = "<p class='hint'>inventory unavailable</p>"; return; }
-  host.innerHTML = state.params.groups.map((g) => `
-    <div class="pgroup ${g.expert ? "expert" : ""}">
-      <h3>${esc(g.group)}</h3>
-      ${g.items.map((p) => pitemHtml(p)).join("")}
-    </div>`).join("");
-  host.querySelectorAll("input,select").forEach((el) => {
-    el.addEventListener("change", collectAdvanced);
-  });
+  const hosts = ["cfg-inputs", "cfg-science", "cfg-exec"].map((h) => $(h));
+  if (!state.params) {
+    hosts.forEach((h) => {
+      h.innerHTML = "<p class='hint'>parameter inventory unavailable - " +
+        "showing nothing rather than guessing options</p>";
+    });
+    $("cfg-managed").innerHTML = "";
+    return;
+  }
+  const itemsOf = (concern) => state.params.groups.flatMap((g) =>
+    g.items.filter((p) => p.concern === concern));
+  $("cfg-inputs").innerHTML = `
+    <h3>Inputs &amp; sample (agent-managed, auto-discovery)</h3>
+    <p class="hint">You normally describe where the data is; the input
+    detector / planner discovers the files and proposes a manifest
+    (native plan step 01). Only override a path when discovery picked
+    wrong - every override is recorded in the run snapshot.</p>
+    ${itemsOf("inputs").map((p) => pitemHtml(p)).join("")}`;
+  const modules = state.params.groups.filter((g) => g.concern === "science");
+  $("cfg-science").innerHTML = `
+    <h3>Scientific configuration - per NeoAG module</h3>
+    ${modules.map((g) => `
+      <div class="pgroup">
+        <h3>${esc((g.module && g.module.label) || g.group)}</h3>
+        ${g.module ? `<p class="hint">${esc(g.module.purpose || "")}
+          <br>Tools (from the configured repo's workflow TOML):
+          <b>${esc((g.module.tools || []).join(", "))}</b>
+          <br><span class="psrc">${esc((g.module.tools_provenance || []).join("; "))}</span></p>` : ""}
+        ${g.items.map((p) => pitemHtml(p)).join("")}
+      </div>`).join("")}`;
+  $("cfg-exec").innerHTML = itemsOf("execution").map((p) => pitemHtml(p)).join("");
+  const managed = itemsOf("managed");
+  $("cfg-managed").innerHTML = managed.length
+    ? "Managed automatically, never a form field: " +
+      managed.map((p) => `<b>${esc(p.label)}</b> (${esc(p.desc || "")})`).join("; ")
+    : "";
+  hosts.forEach((h) =>
+    h.querySelectorAll("input,select").forEach((el) =>
+      el.addEventListener("change", collectAdvanced)));
   collectAdvanced();
 }
 
 function pitemHtml(p) {
   let ctrl;
   if (p.type === "choice") {
-    ctrl = `<select data-param="${esc(p.id)}">${(p.values || []).map((v) =>
+    ctrl = `<select data-param="${esc(p.id)}"><option value="">(leave default)</option>${(p.values || []).map((v) =>
       `<option>${esc(v)}</option>`).join("")}</select>`;
   } else if (p.type === "flag") {
     ctrl = `<input type="checkbox" data-param="${esc(p.id)}">`;
@@ -578,7 +608,7 @@ function pitemHtml(p) {
     ctrl = `<input type="text" data-param="${esc(p.id)}" placeholder="${esc(p.default || "")}">`;
   }
   return `<div class="pitem">
-    <div><div class="pname">${esc(p.label)}</div><div class="pdef">default: ${esc(p.default ?? "none")}</div></div>
+    <div><div class="pname">${esc(p.label)}${p.cli ? ` <code>${esc(p.cli)}</code>` : ""}</div><div class="pdef">default: ${esc(p.default ?? "none")}</div></div>
     <div>${ctrl}</div>
     <div class="pdesc">${esc(p.desc || "")}</div>
     <div class="psrc">${esc(p.source || "")}</div>
@@ -648,6 +678,37 @@ async function refreshManifests() {
 
 /* submit */
 $("nj-submit").addEventListener("click", async () => {
+  if (nativeEngineSel() === "native") {
+    /* M5 PART 1: GUI path of the unified task system. Chat path posts to
+       the SAME endpoint - one Job ID either way. */
+    const profile = (document.querySelector(
+      'input[name="njnative"]:checked') || {}).value || "demo";
+    const native_params = { sample_id: $("nj-n-case").value || "NATIVE-1" };
+    if (profile === "gateway") {
+      if ($("nj-n-vcf").value.trim())
+        native_params.somatic_vcf = $("nj-n-vcf").value.trim();
+      const hla = $("nj-n-hla").value.split(",")
+        .map((x) => x.trim()).filter(Boolean);
+      if (hla.length) native_params.hla_alleles = hla;
+      /* Scientific overrides FORWARD to the native gateway only for the
+         keys its verified allowlist accepts (native.py _SCIENTIFIC_KEYS
+         mirrors the deployed gateway route spec) - no silently dropped
+         or invented options. */
+      const sci = collectAdvanced();
+      ["event_top_n", "candidate_top_n", "genome_build"].forEach((k) => {
+        if (sci[k] !== undefined && sci[k] !== "") native_params[k] = sci[k];
+      });
+    }
+    try {
+      const res = await api("POST", "/api/jobs", { engine: "native",
+        native_profile: profile, sample_id: native_params.sample_id,
+        native_params, stub: $("nj-n-stub").checked });
+      toast(`native job ${res.job_id} waiting for your approval ` +
+        "(Tasks panel above)");
+      await refreshJobs();
+    } catch (e) { toast("native submit failed: " + e.message, true); }
+    return;
+  }
   const sample = $("nj-sample").value;
   const stage_ids = [...document.querySelectorAll("[data-stage]")]
     .filter((c) => c.checked).map((c) => c.dataset.stage);
@@ -664,6 +725,112 @@ $("nj-submit").addEventListener("click", async () => {
     toast(`job ${res.job_id} waiting for your approval (Tasks panel above)`);
     await refreshJobs();
   } catch (e) { toast("submit failed: " + e.message, true); }
+});
+
+/* M5: engine selection + native controls (honest capability reporting) */
+let nativeCap = null;
+function nativeEngineSel() {
+  return (document.querySelector(
+    'input[name="njengine"]:checked') || {}).value || "mock";
+}
+function renderNativeCap() {
+  const host = $("native-cap");
+  if (!nativeCap || !host) return;
+  const t = nativeCap.toolchain || {};
+  const y = (b) => b ? "present" : "<b>MISSING</b>";
+  host.innerHTML = nativeCap.available
+    ? `Native source imports <b>OK</b> &middot; demo fixtures ${y(t.demo_fixtures && t.demo_fixtures.present)}` +
+      ` &middot; reference FASTA ${y(t.reference_fasta && t.reference_fasta.present)}` +
+      ` &middot; VEP ${y(t.vep_bin && t.vep_bin.present)}` +
+      ` &middot; native gateway ${nativeCap.gateway && nativeCap.gateway.running
+        ? "running (" + esc(String(nativeCap.gateway.url)) + ")"
+        : "not running - started on demand at submission"}` +
+      ` &middot; gateway cancel: ${nativeCap.cancel_supported_by_native_gateway ? "supported" : "NOT supported (verified limitation)"}`
+    : `<b>Native execution UNAVAILABLE on this host</b> - a native job ` +
+      `will fail honestly; the mock engine is never silently substituted`;
+}
+async function loadNativeCap() {
+  if (nativeCap) { renderNativeCap(); return; }
+  $("native-cap").textContent = "checking native capability...";
+  try { nativeCap = await api("GET", "/api/native/capability"); renderNativeCap(); }
+  catch (e) { $("native-cap").innerHTML = "capability check failed: " + esc(e.message); }
+}
+document.querySelectorAll('input[name="njengine"]').forEach((r) =>
+  r.addEventListener("change", () => {
+    const nat = nativeEngineSel() === "native";
+    $("native-box").classList.toggle("hidden", !nat);
+    $("mock-box").classList.toggle("hidden", nat);
+    if (nat) loadNativeCap();
+    applyDevMode();
+  }));
+document.querySelectorAll('input[name="njnative"]').forEach((r) =>
+  r.addEventListener("change", () => {
+    $("native-gw-box").classList.toggle("hidden",
+      (document.querySelector(
+        'input[name="njnative"]:checked') || {}).value !== "gateway");
+    applyDevMode();
+  }));
+/* Demo/Developer mode gate (Milestone 5 PART 2 concern D): demo-only
+   controls are hidden until explicitly enabled, and stay off by
+   default in every fresh session (choice persisted per browser). */
+function devModeOn() {
+  try { return localStorage.getItem("nj_devmode") === "1"; }
+  catch (_) { return false; }
+}
+function applyDevMode() {
+  const on = devModeOn();
+  const cb = $("devmode-toggle");
+  if (cb) cb.checked = on;
+  $("dev-controls").classList.toggle("hidden", !on);
+  if (!on) $("nj-fail").checked = false;
+  const stubWrap = $("nj-stub-wrap");
+  const gw = (document.querySelector(
+    'input[name="njnative"]:checked') || {}).value === "gateway";
+  const engNat = (document.querySelector(
+    'input[name="njengine"]:checked') || {}).value === "native";
+  const showStub = on && gw && engNat;
+  stubWrap.style.display = showStub ? "" : "none";
+  if (!showStub) $("nj-n-stub").checked = false;
+}
+$("devmode-toggle").addEventListener("change", (e) => {
+  try { localStorage.setItem("nj_devmode", e.target.checked ? "1" : "0"); }
+  catch (_) { /* storage unavailable: session-only toggle */ }
+  applyDevMode();
+});
+applyDevMode();
+function renderNativePlan(plan) {
+  const host = $("native-preview");
+  if (!host || !plan) return;
+  const steps = (plan.steps || []).map((s) =>
+    `<li><b>${esc(s.step_id || "")} ${esc(s.name || "")}</b> ` +
+    `<span class="pill ${s.status === "PASS" ? "ok"
+      : s.status === "SKIPPED" || s.status === "DRY_RUN" ? "muted"
+      : s.status === "FAILED" || s.status === "BLOCKED" ? "danger"
+      : "warn"}">${esc(s.status || "")}</span>` +
+    (s.detail ? ` <span class="hint">${esc(String(s.detail).slice(0, 140))}</span>` : "") +
+    `</li>`).join("");
+  host.innerHTML = `<div class="manifest-card">
+    <div class="mnote ${plan.ok ? "" : "warn"}">native plan: <b>${esc(plan.status || plan.status_code || "?")}</b>${plan.run_id ? " &middot; run " + esc(plan.run_id) : ""}</div>
+    ${steps ? `<ul>${steps}</ul>` : ""}
+    ${plan.blocking_issues && plan.blocking_issues.length
+      ? `<p class="hint">Blocking: ${plan.blocking_issues.map(esc).join(", ")}</p>` : ""}
+    ${plan.detail ? `<p class="hint">${esc(plan.detail)}</p>` : ""}
+    ${plan.run_plan_md ? `<details><summary class="hint">generated run plan (native markdown)</summary><pre class="tool-out">${esc(plan.run_plan_md)}</pre></details>` : ""}
+  </div>`;
+}
+$("nj-native-preview").addEventListener("click", async () => {
+  const host = $("native-preview");
+  host.innerHTML = '<div class="hint">running the REAL NeoAG planner (read-only, executes nothing)... this can take a minute</div>';
+  const hla = $("nj-n-hla").value.split(",").map((x) => x.trim()).filter(Boolean);
+  const native_params = { sample_id: $("nj-n-case").value || "NATIVE-1" };
+  if ($("nj-n-vcf").value.trim()) native_params.somatic_vcf = $("nj-n-vcf").value.trim();
+  if (hla.length) native_params.hla_alleles = hla;
+  try {
+    const plan = await api("POST", "/api/jobs/native/preview", { native_params });
+    renderNativePlan(plan);
+  } catch (e) {
+    host.innerHTML = `<div class="mnote warn">preview failed: ${esc(e.message)}</div>`;
+  }
 });
 
 /* attention strip: anything blocked on a human click */
@@ -757,13 +924,33 @@ async function openJob(id) {
     <div class="btnrow">${job ? statusPill(job.state) : ""}
       ${task && task.outcome ? `<span class="pill ${task.outcome === "delivered"
         ? "ok" : task.outcome ? "warn" : "muted"}">${esc(task.outcome)}</span>` : ""}
-      <span class="pill muted">${esc(job ? job.kind : "?")}</span></div>
+      <span class="pill muted">${esc(job ? job.kind : "?")}</span>
+      ${task && task.native ? `<span class="pill accent">native ${esc(task.native.profile || "")}</span>`
+        : `<span class="pill warn">mock engine</span>`}</div>
     <section><h3>Controls</h3><div class="btnrow">
-      <button class="btn sm" id="jd-pause" ${running ? "" : "disabled"}>Pause</button>
+      <button class="btn sm" id="jd-pause" ${running && !(task && task.native) ? "" : "disabled"}
+        title="${task && task.native ? "native runs have no safe pause point (real pipeline process)" : ""}">Pause</button>
       <button class="btn sm" id="jd-resume" ${job && job.state === "paused" ? "" : "disabled"}>Resume</button>
       <button class="btn sm danger" id="jd-cancel"
-        ${job && !["completed", "failed", "cancelled"].includes(job.state) ? "" : "disabled"}>Cancel</button>
+        ${job && !["completed", "failed", "cancelled"].includes(job.state) ? "" : "disabled"}
+        title="${task && task.native && task.native.profile === "gateway" ? "cancelling stops the Web job only - the native gateway job has no cancel route (verified) and runs on" : ""}">Cancel</button>
+      ${task && task.native && task.native.profile === "gateway"
+        ? `<span class="hint">native gateway job ${esc(task.native.gateway_job_id || "")}${task.native.gateway_job_id ? "" : " (not yet submitted)"} - cancel caveats in the event log</span>` : ""}
     </div></section>
+    ${task && task.native ? `<section><h3>Native execution</h3>
+      <div class="kv">
+        <div class="k">engine</div><div>${esc(task.native.engine || "native")} ${esc(task.native.engine_version || "")} (${esc(task.native.profile || "")})</div>
+        <div class="k">inputs</div><div><code>${esc(JSON.stringify(task.native.native_params || {}))}</code></div>
+        <div class="k">output directory</div><div><code>${esc(task.native.outdir || "-")}</code></div>
+        ${task.native.failure_code ? `<div class="k">failure</div><div>${esc(task.native.failure_code)}</div>` : ""}
+      </div>
+      ${task.native.plan && (task.native.plan.steps || []).length
+        ? `<details open><summary class="hint">native plan (produced by NeoAG's own planner, not a hardcoded stage list)</summary><ul>${
+            (task.native.plan.steps || []).map((s) => `<li><b>${esc(s.step_id || "")} ${esc(s.name || "")}</b>: ${esc(s.status || "")}${s.detail ? " - " + esc(String(s.detail).slice(0, 140)) : ""}</li>`).join("")
+          }</ul></details>` : ""}
+      ${task.native.plan && task.native.plan.run_plan_md
+        ? `<details><summary class="hint">generated run plan (markdown)</summary><pre class="tool-out">${esc(task.native.plan.run_plan_md)}</pre></details>` : ""}
+    </section>` : ""}
     <section><h3>Requested configuration</h3>
       <div class="kv">${Object.entries((job && job.spec &&
         job.spec.requested_config) || {})
@@ -864,7 +1051,16 @@ function renderResults() {
       </div>
       ${res.outcome_drift ? `<div class="mnote warn">${esc(res.outcome_drift)}</div>` : ""}
       ${res.production_release === false
-        ? `<div class="mnote">production release BLOCKED: ${esc(res.release_note || "")}</div>` : ""}`;
+        ? `<div class="mnote">production release BLOCKED: ${esc(res.release_note || "")}</div>` : ""}
+      <div class="btnrow"><a class="btn sm"
+        href="/api/results/${esc(state.resultsJob)}/bundle"
+        download>Download results bundle (.zip)</a>
+        <span class="hint">built once from the persisted job state (result,
+        ranking tables, decision history, immutable snapshot, artifacts,
+        provenance); raw FASTQ/BAM-class inputs and oversized files are
+        NEVER included and every exclusion is listed with its reason in
+        the bundle manifest; re-download serves the same pinned bytes</span>
+      </div>`;
     $("res-meta").innerHTML = `
       <div class="hint">${esc(res.disclaimer || "")}</div>
       <div class="kv">${Object.entries(res.provenance || {})
@@ -872,6 +1068,21 @@ function renderResults() {
     $("res-warnings").innerHTML = (res.warnings || []).length
       ? `<div class="warnlist">${res.warnings.map((w) =>
           `<div class="mnote warn">warning: ${esc(w)}</div>`).join("")}</div>` : "";
+    if (res.engine === "benchmark") {
+      // M5 PART 6: the stated metrics are shown COMPUTED or honestly
+      // marked unanswered - never silently omitted
+      const m = res.metrics || {};
+      const ck = (res.arms_summary || {}).candidate || {};
+      $("res-meta").insertAdjacentHTML("afterbegin",
+        `<div class="card"><b>Benchmark metrics</b>` +
+        `<div class="hint">candidate arm: ${esc(ck.kind || "")}` +
+        `${ck.tool ? " (" + esc(ck.tool) + ")" : ""}</div>` +
+        (m.computed ? `<pre class="json">${esc(JSON.stringify(m.computed, null, 1))}</pre>` : "") +
+        `<div class="mnote${m.computed ? "" : " warn"}">${esc(m.note || "")}</div>` +
+        `<div class="hint">seed ${esc((res.reproducibility || {}).seed || "")}` +
+        ` - the arm files under this run's directory are the measured` +
+        ` artefacts (see the results bundle)</div></div>`);
+    }
     const arts = res.artifacts || (res.manifest || {}).artifacts || [];
     $("res-artifacts").innerHTML = `<h3 class="sec">Output artifacts (${arts.length})</h3>` +
       (arts.length ? `<div class="tablewrap"><table class="data">
@@ -998,7 +1209,66 @@ function renderDiscovery() {
     renderDiscovery._t = setTimeout(refreshDiscovery, 2500);
 }
 
-function reportHtmlLive(rep) {
+function exportBar(rid) {
+  // M5 PART 7: files are rendered ONCE server-side, pinned to the stored
+  // report content, and re-downloads serve those exact bytes (the view
+  // never re-runs retrieval to serve a download).
+  const b = (fmt, label) =>
+    `<a class="btn sm" href="/api/research/${encodeURIComponent(rid)}` +
+    `/export/${fmt}" download>${label}</a>`;
+  return `<div class="btnrow">${b("html", "Download HTML")}` +
+    `${b("json", "Download JSON")}${b("tsv", "Download TSV tables")}` +
+    `${b("pdf", "Download PDF")}<span class="hint">persisted per report ` +
+    `version - re-download never re-runs retrieval</span></div>`;
+}
+
+async function discoveryAction(btn) {
+  const d = btn.dataset;
+  const out = document.getElementById("dact-" + d.tid);
+  const show = (html) => { if (out) out.innerHTML = html; };
+  const qs = `candidate=${encodeURIComponent(d.tool)}` +
+    `&target=${encodeURIComponent(d.tid)}`;
+  try {
+    if (d.dact === "bench") {
+      const r = await api("POST", "/api/jobs", {
+        kind: "benchmark",
+        benchmark: {
+          hypothesis: `${d.tool} versus ${d.base || "the configured tool"} ` +
+            "changes the ranking metrics on this deployment's own " +
+            "validation inputs",
+          tools: { candidate: d.tool,
+            baseline: d.base || "configured tool" },
+          candidate_strategy: "evidence-consensus",
+          metrics: ["top_k_overlap", "rank_correlation_spearman",
+            "candidate_set_fraction"],
+          dataset: { source: "demo_fixture" },
+          compute_estimate: "single host, CPU minutes (fixture harness)",
+          risks: ["fixture inputs are synthetic - results do not " +
+            "establish real-world performance"] } });
+      show(`<div class="mnote">Benchmark PROPOSED: job ${esc(r.job_id)} ` +
+        `is blocked on approval ${esc(r.approval_id)} - it runs only if ` +
+        `you approve the card (Approvals panel).</div>`);
+      refresh();
+    } else if (d.dact === "compat") {
+      const j = await api("GET", `/api/research/${encodeURIComponent(d.rid)}` +
+        `/compatibility?${qs}`);
+      show(`<div class="card"><b>Compatibility check (read-only): ` +
+        `${esc(j.candidate)}</b>` +
+        `<div class="hint">${esc(j.interface)}</div><pre class="json">${
+          esc(JSON.stringify(j, null, 1))}</pre></div>`);
+    } else {
+      const j = await api("GET", `/api/research/${encodeURIComponent(d.rid)}` +
+        `/adoption-plan?${qs}`);
+      show(`<div class="card"><b>Adoption plan - ${esc(j.candidate)} ` +
+        `(${esc(j.target || "")})</b><span class="pill danger">not ` +
+        `applied</span><div class="mnote">${esc(j.statement)}</div>` +
+        `<ol>${(j.steps || []).map((s) => `<li>${esc(s)}</li>`).join("")}` +
+        `</ol><div class="hint">${esc(j.verification_gate)}</div></div>`);
+    }
+  } catch (e) { toast("action failed: " + e.message, true); }
+}
+
+function reportHtmlLive(rep, rid) {
   const kv = (o) => `<div class="kv">${Object.entries(o || {}).map(([k, v]) =>
     `<div class="k">${esc(k)}</div><div>${esc(
       typeof v === "object" ? JSON.stringify(v) : v)}</div>`).join("")}</div>`;
@@ -1006,45 +1276,151 @@ function reportHtmlLive(rep) {
     `<li>${esc(typeof x === "object" ? JSON.stringify(x) : x)}</li>`).join("")}</ul>`;
   const rows = (rep.comparison || []).map((c) => `
     <tr><td><b>${esc(c.tool)}</b></td><td>${esc(c.target || "")}</td>
+    <td>${esc(c.artifact_class || "unclassified")}</td>
     <td>${esc(c.verified_version || "Not verified")}</td>
     <td>${esc(c.license || "Not verified")}</td>
     <td>${esc(c.maintenance || "Not verified")}</td>
     <td>${esc(c.benchmark_evidence || "")}</td>
+    <td class="hint">${esc(c.performance_summary || "")}</td>
     <td>${esc(c.independently_validated || "")}</td>
     <td class="hint">${esc(c.evidence_gaps || "")}</td></tr>`).join("");
+  const concl = Object.entries(rep.module_conclusions || {});
+  const tcards = (rep.task_comparisons || []).map((t) => {
+    const firstAlt = (t.rows || [])[0];
+    const curName = ((t.current_tools || [])[0] || {}).name || "";
+    const actions = firstAlt ? `
+      <div class="btnrow">
+        <button class="btn sm" data-dact="compat" data-rid="${esc(rid || "")}"
+          data-tid="${esc(t.target_id)}" data-tool="${esc(firstAlt.tool)}">Check compatibility</button>
+        <button class="btn sm" data-dact="plan" data-rid="${esc(rid || "")}"
+          data-tid="${esc(t.target_id)}" data-tool="${esc(firstAlt.tool)}">Adoption plan</button>
+        <button class="btn sm" data-dact="bench" data-tid="${esc(t.target_id)}"
+          data-tool="${esc(firstAlt.tool)}" data-base="${esc(curName)}">Propose benchmark</button>
+        <span class="hint">first alternative: ${esc(firstAlt.tool)} - checks
+        are read-only; a proposed benchmark is a FORMAL job that waits for
+        your approval before anything runs</span></div>
+      <div id="dact-${esc(t.target_id)}"></div>` : "";
+    return `
+    <div class="card"><b>${esc(t.target)}</b>
+    <div class="hint">current: ${esc((t.current_tools || [])
+      .map((c) => `${c.name}${c.version && c.version !== "n/a" ? " [" + c.version + "]" : ""}`).join(", "))}</div>
+    ${(Object.entries(t.alternatives_by_kind || {}).map(([k, names]) =>
+      `<div class="hint">${esc(k)}: ${esc(names.join(", "))}</div>`)).join("")
+      || '<div class="hint">no registry-verified alternatives</div>'}
+    <div class="tablewrap"><table class="data">
+      <thead><tr><th>Alternative</th><th>Version</th><th>Published
+      performance (context-established only)</th><th>Licensing /
+      maintenance</th><th>Evidence quality</th></tr></thead>
+      <tbody>${(t.rows || []).map((r) => `<tr>
+        <td>${esc(r.tool)} <span class="hint">(${esc(r.artifact_class)})</span></td>
+        <td>${esc(r.version)}</td>
+        <td>${esc(r.published_performance)}</td>
+        <td>${esc(r.license)} · ${esc(r.maintenance)}</td>
+        <td class="hint">${esc(r.evidence_quality)}</td></tr>`).join("")}</tbody>
+    </table></div>
+    <div class="hint">${esc(t.note || "")}</div>${actions}</div>`;
+  }).join("");
   const cits = (rep.literature_citations || []).slice(0, 30).map((c) => `
     <li><b>${esc(c.title || "")}</b> ${esc(c.year || "")} - ${esc(c.source || "")}
     ${c.url ? esc(c.url) : esc(c.id || "")}</li>`).join("");
   const prov = rep.provenance || {};
+  const cov = rep.coverage_accounting || {};
+  // 1. executive recommendations: conclusions FIRST, with the
+  //    critical evidence limitation (coverage + comparability) inline
+  const conclCards = concl.map(([tid, c]) => `
+    <div class="card"><b>${esc(tid)}</b> - ${esc(c.conclusion)}
+      <div class="hint">${esc(c.why)}</div>
+      ${c.explanation ? `<ul class="hint">
+        <li>evidence: ${esc(c.explanation.what_evidence_supports_it)}</li>
+        <li>expected advantage: ${esc(c.explanation.expected_advantage)}</li>
+        <li>directly comparable: ${esc(String(c.explanation.directly_comparable))} - ${esc(c.explanation.directly_comparable_note)}</li>
+        <li>usable here: ${esc(c.explanation.usable_in_current_deployment)}</li>
+        <li>remains to verify: ${(c.explanation.remains_to_verify || []).map(esc).join(" | ")}</li>
+      </ul>` : ""}
+      ${c.recommended_evaluation ? `<div class="mnote">evaluation to run:
+        ${esc(c.recommended_evaluation)}</div>` : ""}
+    </div>`).join("");
+  const covLine = Object.keys(cov).length ? `
+    <div class="hint">evidence coverage: ${esc(cov.researched_modules)}/${esc(cov.identified_modules)}
+      modules researched · ${esc((cov.sufficient_evidence || []).length)} with sufficient
+      evidence · ${esc((cov.insufficient_evidence || []).length)} thin ·
+      ${esc((cov.not_researched || []).length)} not researched ·
+      <b>${esc(cov.completeness || "?")}</b> - ${esc(cov.note || "")}
+      ${(cov.not_researched || []).length ? "<br>missing: " + esc((cov.not_researched || []).map((m) => m.id + " (" + m.reason + ")").join(", ")) : ""}
+    </div>` : "";
+  // 2. current tools and potential replacements
+  const toolsMap = (rep.task_comparisons || []).map((t) => `
+    <tr><td>${esc(t.target)}</td>
+    <td>${esc((t.current_tools || []).map((c) => `${c.name}${c.installed && c.installed !== "n/a" ? " · installed " + c.installed : ""}`).join(", "))}</td>
+    <td>${esc((Object.entries(t.alternatives_by_kind || {}).map(([k, n]) => `${k}: ${n.join(", ")}`).join(" · ")) || "none registry-verified")}</td></tr>`).join("");
+  const vfind = (rep.version_license_findings || []).map((v) => `
+    <tr><td>${esc(v.tool)}</td><td>${esc(v.target)}</td>
+    <td>${esc(v.version_verdict)}${v.is_development ? " <span class='hint pill warn'>DEVELOPMENT</span>" : ""}${v.unresolved_version ? " <span class='hint'>no chain step produced a version</span>" : ""}</td>
+    <td>${esc(v.license)}</td><td class="hint">${esc(v.compatibility)}</td></tr>`).join("");
   return `<div class="card">
     <div class="mnote">${esc(rep.disclaimer)}</div>
-    <h3 class="sec">Executive summary</h3>${ul(rep.executive_summary)}
-    <h3 class="sec">Code-grounded inventory</h3>
-    ${kv({ repo: rep.inventory?.repo, git_commit: rep.inventory?.git_commit,
-      code_verified: rep.inventory?.code_verified,
-      stages: rep.inventory?.n_stages, captured_at: rep.inventory?.captured_at })}
-    <h3 class="sec">Candidate comparison (registry-verified fields; "Not
-      verified" = could not be confirmed - never guessed)</h3>
+    <h3 class="sec">Executive recommendations</h3>${ul(rep.executive_summary)}
+    ${conclCards}${covLine}
+    <h3 class="sec">Current NeoAG tools and potential replacements</h3>
     <div class="tablewrap"><table class="data">
-      <thead><tr><th>Tool</th><th>Target</th><th>Version</th><th>License</th>
-      <th>Maintenance</th><th>Benchmark evidence</th>
-      <th>Independent validation</th><th>Evidence gaps</th></tr></thead>
-      <tbody>${rows}</tbody></table></div>
-    <h3 class="sec">Literature citations (${(rep.literature_citations || []).length}, abstract level)</h3>
-    <ul>${cits || "<li>none retrieved</li>"}</ul>
-    <h3 class="sec">Licenses seen</h3>${ul(rep.license_constraints)}
-    <h3 class="sec">Task metrics (never rank across incomparable metrics)</h3>
+      <thead><tr><th>Module</th><th>Current tool (installed)</th>
+      <th>Potential replacements (by kind)</th></tr></thead>
+      <tbody>${toolsMap}</tbody></table></div>
+    ${(rep.task_comparisons || []).length ? `<h3 class="sec">Evidence-based
+      comparison by scientific task (grouped by artifact kind; no
+      cross-task rows)</h3>${tcards}` : ""}
+    <h3 class="sec">Version, license and compatibility findings</h3>
+    <div class="tablewrap"><table class="data">
+      <thead><tr><th>Tool</th><th>Module</th><th>Version verdict
+      (chain)</th><th>License</th><th>Compatibility</th></tr></thead>
+      <tbody>${vfind}</tbody></table></div>
+    <h3 class="sec">Recommended Next Actions</h3>${ul(rep.recommended_next_actions)}
+    <h3 class="sec">Recommended benchmarks (never rank across
+      incomparable metrics)</h3>
     ${ul((Object.entries(rep.recommended_benchmarks || {})
       .map(([t, b]) => `${t}: ${(b.metrics || []).join("; ")}${
         b.warning ? " - WARNING: " + b.warning : ""}`)))}
-    <h3 class="sec">Open questions</h3>${ul(rep.open_questions)}
-    <h3 class="sec">Methodology</h3><p class="hint">${esc(rep.methodology || "")}</p>
-    <h3 class="sec">Limitations</h3>${ul(rep.limitations)}
-    <details class="adv"><summary>Full provenance (query log, counts,
-      exclusions, failures)</summary>
-      ${kv({ sources_consulted: prov.sources_consulted,
+    <h3 class="sec">Sources and citations (${(rep.literature_citations || []).length}, retrieved)</h3>
+    <ul>${cits || "<li>none retrieved</li>"}</ul>
+    <h3 class="sec">Detailed methodology</h3><p class="hint">${esc(rep.methodology || "")}</p>
+    <h3 class="sec">Limitations and incomplete evidence</h3>${ul(rep.limitations)}
+    <details class="adv"><summary>Full candidate comparison table
+      ("Not verified" = could not be confirmed - never guessed)</summary>
+      <div class="tablewrap"><table class="data">
+      <thead><tr><th>Tool</th><th>Target</th><th>Kind</th><th>Version
+      (chain verdict)</th><th>License</th>
+      <th>Maintenance</th><th>Benchmark evidence</th>
+      <th>Performance (context gate)</th>
+      <th>Independent validation</th><th>Evidence gaps</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    </details>
+    <details class="adv"><summary>Version verification chains (every
+      step: source, date, result - skipped steps keep their reason)</summary>
+      ${(rep.candidates || []).map((c) => `<div class="hint"><b>${esc(c.name)}</b>
+        → ${esc(c.verified_version)} · installed: ${esc(c.installed_version || "n/a")}
+        <ul>${((c.version_chain || {}).chain || []).map((s) =>
+          `<li>${esc(s.step)}: ${esc(s.outcome)}${s.value ? " = " + esc(JSON.stringify(s.value)) : ""}${s.reason ? " (" + esc(s.reason) + ")" : ""} [${esc(String(s.checked_at || "").slice(0, 10))}]</li>`).join("")}</ul>
+        ${((c.version_chain || {}).values || {}).benchmark_versions ? `<div>versions cited by benchmarks: ${esc(((c.version_chain || {}).values || {}).benchmark_versions.map((b) => b.version).join(", "))}</div>` : ""}
+      </div>`).join("")}
+    </details>
+    <details class="adv"><summary>Code-grounded inventory</summary>
+      ${kv({ repo: rep.inventory?.repo, git_commit: rep.inventory?.git_commit,
+        code_verified: rep.inventory?.code_verified,
+        stages: rep.inventory?.n_stages, captured_at: rep.inventory?.captured_at })}
+    </details>
+    <details class="adv"><summary>Licenses seen / full coverage
+      accounting / provenance (query log, counts, exclusions,
+      failures)</summary>
+      ${ul(rep.license_constraints)}
+      ${kv({ identified_modules: cov.identified_modules,
+        researched_modules: cov.researched_modules,
+        sufficient_evidence: cov.sufficient_evidence,
+        insufficient_evidence: cov.insufficient_evidence,
+        not_researched: cov.not_researched, completeness: cov.completeness,
+        sources_consulted: prov.sources_consulted,
         query_counts: prov.query_counts, dedup_removed: prov.dedup_removed,
         exclusions: prov.exclusions, selection_criteria: prov.selection_criteria,
+        github_budget: prov.github_budget_at_start,
         failures: prov.failures })}
       <p class="hint">queries persisted: ${(prov.queries || []).length}</p>
       <ul>${(prov.queries || []).slice(0, 40).map((q) =>
@@ -1106,7 +1482,10 @@ async function showReport(id) {
     const rep = r.report;
     const isLive = (rep.engine || "").includes("live") ||
       !!rep.inventory;
-    $("res-report").innerHTML = (isLive ? reportHtmlLive : reportHtmlExample)(rep);
+    $("res-report").innerHTML = exportBar(r.id) +
+      (isLive ? reportHtmlLive(rep, r.id) : reportHtmlExample(rep));
+    document.querySelectorAll("[data-dact]").forEach((b) =>
+      b.addEventListener("click", () => discoveryAction(b)));
   } catch (e) { toast("report failed: " + e.message, true); }
 }
 
@@ -1246,39 +1625,54 @@ function openSkillEditor(slug) {
     const cats = state.boot.skillCategories || [];
     host.innerHTML = `<div class="card">
       <div class="card-head"><h2>${s ? "Edit skill" : "New skill"}</h2></div>
-      <label class="lbl">Slug ${s ? "" : "(lowercase, dash-separated)"}</label>
+      <label class="lbl">Slug ${s ? "" : "(leave empty - generated from the title)"}</label>
       <input id="sk-slug" value="${esc(s ? s.slug : "")}" ${s ? "disabled" : ""}>
       <label class="lbl">Title</label>
       <input id="sk-title" value="${esc(s ? s.title : "")}">
       <label class="lbl">Category</label>
       <select id="sk-cat">${cats.map((c) =>
         `<option ${s && s.category === c ? "selected" : ""}>${esc(c)}</option>`).join("")}</select>
-      <label class="lbl">Content (SKILL.md - frontmatter required: --- name/description ---)</label>
+      <label class="lbl">Content (SKILL.md - no need to write frontmatter: name/description are generated for you)</label>
       <textarea id="sk-body" rows="14" spellcheck="false">${esc(s ? s.content :
         "---\nname: my-skill\ndescription: one line about when this skill applies\n---\n\n# My skill\n\nWhat the agent should know or do.\n")}</textarea>
       <div class="btnrow">
         <button class="btn primary sm" id="sk-save">Save</button>
+        <button class="btn sm" id="sk-save-apply">Save &amp; apply to new sessions</button>
         <button class="btn ghost sm" id="sk-cancel">Cancel</button>
-        <span class="hint">saving does NOT deploy; deploy explicitly. Skills are
-        advisory - the gate and policies stay enforced regardless.</span>
+        <span class="hint">Save records a version. "Save &amp; apply" also
+        deploys the file into the agent workspace so NEW chat sessions pick
+        it up (a live session keeps what it loaded). Skills are advisory -
+        the gate and policies stay enforced regardless.</span>
       </div>
       <div id="sk-err" class="hint"></div></div>`;
     $("sk-cancel").addEventListener("click", () => host.innerHTML = "");
-    $("sk-save").addEventListener("click", async () => {
+    const doSave = async (apply) => {
       const body = { slug: $("sk-slug").value.trim(),
                      title: $("sk-title").value.trim(),
                      category: $("sk-cat").value,
                      content: $("sk-body").value };
       try {
-        if (s) await api("POST", `/api/skills/${s.slug}/update`, body);
-        else await api("POST", "/api/skills", body);
+        let saved;
+        if (s) saved = await api("POST", `/api/skills/${s.slug}/update`, body);
+        else saved = await api("POST", "/api/skills", body);
+        if (apply) {
+          const r = await api("POST", `/api/skills/${saved.slug}/deploy`, {});
+          const st = (r.results || [])[0] || {};
+          toast(st.state === "written"
+            ? `saved + deployed ${saved.slug} - active in NEW sessions`
+            : `saved, but deploy reported: ${st.state || "?"} ` +
+              `${st.error || ""}`.trim(), st.state !== "written");
+        } else {
+          toast("saved (new version recorded)");
+        }
         host.innerHTML = "";
-        toast("saved (new version recorded)");
         await refreshSkills();
       } catch (e) {
         $("sk-err").textContent = (e.data?.errors || [e.data?.error || e.message]).join("; ");
       }
-    });
+    };
+    $("sk-save").addEventListener("click", () => doSave(false));
+    $("sk-save-apply").addEventListener("click", () => doSave(true));
   };
   if (!slug) return fill(null);
   api("GET", `/api/skills/${slug}`).then(fill)
