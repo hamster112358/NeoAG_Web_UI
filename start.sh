@@ -12,6 +12,22 @@ if [ -f "$WD" ] && kill -0 "$(cat "$WD")" 2>/dev/null; then
 fi
 rm -f data/STOP
 mkdir -p data
+
+# Deploy the agent-workspace assets (PreToolUse gate hook, skill, rules)
+# into the live workspace the real agent runs in. Runtime dirs (jobs/,
+# audit/, .neoag-approvals/) are never removed by this step.
+WS=/data1/neoag/agents/neoag_agent_ws
+if [ -d agent_workspace_assets ]; then
+  if mkdir -p "$WS/.codebuddy/skills" "$WS/jobs" "$WS/audit" \
+              "$WS/.neoag-approvals" 2>/dev/null &&
+     cp -a agent_workspace_assets/CODEBUDDY.md "$WS/" &&
+     cp -a agent_workspace_assets/.codebuddy/. "$WS/.codebuddy/"; then
+    chmod 700 "$WS/.neoag-approvals" 2>/dev/null || true
+  else
+    echo "WARNING: could not deploy agent workspace assets to $WS" >&2
+  fi
+fi
+
 umask 077
 setsid nohup bash watchdog.sh >> data/watchdog.log 2>&1 &
 # the server requires Basic auth: 401 on a credential-less probe still

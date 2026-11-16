@@ -1,24 +1,75 @@
-"""Redesign verification battery v3 (mock only).
-Keeps every milestone-2 invariant, adds redesign checks: new IA, job kinds,
-input manifests, real params inventory, help docs, agent-mode gating,
-CodeBuddy client, legacy-notice filtering.
-Run: python3 tests/verify_battery.py   (demo server must be running)
+"""Redesign verification battery v4 (mock only).
+Keeps every milestone-2 invariant and the redesign checks (new IA, job
+kinds, input manifests, real params inventory, help docs, agent-mode
+gating), and adds the phase-B checks: conversation persistence API,
+gate classifier + grant protocol, layout contract, honest status
+endpoint.
+
+Runs against an ISOLATED server (fresh NEOAG_DEMO_DB on port 8798)
+that this script spawns itself - the live demo state and its database
+are never touched.
+Run: python3 tests/verify_battery.py
 """
+import atexit
 import base64
+import hashlib
 import json
+import os
+import pathlib
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 
-BASE = "http://127.0.0.1:8712"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+PORT = 8798
+BASE = f"http://127.0.0.1:{PORT}"
 PASS, FAIL = [], []
 
-AUTH_PATH = "/data1/neoag/agents/neoag-web-demo/data/auth.json"
+AUTH_PATH = ROOT / "data" / "auth.json"
 with open(AUTH_PATH) as f:
     _a = json.load(f)
 AUTH_HEADER = "Basic " + base64.b64encode(
     f"{_a['user']}:{_a['password']}".encode()).decode()
+
+# ---------- isolated server (fresh db, own port) ----------
+_srv = subprocess.Popen(
+    [sys.executable, "-u", "-m", "backend.server"], cwd=str(ROOT),
+    env=dict(os.environ, NEOAG_DEMO_DB="batterytest.sqlite3",
+             NEOAG_DEMO_PORT=str(PORT)),
+    stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+
+
+def _cleanup():
+    _srv.terminate()
+    try:
+        _srv.wait(timeout=8)
+    except Exception:
+        _srv.kill()
+    try:
+        (ROOT / "data" / "batterytest.sqlite3").unlink()
+    except OSError:
+        pass
+
+
+atexit.register(_cleanup)
+
+
+def _wait_up():
+    for _ in range(80):
+        try:
+            req = urllib.request.Request(BASE + "/api/bootstrap",
+                                         headers={"Authorization": AUTH_HEADER})
+            urllib.request.urlopen(req, timeout=3)
+            return
+        except Exception:
+            time.sleep(0.25)
+    raise RuntimeError("isolated battery server did not start")
+
+
+_wait_up()
 
 
 def check(name, ok, detail=""):
@@ -94,6 +145,14 @@ def get_raw(path, timeout=5, auth=True):
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.status, r.read()
 
+
+# ---------- 0 fresh workspace is empty (no seeded demo clutter) ----------
+_, bz = call("/api/bootstrap")
+check("0 fresh workspace starts empty",
+      bz["conversations"] == [] and bz["messages"] == [] and
+      bz["jobs"] == [] and bz["approvals"] == [] and
+      bz.get("active_conv", "") == "", str({k: bz[k] for k in
+      ("conversations", "messages", "jobs", "approvals")})[:160])
 
 # ---------- 1 static / frontend ----------
 st, idx = get_raw("/")
@@ -435,8 +494,9 @@ try:
 except urllib.error.HTTPError as e:
     st_bad = e.code
 check("45 invalid agent-mode -> 400", st_bad == 400, str(st_bad))
-check("46 legacy mock banners filtered client-side",
-      "mock prototype" in js and "MOCK PROTOTYPE" in js)
+check("46 conversation-aware frontend wired",
+      all(k in js for k in ("renderSidebar", "openConv", "conv_id",
+                            "/api/conversations", "initSplitter")))
 def _banner_count():
     _, bb = call("/api/bootstrap")
     return sum(1 for m in bb["messages"]
@@ -452,12 +512,111 @@ check("48 scripted chat still answers in mock mode",
 cb = call("/api/codebuddy/status")[1] if True else {}
 check("49 codebuddy client status honest", cb.get("connected") in (True, False))
 st, kb = call("/api/help/codebuddy")
-check("50 codebuddy integration doc served", st == 200 and
-      "runs API" in kb.get("markdown", ""))
+check("50 codebuddy doc describes jobs API + gate", st == 200 and
+      "jobs api" in kb.get("markdown", "").lower() and
+      "confirm_required" in kb.get("markdown", "").lower())
+
+# ---------- 13 phase B: conversations, gate, layout contract ----------
+st, cr = call("/api/chat", {"text": "battery conversation alpha"})
+cid_a = cr["conv_id"]
+check("51 first chat auto-creates a titled conversation",
+      st == 200 and cid_a and
+      cr["conversation"]["title"].startswith("battery conversation"),
+      str(cr["conversation"])[:160])
+call("/api/chat", {"text": "second message in alpha", "conv_id": cid_a})
+st, cv = call(f"/api/conversations/{cid_a}")
+check("52 messages thread into the conversation",
+      st == 200 and sum(1 for m in cv["messages"] if m["role"] == "user") == 2)
+call("/api/chat", {"text": "battery conversation beta"})
+_, cl = call("/api/conversations")
+ids = {c["id"] for c in cl["conversations"]}
+check("53 history lists separate conversations with counts",
+      cid_a in ids and len(ids) >= 2 and
+      all(c["n_messages"] >= 2 for c in cl["conversations"]))
+cid_b = next(c["id"] for c in cl["conversations"]
+             if (c["title"] or "").startswith("battery conversation beta"))
+st, _ = call(f"/api/conversations/{cid_a}/rename", {"title": "Renamed A"})
+_, cv2 = call(f"/api/conversations/{cid_a}")
+check("54 rename persists", st == 200 and
+      cv2["conversation"]["title"] == "Renamed A")
+_, cvb = call(f"/api/conversations/{cid_b}")
+check("55 switching chats shows only that conversation's messages",
+      all("alpha" not in m["text"] for m in cvb["messages"]))
+st, _ = call(f"/api/conversations/{cid_b}/delete", {})
+_, cl2 = call("/api/conversations")
+check("56 delete is soft: hidden from list, rows retained",
+      st == 200 and all(c["id"] != cid_b for c in cl2["conversations"]))
+try:
+    call(f"/api/conversations/{cid_b}/rename", {"title": "x"})
+    st_bad = 200
+except urllib.error.HTTPError as e:
+    st_bad = e.code
+check("57 deleted conversation is closed for edits", st_bad == 404,
+      str(st_bad))
+st, ex = call(f"/api/conversations/{cid_a}/example", {})
+_, cv3 = call(f"/api/conversations/{cid_a}")
+check("58 Load Example populates only its own conversation",
+      st == 200 and len(ex["messages"]) >= 2 and
+      all(m["conv_id"] == cid_a for m in ex["messages"]) and
+      len(cv3["messages"]) >= 5)
+try:
+    call("/api/admin/restore", {"file": "../auth.json"})
+    st_bad = 200
+except urllib.error.HTTPError as e:
+    st_bad = e.code
+check("59 restore rejects path traversal / unknown archives",
+      st_bad == 400, str(st_bad))
+cb = call("/api/codebuddy/status")[1]
+check("60 status endpoint honest about the gate model",
+      "gate" in json.dumps(cb).lower() and
+      '"plan"' not in json.dumps(cb))
+_, css_raw = get_raw("/static/styles.css")
+css = css_raw.decode()
+check("61 layout contract: app fills viewport, panes scroll alone",
+      "overflow: hidden" in css and "--chatw" in css and
+      b'id="splitter"' in idx and b'id="conv-list"' in idx and
+      b'id="new-chat"' in idx)
+# gate classifier straight from the versioned asset (no gateway needed)
+import importlib.util as _ilu
+_gp = ROOT / "agent_workspace_assets" / ".codebuddy" / "gate.py"
+_spec = _ilu.spec_from_file_location("gate_asset", _gp)
+_gate = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_gate)
+
+
+def _cls(tool, cmd):
+    d = _gate.decide({"tool_name": tool, "tool_input": {"command": cmd}})
+    if d is None:
+        return "allow"
+    r = d[1] if len(d) > 1 else ""
+    return d[0] if d[0] != "deny" else (
+        "secret" if "credential" in r else
+        "self" if "self-protected" in r else
+        "frozen" if "immutable" in r else "deny-?")
+
+
+_ok62 = (_cls("Bash", "cat $HOME/.codebuddy/settings.json") == "secret"
+         and _cls("Bash", "echo x > /home/operator/out.log") == "confirm"
+         and _cls("Bash", "echo x >> /data2/caojingqi/original_OpenNeoAG/f") == "frozen"
+         and _cls("Bash", "rm jobs/scratch.txt") == "allow"
+         and _cls("Bash", "echo hi > jobs/out.txt") == "allow"
+         and _cls("Bash", "sed -i s/a/b/ .codebuddy/gate.py") == "self")
+check("62 gate classifier (asset) classes routine/destructive correctly",
+      _ok62)
+_h = hashlib.sha256(b"battery-grant-probe").hexdigest()[:24]
+_gr = pathlib.Path(_gate.APPROVALS) / (_h + ".json")
+_gr.parent.mkdir(parents=True, exist_ok=True)
+_gr.write_text(json.dumps({"granted_at": time.time()}))
+_ok63 = _gate.grant_valid(_h) and not _gate.grant_valid(_h)
+try:
+    _gr.unlink()
+except OSError:
+    pass
+check("63 grant is single-use and hash-matched (real protocol dir)", _ok63)
 
 print()
 print(f"RESULT: {len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", ", ".join(FAIL))
     raise SystemExit(1)
-print("ALL_REDESIGN_CHECKS_PASSED")
+print("ALL_PHASE_B_CHECKS_PASSED")

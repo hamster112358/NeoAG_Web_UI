@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command",
+            "command": "/data1/neoag/agents/neoag_agent_ws/.codebuddy/gate.py",
+            "timeout": 10 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Write|Edit|MultiEdit",
+        "hooks": [
+          { "type": "command",
+            "command": "/data1/neoag/agents/neoag_agent_ws/.codebuddy/post.py",
+            "timeout": 5 }
+        ]
+      }
+    ]
+  }
+}

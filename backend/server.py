@@ -10,6 +10,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import queue
 import secrets
 import threading
@@ -30,7 +31,10 @@ from .store import Store, new_id, now
 ROOT = Path(__file__).resolve().parent.parent
 FRONTEND = ROOT / "frontend"
 DATA = ROOT / "data"
-HOST, PORT = "127.0.0.1", 8712
+HOST = "127.0.0.1"
+# NEOAG_DEMO_PORT + NEOAG_DEMO_DB let verification batteries run isolated
+# servers against fresh databases without touching the live demo state.
+PORT = int(os.environ.get("NEOAG_DEMO_PORT", "8712"))
 
 store = Store(DATA)
 EVENT_QUEUES: list[queue.Queue] = []
@@ -145,10 +149,17 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/static/"):
             return self._static(path[len("/static/"):])
         if path == "/api/bootstrap":
+            convs = store.conv_list()
+            cid = (q.get("conv_id") or [""])[0]
+            if cid and not store.conv_get(cid):
+                cid = ""
+            if not cid and convs:
+                cid = convs[0]["id"]  # most recently updated chat
             return self._json(200, {
                 "demo": True, "dataset_version": DEMO_DATASET_VERSION,
                 "samples": SAMPLES, "stages": STAGES, "policies": POLICIES,
-                "messages": store.msg_list(200),
+                "conversations": convs, "active_conv": cid,
+                "messages": store.msg_list(400, cid) if cid else [],
                 "jobs": [job_public(j) for j in store.job_list(50)],
                 "approvals": store.approval_list(),
                 "decisions": store.decision_list(),
@@ -173,6 +184,15 @@ class Handler(BaseHTTPRequestHandler):
                                    "human_required": HUMAN_REQUIRED})
         if path == "/api/audit":
             return self._json(200, store.audit_list(300))
+        if path == "/api/conversations":
+            return self._json(200, {"conversations": store.conv_list()})
+        if path.startswith("/api/conversations/"):
+            cid = path.strip("/").split("/")[2]
+            conv = store.conv_get(cid)
+            if not conv or conv.get("deleted"):
+                return self._json(404, {"error": "no such conversation"})
+            return self._json(200, {"conversation": conv,
+                                    "messages": store.msg_list(400, cid)})
         if path == "/api/help":
             return self._json(200, {"docs": [
                 {"name": k, "title": v["title"],
@@ -197,7 +217,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/codebuddy/status":
             mode = store.setting("agent_mode", "mock")
             info = {"mode": mode, "connected": False, "transport": "jobs",
-                    "chat_job": None, "chat_permission_mode": "plan",
+                    "chat_jobs": [], "agent_workspace": agent.AGENT_WS,
+                    "permission_mode": "default (tools auto-execute in "
+                                        "headless jobs)",
+                    "enforcement": "workspace PreToolUse gate: destructive "
+                                   "or out-of-workspace operations are "
+                                   "blocked until a single-use human grant",
                     "gateway_version": None, "detail": ""}
             try:
                 client = agent._ensure_client()  # login probe, no dispatch
@@ -205,14 +230,20 @@ class Handler(BaseHTTPRequestHandler):
                 info["connected"] = True
                 info["gateway_version"] = gw.get("version")
                 info["detail"] = (f"gateway v{gw.get('version')} via the "
-                                  "jobs API (chat agent = plan-mode job)")
-                if agent._job_id:
-                    d = client.job(agent._job_id)
-                    info["chat_job"] = {"id": agent._job_id,
-                                        "state": d.get("state"),
-                                        "status": d.get("status"),
-                                        "settled": d.get("settled"),
-                                        "alive": d.get("alive")}
+                                  "jobs API; one agent job per chat, "
+                                  "gate + single-use grants for destructive "
+                                  "operations")
+                for cid, st in list(agent._conv.items()):
+                    if not st.get("job"):
+                        continue
+                    d = client.job(st["job"])
+                    info["chat_jobs"].append(
+                        {"conv_id": cid, "id": st["job"],
+                         "busy": bool(st.get("busy")),
+                         "state": d.get("state"),
+                         "status": d.get("status"),
+                         "settled": d.get("settled"),
+                         "alive": d.get("alive")})
             except Exception as e:
                 info["detail"] = str(e)[:200]
             return self._json(200, info)
@@ -249,16 +280,60 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": str(e)})
         try:
             if path == "/api/chat":
-                text = str(body.get("text", ""))[:2000]
-                store.audit("user", "chat.send", "-", {"text": text[:120]})
-                msgs = [store.msg_add("user", text, {})]
+                text = str(body.get("text", ""))[:4000]
+                cid = str(body.get("conv_id", "") or "")
+                conv = store.conv_get(cid) if cid else None
+                if not conv or conv.get("deleted"):
+                    conv = store.conv_create("")  # first message starts a chat
+                    cid = conv["id"]
+                if not (conv.get("title") or "").strip():
+                    store.conv_set_title(cid, agent.title_from(text))
+                store.audit("user", "chat.send", cid, {"text": text[:120]})
+                msgs = [store.msg_add("user", text, {}, cid)]
                 mode = store.setting("agent_mode", "mock")
                 if mode == "real":
-                    msgs += agent.handle_real(text)
+                    msgs += agent.handle_real(text, cid)
                 else:
-                    msgs += agent.handle(text)
-                publish({"type": "chat"})
-                return self._json(200, {"messages": msgs})
+                    msgs += agent.handle(text, cid)
+                store.conv_touch(cid)
+                publish({"type": "chat", "conv_id": cid,
+                         "conversations": True})
+                return self._json(200, {"messages": msgs, "conv_id": cid,
+                                        "conversation": store.conv_get(cid)})
+            if path == "/api/conversations":
+                conv = store.conv_create(str(body.get("title", ""))[:120])
+                store.audit("user", "conv.create", conv["id"], {})
+                publish({"type": "conversations"})
+                return self._json(201, {"conversation": conv})
+            if path.startswith("/api/conversations/"):
+                parts = path.strip("/").split("/")  # api/conversations/<id>/<act>
+                cid, act = parts[2], (parts[3] if len(parts) > 3 else "")
+                conv = store.conv_get(cid)
+                if not conv or conv.get("deleted"):
+                    return self._json(404, {"error": "no such conversation"})
+                if act == "rename":
+                    title = str(body.get("title", "")).strip()[:120]
+                    if not title:
+                        return self._json(400, {"error": "title required"})
+                    conv = store.conv_set_title(cid, title)
+                    store.audit("user", "conv.rename", cid, {"title": title})
+                    publish({"type": "conversations"})
+                    return self._json(200, {"conversation": conv})
+                if act == "delete":  # soft: hidden in UI, rows retained
+                    ok = store.conv_delete(cid)
+                    store.audit("user", "conv.delete", cid, {"soft": True})
+                    publish({"type": "conversations"})
+                    return self._json(200, {"ok": ok, "deleted": cid})
+                if act == "example":
+                    msgs = agent.load_example(cid)
+                    if not (conv.get("title") or "").strip():
+                        store.conv_set_title(cid, "Example: DEMO-P001")
+                    store.conv_touch(cid)
+                    publish({"type": "chat", "conv_id": cid,
+                             "conversations": True})
+                    return self._json(200, {"messages": msgs,
+                                            "conv_id": cid})
+                return self._json(404, {"error": "not found", "path": path})
             if path == "/api/agent/mode":
                 mode = str(body.get("mode", ""))
                 if mode not in ("mock", "real"):
@@ -340,10 +415,30 @@ class Handler(BaseHTTPRequestHandler):
                 if not appr:
                     return self._json(409, {"error": "approval not pending"})
                 store.audit("user", f"approval.{appr['state']}", aid,
-                            {"job": appr["job_id"]})
-                jobs.on_approval_decided(aid, approve)
+                            {"job": appr["job_id"],
+                             "action": appr["action"]})
+                if appr["action"] == "gate_op":
+                    # real-agent destructive-op confirmation card: write
+                    # the single-use grant and wake the agent session
+                    agent.on_gate_decision(appr, approve)
+                else:
+                    jobs.on_approval_decided(aid, approve)
                 publish({"type": "approval", "id": aid})
                 return self._json(200, appr)
+            if path == "/api/admin/archive":
+                # reversible cleanup of developer/demo records (see store)
+                res = store.archive_and_purge()
+                publish({"type": "records_changed"})
+                return self._json(200, res)
+            if path == "/api/admin/restore":
+                fp = Path(str(body.get("file", ""))).name
+                p = DATA / fp
+                if not fp.startswith("archive-") or not p.is_file():
+                    return self._json(400, {"error": "no such archive file "
+                                                     "in the data dir"})
+                n = store.restore_archive(str(p))
+                publish({"type": "records_changed"})
+                return self._json(200, {"restored_rows": n})
             if path == "/api/settings":
                 cur = store.setting("ui", {})
                 cur.update({k: v for k, v in body.items()

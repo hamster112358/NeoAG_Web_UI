@@ -34,13 +34,22 @@ Approval semantics (measured, not assumed)
 - permissionMode "default" (gateway process default): dispatched jobs
   execute tools autonomously (tool_call pending -> completed with real
   output; no interactive approval exists for headless job workers).
+  An "ask" decision AUTO-DENIES in headless jobs, so an approval-relay
+  UI cannot be built on gateway permission prompts alone.
 - permissionMode "plan": execution tools are DENIED with a verbatim
   error - "Permission to use Bash has been denied because this tool
   requires approval but permission prompts are not available" - while
-  read/inspect behaviour still works. THIS demo therefore dispatches
-  its chat agent in plan mode: the real agent answers and proposes, but
-  this interface can never execute commands or edit files. Execution,
-  if ever wired, must go through the demo's own approval queue.
+  read/inspect behaviour still works.
+- THIS demo therefore dispatches chat agents in the gateway DEFAULT
+  mode and enforces safety itself: the agent runs inside
+  /data1/neoag/agents/neoag_agent_ws (outside any git repo, otherwise
+  jobs execute in a .codebuddy/worktrees copy where project settings
+  would not apply) whose .codebuddy/settings.json installs a PreToolUse
+  gate hook. Routine reads and writes inside the workspace execute
+  silently; destructive or out-of-workspace operations are DENIED
+  before execution with "NEOAG_CONFIRM_REQUIRED op=<hash>", which the
+  demo relays as a confirmation card; approving writes a single-use,
+  hash-matched grant that unlocks exactly one identical retry.
 
 Gateway quirks (verified):
 - JSON responses can embed raw newlines in free-text fields (detail):

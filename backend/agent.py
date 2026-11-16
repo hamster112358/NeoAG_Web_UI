@@ -2,207 +2,363 @@
 
  - mock (default): scripted demo agent - no LLM is called at all.
  - real: the genuine server-side CodeBuddy agent via the gateway Jobs
-   API, plan-mode (execution tools denied gateway-side). See
-   handle_real/_relay_job below and backend/codebuddy_client.py.
+   API, one live job per conversation, executed inside the dedicated
+   agent workspace /data1/neoag/agents/neoag_agent_ws. Ordinary reads,
+   diagnostics and workspace writes run WITHOUT approval prompts; the
+   workspace's PreToolUse gate (verified live) blocks destructive or
+   out-of-workspace operations until a human approves the confirmation
+   card, at which point this layer writes a single-use, hash-matched
+   grant and tells the agent to retry.
 
 Channel separation, per project requirements:
  - role="agent"      -> agent suggestion   (badge: "agent suggestion")
  - role="policy"     -> validated NeoAG policy text, quoted from policies.py
                         (badge: "validated policy", cites its source)
-The agent never invents policy, never claims real computation happened, and
-never references anything but synthetic DEMO- data. Honesty about the demo
-nature lives in the header indicator and artifact badges - NOT in repeated
-chat banners (removed in this redesign).
+The scripted agent never invents policy, never claims real computation
+happened, and never references anything but synthetic DEMO- data.
+Honesty about simulated functionality lives in the header indicator and
+artifact badges - NOT in repeated chat banners.
 """
 from __future__ import annotations
 
 import json
 import re
 import threading
+import time
 
 from . import mock_data
 from .policies import POLICY_BY_ID
+from .store import new_id
+
+AGENT_WS = "/data1/neoag/agents/neoag_agent_ws"
+APPROVALS_DIR = AGENT_WS + "/.neoag-approvals"
+CONFIRM_RE = re.compile(
+    r"NEOAG_CONFIRM_REQUIRED op=([0-9a-f]{24}) :: (.+?) "
+    r"This operation is classified", re.S)
 
 
 class DemoAgent:
+    AGENT_WS = AGENT_WS  # surfaced in /api/codebuddy/status
+
     def __init__(self, store, jobs):
         self.store = store
         self.jobs = jobs
         self._client = None            # lazy CodeBuddyClient (real mode)
-        self._context: list[str] = []  # rolling context for re-dispatch
-        self._job_id: str | None = None  # persistent real chat job
-        self._relay_thread: threading.Thread | None = None
-        self._busy = False             # one in-flight real exchange
+        # per-conversation real-mode state:
+        # {conv_id: {"job": str|None, "busy": bool, "seen": set,
+        #            "ops": set, "replies": {mid: text}}}
+        self._conv: dict[str, dict] = {}
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
-    # Real-agent integration via the CodeBuddy gateway JOBS API (the
-    # runs API could not guarantee transcript delivery - see
-    # backend/codebuddy_client.py for the verified API map). OFF by
-    # default; the operator switches modes in the UI
-    # (POST /api/agent/mode), and the switch is audited. The chat agent
-    # runs as a plan-mode job instance: a REAL agent whose execution
-    # tools (Bash/edits) are denied gateway-side, so this interface can
-    # propose but never execute. Tool denial text is relayed verbatim.
+    # helpers shared by both transports
     # ------------------------------------------------------------------
-    CHAT_CWD = "/tmp"                  # deliberately inert working dir
-    CHAT_PREAMBLE = (
-        "You are the real CodeBuddy agent embedded as the assistant of "
-        "the NeoAG web workspace (a front-end for the NeoAG neoantigen "
-        "pipeline; the workspace's own demo jobs run on synthetic data "
-        "only). This session is permissionMode=plan: Bash and file "
-        "edits are denied by the gateway - when the user asks for an "
-        "action, describe the exact command or change instead of "
-        "attempting it. Never invent results; say when you are unsure. "
-        "The user's message follows.\n\n")
+    def _say(self, text: str, role: str = "agent", meta: dict | None = None,
+             conv_id: str = "") -> dict:
+        meta = dict(meta or {})
+        meta.setdefault("badges", ["agent suggestion"] if role == "agent"
+                        else ["validated policy"])
+        return self.store.msg_add(role, text, meta, conv_id)
 
+    def _policy(self, pol_id: str, conv_id: str = "") -> dict:
+        p = POLICY_BY_ID[pol_id]
+        return self.store.msg_add(
+            "policy", p["text"],
+            {"policy_id": pol_id, "source": p["source"],
+             "badges": ["validated policy"]}, conv_id)
+
+    def _cstate(self, conv_id: str) -> dict:
+        with self._lock:
+            return self._conv.setdefault(
+                conv_id, {"job": None, "busy": False, "seen": set(),
+                          "ops": set(), "replies": {}, "delivered": set()})
+
+    @staticmethod
+    def title_from(text: str) -> str:
+        line = re.sub(r"\s+", " ", (text or "").strip())
+        return (line[:47] + "...") if len(line) > 50 else (line or "New chat")
+
+    # ------------------------------------------------------------------
+    # REAL-agent integration (CodeBuddy gateway Jobs API). OFF by
+    # default; the operator switches modes in the UI (POST
+    # /api/agent/mode), audited. backend/codebuddy_client.py documents
+    # the verified API; the gate + grant flow is verified end-to-end.
+    # ------------------------------------------------------------------
     def _ensure_client(self):
         if self._client is None:
             from .codebuddy_client import CodeBuddyClient
             self._client = CodeBuddyClient()
         return self._client
 
-    def handle_real(self, text: str) -> list[dict]:
-        """Send the user text to the REAL server-side CodeBuddy agent
-        (persistent plan-mode job; multi-turn via /reply). Immediate
-        acknowledgement returns here; the agent's real output arrives
-        asynchronously from the job transcript ('chat' SSE events)."""
+    CHAT_PREAMBLE = (
+        "You are the NeoAG assistant inside the NeoAG Web chat "
+        "(the workspace rules in CODEBUDDY.md apply). Keep answers "
+        "grounded: never invent files, numbers or results. The user's "
+        "message follows.\n\n")
+
+    def handle_real(self, text: str, conv_id: str) -> list[dict]:
+        """Route one user turn to the conversation's real agent job
+        (dispatch or multi-turn reply), then relay the real transcript
+        asynchronously ('chat' SSE events)."""
         try:
             client = self._ensure_client()
         except Exception as e:
             return [self._say(
                 f"Real-agent mode is ON but the CodeBuddy gateway is not "
                 f"reachable from this server ({e}). Nothing was executed.",
-                meta={"badges": ["agent suggestion", "integration error"]})]
-        if self._busy:
+                meta={"badges": ["agent suggestion", "integration error"]},
+                conv_id=conv_id)]
+        st = self._cstate(conv_id)
+        if st["busy"]:
             return [self._say(
-                "The real agent is still working on the previous message "
-                "(one exchange at a time). Wait for its reply.",
-                meta={"badges": ["real agent", "integration note"]})]
-        detail = client.job(self._job_id) if self._job_id else {}
-        alive = bool(detail) and not detail.get("unknown") and \
-            detail.get("state") not in (None, "stopped", "failed")
+                "The agent is still working on the previous message in "
+                "this chat (one exchange at a time). Wait for its reply.",
+                meta={"badges": ["real agent", "integration note"]},
+                conv_id=conv_id)]
+        conv = self.store.conv_get(conv_id) or {}
+        job_id = conv.get("job_id")
+        alive = False
+        if job_id:
+            d = client.job(job_id)
+            alive = bool(d) and not d.get("unknown") and \
+                d.get("state") not in (None, "stopped", "failed")
+        redispatched = False
         try:
             if alive:
-                r = client.reply(self._job_id, text)
-                if r.get("delivered"):
-                    job_id, started = self._job_id, "continued"
-                else:
+                r = client.reply(job_id, text)
+                if not r.get("delivered"):
                     raise RuntimeError(f"reply failed: "
                                        f"{r.get('error') or r}")
+                started = "continued"
             else:
-                prompt = self.CHAT_PREAMBLE + self._context_block() + text
-                d = client.dispatch(prompt, cwd=self.CHAT_CWD,
-                                    name="neoag-web-chat",
-                                    permission_mode="plan")
-                job_id, started = d.get("id"), "started"
-                self._job_id = job_id
+                # durable-history recovery: rebuild context from saved
+                # messages, then dispatch a fresh job (one honest notice)
+                hist = [ln for ln in self.store.conv_recent_text(conv_id, 14)]
+                ctx = ""
+                if hist:
+                    ctx = ("Rolling transcript of this conversation "
+                           "(fresh agent session - the previous one ended; "
+                           "saved history rides along):\n"
+                           + "\n".join(f"- {h}" for h in hist) + "\n\n")
+                d = client.dispatch(self.CHAT_PREAMBLE + ctx + text,
+                                    cwd=AGENT_WS,
+                                    name="neoag-web-chat")
+                job_id = d.get("id")
+                self.store.conv_set_job(conv_id, job_id, "working")
+                self.store.audit("agent", "real.dispatch", conv_id,
+                                 {"job": job_id})
+                started, redispatched = "started", bool(hist)
         except Exception as e:
-            self._job_id = None
+            self.store.conv_set_job(conv_id, None, "error")
             return [self._say(
                 f"Could not reach the real agent: {e} Nothing was "
-                "executed. (The gateway rate-limits job dispatch; try "
-                "again shortly.)",
-                meta={"badges": ["agent suggestion", "integration error"]})]
-        self._busy = True
-        self._context.append(f"user: {text[:140]}")
-        note = self.store.msg_add(
+                "executed. (The gateway rate-limits dispatch; try again "
+                "shortly.)",
+                meta={"badges": ["agent suggestion", "integration error"]},
+                conv_id=conv_id)]
+        st["job"] = job_id
+        st["busy"] = True
+        msgs = []
+        if redispatched:
+            msgs.append(self.store.msg_add(
+                "system",
+                "The previous agent session for this chat had ended; a "
+                "new one was started from the saved conversation history. "
+                "Earlier context is available, but the agent process "
+                "itself is new.",
+                {"badges": ["real agent", "integration note"]}, conv_id))
+        msgs.append(self.store.msg_add(
             "agent",
-            f"Real agent {started} (job {str(job_id)[:8]}..., read-only "
-            "plan mode - it can inspect and propose but not execute). "
-            "Its answer and any tool attempts stream in below from the "
-            "gateway transcript.",
+            f"Real agent {started} (job {str(job_id)[:8]}...). Its tool "
+            "work executes on the server; routine operations run "
+            "directly, destructive ones will appear here as a "
+            "confirmation card before anything changes.",
             {"badges": ["real agent", "streaming"],
-             "source": "codebuddy", "job_id": job_id})
-        self._relay_thread = threading.Thread(
-            target=self._relay_job, args=(job_id,), daemon=True)
-        self._relay_thread.start()
-        return [note]
+             "source": "codebuddy", "job_id": job_id}, conv_id))
+        threading.Thread(target=self._turn, args=(conv_id,),
+                         daemon=True).start()
+        return msgs
 
-    def _context_block(self) -> str:
-        if not self._context:
-            return ""
-        tail = "\n".join(f"- {c}" for c in self._context[-8:])
-        return ("Rolling transcript of this chat (the job was "
-                f"re-dispatched, so prior turns ride along):\n{tail}\n\n")
-
-    def _relay_job(self, job_id: str) -> None:
-        """Poll the job transcript, post NEW tool events immediately and
-        the assistant's reply when the turn settles. Never fabricates:
-        content comes only from the gateway transcript/detail fields."""
+    def _turn(self, conv_id: str) -> None:
+        """Relay one agent turn: post NEW tool activity live, create
+        confirmation cards for gate CONFIRM denials, post the assistant
+        reply when the turn settles. Content only from the gateway -
+        never fabricated."""
         import html as _html
-        import time as _time
         from .server import publish
+        st = self._cstate(conv_id)
         client = self._client
-        seen: set[str] = set()
-        reply_texts: dict[str, str] = {}
-        t0 = _time.time()
-        max_seconds = 600
+        job_id = st["job"]
+        t0 = time.time()
+        max_seconds = 900
+        if not st["seen"]:
+            # First relay since (re)start: replayed history of earlier
+            # turns must NOT be re-posted as fresh tool activity.
+            for u in client.transcript(job_id):
+                kind = str(u.get("sessionUpdate") or "")
+                if kind in ("tool_call", "tool_call_update"):
+                    st["seen"].add(
+                        f"{kind}|{u.get('toolCallId')}|{u.get('status')}")
         try:
-            while _time.time() - t0 < max_seconds:
-                _time.sleep(2.5)
+            while time.time() - t0 < max_seconds:
+                time.sleep(2.5)
                 detail = client.job(job_id)
                 state = detail.get("state")
+                self.store.conv_touch(conv_id, job_state=str(state))
                 for u in client.transcript(job_id):
                     kind = str(u.get("sessionUpdate") or "")
-                    mid = str(u.get("messageId") or u.get("toolCallId") or "")
                     if kind in ("tool_call", "tool_call_update"):
                         key = f"{kind}|{u.get('toolCallId')}|{u.get('status')}"
-                        if key in seen:
+                        if key in st["seen"]:
                             continue
-                        seen.add(key)
+                        st["seen"].add(key)
                         if kind == "tool_call":
-                            body = (f"[attempted] {u.get('title') or 'tool'}"
-                                    f" (status {u.get('status')})")
+                            body = (f"[running] {u.get('title') or 'tool'}")
                         else:
                             out = str(u.get("rawOutput") or "")[:300]
-                            body = (f"[tool {u.get('status')}] "
-                                    f"{_html.escape(out)}")
+                            body = f"[tool {u.get('status')}] {_html.escape(out)}"
+                            self._scan_gate_confirm(u, conv_id, st)
                         self.store.msg_add(
                             "tool", body,
                             {"badges": ["tool output", "real agent"],
-                             "job_id": job_id})
-                        publish({"type": "chat"})
-                    elif kind == "agent_message_chunk" and mid:
+                             "job_id": job_id}, conv_id)
+                        publish({"type": "chat", "conv_id": conv_id})
+                    elif kind == "agent_message_chunk":
+                        mid = str(u.get("messageId") or "")
                         txt = (u.get("content") or {}).get("text") or ""
-                        if txt.strip():
-                            reply_texts[mid] = txt
+                        if mid and txt.strip():
+                            st["replies"][mid] = txt
                 if state in ("done", "failed", "stopped"):
-                    body = max(reply_texts.values(),
-                               key=len) if reply_texts else ""
-                    if state == "done" and body:
+                    # newest assistant message wins (transcript order);
+                    # a message already relayed is never re-sent
+                    mid, body = (list(st["replies"].items())[-1]
+                                 if st["replies"] else ("", ""))
+                    if state == "done" and body and \
+                            mid not in st["delivered"]:
+                        st["delivered"].add(mid)
                         self.store.msg_add(
                             "agent", body,
                             {"badges": ["real agent"],
-                             "source": "codebuddy", "job_id": job_id})
-                        self._context.append(f"agent: {body[:140]}")
+                             "source": "codebuddy", "job_id": job_id},
+                            conv_id)
                     else:
                         live = str(detail.get("detail") or "")[:200]
                         self.store.msg_add(
                             "agent",
-                            f"(Real-agent turn ended: {state}."
+                            f"(Agent turn ended: {state}."
                             + (f" Gateway detail: {live}" if live else "")
                             + " No assistant reply text was recorded - "
                               "this interface does not fabricate one.)",
                             {"badges": ["real agent", "integration note"],
-                             "job_id": job_id})
-                    publish({"type": "chat"})
+                             "job_id": job_id}, conv_id)
+                    publish({"type": "chat", "conv_id": conv_id})
                     return
             self.store.msg_add(
                 "agent",
                 f"(No terminal job state seen within {max_seconds}s; the "
-                "gateway still holds the job. Its transcript remains "
-                "readable - send another message or check the operator's "
-                "CodeBuddy Web UI.)",
+                "gateway still holds the job. Send another message to "
+                "continue, or check the operator's CodeBuddy Web UI.)",
                 {"badges": ["real agent", "integration note"],
-                 "job_id": job_id})
-            publish({"type": "chat"})
+                 "job_id": job_id}, conv_id)
+            publish({"type": "chat", "conv_id": conv_id})
         finally:
-            self._busy = False
+            st["busy"] = False
+
+    def _scan_gate_confirm(self, upd: dict, conv_id: str, st: dict) -> None:
+        """A gate CONFIRM denial in tool output => create a confirmation
+        card (approval record) so the human decides."""
+        out = str(upd.get("rawOutput") or "")
+        m = CONFIRM_RE.search(out)
+        if not m or upd.get("status") != "failed":
+            return
+        op, note = m.group(1), m.group(2)[:300]
+        if op in st["ops"]:
+            return
+        st["ops"].add(op)
+        from .server import publish
+        aid = new_id("apm")
+        self.store.approval_create(
+            aid, "", "gate_op", "destructive",
+            json.dumps({"op": op, "conv_id": conv_id, "note": note,
+                        "job_id": st["job"]}, ensure_ascii=False))
+        self.store.audit("gate", "gate.confirm_required", aid,
+                         {"op": op, "conv": conv_id})
+        publish({"type": "approval", "id": aid})
+
+    def on_gate_decision(self, appr: dict, approve: bool) -> None:
+        """Human resolved a confirmation card. Approve => write the
+        single-use grant (the hook consumes it on an identical retry)
+        and tell the agent; deny => tell it to stand down."""
+        from .server import publish
+        info = json.loads(appr.get("detail") or "{}")
+        conv_id, op = info.get("conv_id", ""), info.get("op", "")
+        st = self._cstate(conv_id)
+        job_id = st["job"] or (self.store.conv_get(conv_id) or {}).get("job_id")
+        if approve and op:
+            import os
+            os.makedirs(APPROVALS_DIR, exist_ok=True)
+            f = os.path.join(APPROVALS_DIR, f"{op}.json")
+            with open(f, "w") as fh:
+                json.dump({"op": op, "granted_at": time.time(),
+                           "approval_id": appr["id"]}, fh)
+            os.chmod(f, 0o600)
+        try:
+            client = self._ensure_client()
+            if job_id:
+                msg = (
+                    "The user APPROVED this exact operation on the "
+                    "confirmation card. Retry the identical tool call "
+                    "now - the approval unlocks it exactly once - then "
+                    "report the outcome."
+                    if approve else
+                    "The user DECLINED the operation on the confirmation "
+                    "card. Do not retry it; briefly explain the safest "
+                    "alternative.")
+                r = client.reply(job_id, msg)
+                if not r.get("delivered"):
+                    raise RuntimeError(str(r)[:160])
+            if not st["busy"]:
+                st["busy"] = True
+                st["job"] = job_id
+                threading.Thread(target=self._turn, args=(conv_id,),
+                                 daemon=True).start()
+        except Exception as e:
+            self.store.msg_add(
+                "agent",
+                f"(Approval recorded, but the agent session could not be "
+                f"reached to act on it: {e}. The grant, if issued, stays "
+                "valid ~10 minutes for a matching retry.)",
+                {"badges": ["real agent", "integration note"]}, conv_id)
+        publish({"type": "chat", "conv_id": conv_id})
 
     # ------------------------------------------------------------------
-    # Input-manifest proposal (mock integration point). In demo mode the
-    # proposal is SYNTHETIC and labelled; with a real agent the same
-    # manifest shape would be produced by actual server-side inspection.
+    # Load Example (explicit user action; nothing demo-related appears
+    # automatically in a fresh workspace)
+    # ------------------------------------------------------------------
+    def load_example(self, conv_id: str) -> list[dict]:
+        out = [self._say(
+            "DEMO-P001 (synthetic): HER2+ breast cancer case with "
+            "tumor/normal WGS and tumor RNA in /demo/DEMO-P001/. "
+            "Analyze it end to end.",
+            role="user", meta={"badges": ["example"]}, conv_id=conv_id)]
+        out.append(self._say(
+            "Loaded a synthetic example case so you can explore the "
+            "workspace flow. Everything below it is DEMO data (seeded "
+            "mock engine). Ask me to prepare an analysis - in DEMO "
+            "mode the job runs the scripted engine; the real agent "
+            "performs the equivalent steps server-side when Real mode "
+            "is on.", conv_id=conv_id))
+        res = self.jobs.submit("DEMO-P001",
+                               [s["id"] for s in mock_data.STAGES
+                                if s["required"]], "auto")
+        out.append(self._say(
+            f"Prepared demo analysis {res['job_id']} for DEMO-P001 - "
+            "blocked on your approval (execute-class work always "
+            "needs a human click).", conv_id=conv_id))
+        return out
+
+    # ------------------------------------------------------------------
+    # Scripted (mock) agent - unchanged intents
     # ------------------------------------------------------------------
     def propose_manifest(self, description: str) -> dict:
         t = description.lower()
@@ -245,31 +401,20 @@ class DemoAgent:
             "which run is the matched normal")
         return manifest
 
-    def _say(self, text: str, role: str = "agent", meta: dict | None = None) -> dict:
-        meta = dict(meta or {})
-        meta.setdefault("badges", ["agent suggestion"] if role == "agent"
-                        else ["validated policy"])
-        return self.store.msg_add(role, text, meta)
-
-    def _policy(self, pol_id: str) -> dict:
-        p = POLICY_BY_ID[pol_id]
-        return self.store.msg_add("policy", p["text"],
-                                  {"policy_id": pol_id, "source": p["source"],
-                                   "badges": ["validated policy"]})
-
-    # ------------------------------------------------------------------
-    def handle(self, text: str) -> list[dict]:
+    def handle(self, text: str, conv_id: str = "") -> list[dict]:
         t = text.lower().strip()
         out: list[dict] = []
 
         if re.search(r"^\s*(hi|hello|hey|help|what can you)\b", t):
             out.append(self._say(
-                "I am the scripted DEMO assistant (no LLM, no real pipeline). "
-                "I can explain NeoAG stages and settings, propose an input "
-                "manifest from a directory description, submit a formal "
-                "analysis, and walk results. Try: \"analyze DEMO-P001\", "
-                "\"status\", \"show top candidates\", \"what rules does "
-                "NeoAG enforce\", \"research fusion tools\"."))
+                "I can explain NeoAG stages and settings, propose an "
+                "input manifest from a directory description, prepare a "
+                "formal analysis, and walk results. In DEMO mode every "
+                "job runs the scripted mock engine on synthetic data; "
+                "switch the mode pill to reach the real server-side "
+                "agent. Try: \"analyze DEMO-P001\", \"status\", \"show "
+                "top candidates\", \"what rules does NeoAG enforce\", "
+                "\"research fusion tools\".", conv_id=conv_id))
             return out
 
         if any(k in t for k in ("research", "discover", "sota", "alternativ",
@@ -286,19 +431,21 @@ class DemoAgent:
                 target=__import__("backend.research", fromlist=["run_research"])
                 .run_research, args=(rid, scope, target or "presentation",
                                      self.store, publish), daemon=True).start()
-            out.append(self._policy("POL-002"))
+            out.append(self._policy("POL-002", conv_id))
             out.append(self._say(
                 f"Started a SOTA discovery digest ({scope} scope, "
                 f"{target or 'presentation'}). Every row is labelled "
                 "literature-derived example content - no live search, no "
-                "downloads, no benchmarks. Open the Discovery view."))
+                "downloads, no benchmarks. Open the Discovery view.",
+                conv_id=conv_id))
             return out
 
         if any(k in t for k in ("decision history", "decisions",
                                 "what did you decide")):
             ds = self.store.decision_list(50)
             if not ds:
-                out.append(self._say("No decisions recorded yet."))
+                out.append(self._say("No decisions recorded yet.",
+                                     conv_id=conv_id))
                 return out
             pend = [d for d in ds if d["status"] == "pending"]
             lines = "\n".join(
@@ -308,16 +455,17 @@ class DemoAgent:
             out.append(self._say(
                 f"Decision history ({len(ds)} recorded, {len(pend)} pending): \n"
                 + lines + "\n\nFull detail (options, evidence, policy version) "
-                "is in each job's Decision History view."))
+                "is in each job's Decision History view.", conv_id=conv_id))
             return out
 
         if any(k in t for k in ("rule", "policy", "policies", "enforce", "validated")):
-            out.append(self._policy("POL-002"))
-            out.append(self._policy("POL-001"))
-            out.append(self._policy("POL-003"))
+            out.append(self._policy("POL-002", conv_id))
+            out.append(self._policy("POL-001", conv_id))
+            out.append(self._policy("POL-003", conv_id))
             out.append(self._say(
                 "Those three are quoted policy rules from the NeoAG "
-                "repository. Anything I add is a suggestion only."))
+                "repository. Anything I add is a suggestion only.",
+                conv_id=conv_id))
             return out
 
         if any(k in t for k in ("manifest", "input", "directory", "where are")):
@@ -328,7 +476,8 @@ class DemoAgent:
                 "Describe where your sequencing data live and I will "
                 "propose an input manifest for review. Demo cases: \n"
                 + lines + "\n\nDEMO-P002 has no RNA inputs - the fusion and "
-                "splice stages would be blocked in a real run."))
+                "splice stages would be blocked in a real run.",
+                conv_id=conv_id))
             return out
 
         m = re.search(r"demo-p00[0-9]", t)
@@ -346,25 +495,27 @@ class DemoAgent:
                 f"I prepared a formal analysis for {sample} with "
                 f"{len(stage_ids)} stages ({mode} settings). It is blocked on "
                 "your approval - the agent cannot queue execute-class work "
-                "without a human click (POL-005)."))
-            out.append(self._policy("POL-005"))
+                "without a human click (POL-005).", conv_id=conv_id))
+            out.append(self._policy("POL-005", conv_id))
             return out
 
         if sample and any(k in t for k in ("why", "explain", "candidate", "result", "top")):
-            return self._results("latest")
+            return self._results("latest", conv_id)
         if any(k in t for k in ("result", "candidate", "top ", "top-", "ranking")):
-            return self._results("latest")
+            return self._results("latest", conv_id)
 
         if any(k in t for k in ("status", "progress", "running", "job")):
             jobs = self.store.job_list(5)
             if not jobs:
-                out.append(self._say("No jobs yet. Try \"analyze DEMO-P001\"."))
+                out.append(self._say("No jobs yet. Try \"analyze DEMO-P001\" "
+                                     "or Load Example.", conv_id=conv_id))
                 return out
             lines = "\n".join(
                 f"- {j['id']}: {j['state']}"
                 + (f", {j['progress']}%, stage {j['stage']}" if j["stage"] else "")
                 + (f" ({j['error']})" if j["error"] else "") for j in jobs)
-            out.append(self._say("Latest jobs (live in the Tasks view):\n" + lines))
+            out.append(self._say("Latest jobs (live in the Tasks view):\n" + lines,
+                                 conv_id=conv_id))
             return out
 
         if any(k in t for k in ("pause", "stop", "cancel", "resume")):
@@ -372,46 +523,46 @@ class DemoAgent:
                 "Use the pause / stop / resume buttons on the job card in "
                 "the Tasks view - controls act on the job worker, not just "
                 "the chat. Cancellation is cooperative at stage/substep "
-                "boundaries."))
+                "boundaries.", conv_id=conv_id))
             return out
 
         if any(k in t for k in ("real", "pipeline", "connect", "production")):
-            out.append(self._policy("POL-007"))
+            out.append(self._policy("POL-007", conv_id))
             out.append(self._say(
-                "This prototype is NOT connected to the real pipeline (by "
-                "design for this milestone). The intended real path is the "
-                "NeoAg controlled-execution gateway on 127.0.0.1 - routes "
-                "/open/run + /job-status/<id>, approvals, audit - and the "
-                "integration gaps (cancel endpoint!) are listed in the "
-                "README."))
+                "Real mode (mode pill, top-right) connects the chat to the "
+                "genuine server-side CodeBuddy agent, which inspects, "
+                "computes and diagnoses directly on this server. Formal "
+                "pipeline execution through the mock engine stays clearly "
+                "badged until the NeoAG controlled-execution gateway is "
+                "wired.", conv_id=conv_id))
             return out
 
         out.append(self._say(
-            "DEMO agent here (scripted, no model). Try: \"analyze DEMO-P001\", "
-            "\"what rules does NeoAG enforce\", \"status\", \"show top "
-            "candidates\", \"what data do we have\"."))
+            "Demo agent here (scripted, no model). Try: \"analyze "
+            "DEMO-P001\", \"what rules does NeoAG enforce\", \"status\", "
+            "\"show top candidates\", \"what data do we have\". Or Load "
+            "Example for a guided demo.", conv_id=conv_id))
         return out
 
-    def _results(self, _which: str) -> list[dict]:
+    def _results(self, _which: str, conv_id: str = "") -> list[dict]:
         done = [j for j in self.store.job_list(20) if j["state"] == "completed"]
         if not done:
             out = [self._say(
-                "No completed mock run yet - run \"analyze DEMO-P001\" and "
-                "approve it in the Approvals panel.")]
+                "No completed demo run yet - run \"analyze DEMO-P001\" and "
+                "approve it in the Approvals panel.", conv_id=conv_id)]
             return out
         job = done[0]
-        import json
         rows = json.loads(job["result_json"] or "{}").get("candidates", [])[:3]
         lines = "\n".join(
             f"- #{r['rank']} {r['peptide']} ({r['gene']}, {r['hla']}, "
             f"{r['branch']}): mock score {r['mock_combined_score']}"
             for r in rows)
         return [
-            self._policy("POL-002"),
+            self._policy("POL-002", conv_id),
             self._say(
                 f"Top mock candidates from {job['id']} ({job['sample_id']}):\n"
                 + lines +
                 "\n\nOpen the Results view for full evidence columns. "
                 "These are synthetic demo numbers, not predictions about "
-                "anything real."),
+                "anything real.", conv_id=conv_id),
         ]

@@ -4,10 +4,16 @@ Job states are persisted so a restart never loses queued/running work silently:
 on startup any job still marked queued/running/paused is transitioned to
 'failed' with error 'interrupted by server restart' (visible in the UI).
 States: queued | running | paused | blocked | completed | failed | cancelled.
+
+Conversations (ChatGPT-style persistence): chats live in `conversations`
+(messages carry conv_id); deleting is soft (deleted=1) - rows stay for
+retention/audit. The store also honors the NEOAG_DEMO_DB environment
+override so test batteries run against isolated fresh databases.
 """
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import uuid
@@ -60,6 +66,10 @@ CREATE TABLE IF NOT EXISTS manifests(
   id TEXT PRIMARY KEY, created_at TEXT, updated_at TEXT, description TEXT,
   status TEXT, proposal_json TEXT, confirmed_json TEXT, job_id TEXT
 );
+CREATE TABLE IF NOT EXISTS conversations(
+  id TEXT PRIMARY KEY, created_at TEXT, updated_at TEXT, title TEXT,
+  job_id TEXT, job_state TEXT, deleted INTEGER DEFAULT 0
+);
 """
 
 JOB_STATES = {"queued", "running", "paused", "blocked", "completed", "failed",
@@ -78,10 +88,17 @@ class Store:
     def __init__(self, data_dir: Path):
         data_dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
-        self.db = sqlite3.connect(str(data_dir / DB_NAME), check_same_thread=False)
+        db_name = os.environ.get("NEOAG_DEMO_DB") or DB_NAME
+        self.db_path = str(data_dir / db_name)
+        self.db = sqlite3.connect(self.db_path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         with self.lock:
             self.db.executescript(SCHEMA)
+            try:  # migration for pre-conversation databases
+                self.db.execute("ALTER TABLE messages ADD COLUMN conv_id "
+                                "TEXT DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass  # column already present
             self.db.commit()
 
     # ---------- audit ----------
@@ -191,21 +208,102 @@ class Store:
             rows = self.db.execute(q, args).fetchall()
         return [dict(r) for r in rows]
 
-    # ---------- messages ----------
-    def msg_add(self, role: str, text: str, meta: dict | None = None) -> dict:
+    # ---------- conversations (ChatGPT-style history) ----------
+    def conv_create(self, title: str = "") -> dict:
+        cid = new_id("conv")
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO conversations(id,created_at,updated_at,title) "
+                "VALUES(?,?,?,?)", (cid, now(), now(), title))
+            self.db.commit()
+        return self.conv_get(cid)
+
+    def conv_get(self, cid: str) -> dict | None:
+        with self.lock:
+            row = self.db.execute("SELECT * FROM conversations WHERE id=?",
+                                  (cid,)).fetchone()
+        return dict(row) if row else None
+
+    def conv_list(self, limit: int = 200) -> list[dict]:
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT c.*, (SELECT COUNT(*) FROM messages m "
+                " WHERE m.conv_id=c.id) AS n_messages "
+                "FROM conversations c WHERE c.deleted=0 "
+                "ORDER BY c.updated_at DESC, c.rowid DESC LIMIT ?",
+                (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def conv_touch(self, cid: str, job_state: str | None = None) -> None:
+        with self.lock:
+            if job_state is not None:
+                self.db.execute(
+                    "UPDATE conversations SET updated_at=?, job_state=? "
+                    "WHERE id=?", (now(), job_state, cid))
+            else:
+                self.db.execute("UPDATE conversations SET updated_at=? "
+                                "WHERE id=?", (now(), cid))
+            self.db.commit()
+
+    def conv_set_title(self, cid: str, title: str) -> dict | None:
+        with self.lock:
+            self.db.execute("UPDATE conversations SET title=?, updated_at=? "
+                            "WHERE id=?", (title[:120], now(), cid))
+            self.db.commit()
+        return self.conv_get(cid)
+
+    def conv_set_job(self, cid: str, job_id: str | None,
+                     state: str = "unknown") -> None:
+        with self.lock:
+            self.db.execute(
+                "UPDATE conversations SET job_id=?, job_state=?, updated_at=? "
+                "WHERE id=?", (job_id, state, now(), cid))
+            self.db.commit()
+
+    def conv_delete(self, cid: str) -> bool:
+        """Soft delete: hides from history; backend rows retained."""
         with self.lock:
             cur = self.db.execute(
-                "INSERT INTO messages(ts,role,text,meta_json) VALUES(?,?,?,?)",
-                (now(), role, text, json.dumps(meta or {}, ensure_ascii=False)))
+                "UPDATE conversations SET deleted=1, updated_at=? "
+                "WHERE id=? AND deleted=0", (now(), cid))
+            self.db.commit()
+        return cur.rowcount > 0
+
+    def conv_recent_text(self, cid: str, n: int = 12) -> list[str]:
+        """Recent user/agent turns as 'role: text' lines (context
+        reconstruction after an agent job expired)."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT role, text FROM messages WHERE conv_id=? "
+                "AND role IN ('user','agent') ORDER BY id DESC LIMIT ?",
+                (cid, n)).fetchall()
+        return [f"{r['role']}: {(r['text'] or '')[:200]}"
+                for r in reversed(rows)]
+
+    # ---------- messages ----------
+    def msg_add(self, role: str, text: str, meta: dict | None = None,
+                conv_id: str = "") -> dict:
+        with self.lock:
+            cur = self.db.execute(
+                "INSERT INTO messages(ts,role,text,meta_json,conv_id) "
+                "VALUES(?,?,?,?,?)",
+                (now(), role, text, json.dumps(meta or {}, ensure_ascii=False),
+                 conv_id))
             self.db.commit()
             mid = cur.lastrowid
         return {"id": mid, "ts": now(), "role": role, "text": text,
-                "meta": meta or {}}
+                "meta": meta or {}, "conv_id": conv_id}
 
-    def msg_list(self, limit: int = 200) -> list[dict]:
+    def msg_list(self, limit: int = 200, conv_id: str | None = None) -> list[dict]:
+        q = "SELECT * FROM messages"
+        args: list = []
+        if conv_id is not None:
+            q += " WHERE conv_id=?"
+            args.append(conv_id)
+        q += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
         with self.lock:
-            rows = self.db.execute(
-                "SELECT * FROM messages ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            rows = self.db.execute(q, args).fetchall()
         out = []
         for r in reversed(rows):
             d = dict(r)
@@ -432,3 +530,46 @@ class Store:
                 "FROM manifests ORDER BY created_at DESC LIMIT ?",
                 (limit,)).fetchall()
         return [dict(r) for r in rows]
+
+    # ---------- reversible archive cleanup (developer records) ----------
+    def archive_and_purge(self, keep_audit: bool = True) -> dict:
+        """Export every user-facing table to data/archive-<ts>.json, then
+        delete those rows (audit + settings stay). Reversible: the JSON
+        file contains full rows; re-import with restore_archive()."""
+        tables = ["messages", "jobs", "job_events", "approvals", "decisions",
+                  "research", "research_events", "manifests", "conversations"]
+        dump = {"archived_at": now(), "reason": "developer demo records "
+                "moved out of the visible workspace (reversible)",
+                "tables": {}}
+        with self.lock:
+            for t in tables:
+                rows = [dict(r) for r in
+                        self.db.execute(f"SELECT * FROM {t}").fetchall()]
+                dump["tables"][t] = rows
+                self.db.execute(f"DELETE FROM {t}")
+            self.db.commit()
+        fname = f"archive-{datetime.now():%Y%m%d-%H%M%S}.json"
+        p = Path(self.db_path).parent / fname
+        p.write_text(json.dumps(dump, ensure_ascii=False, indent=1))
+        p.chmod(0o600)
+        counts = {t: len(v) for t, v in dump["tables"].items()}
+        self.audit("server", "store.archive_and_purge", fname, counts)
+        return {"file": str(p), "counts": counts}
+
+    def restore_archive(self, path: str) -> int:
+        """Re-import an archive written by archive_and_purge. Returns the
+        number of rows restored."""
+        dump = json.loads(Path(path).read_text())
+        n = 0
+        with self.lock:
+            for t, rows in dump.get("tables", {}).items():
+                for r in rows:
+                    cols = ", ".join(r.keys())
+                    qm = ", ".join("?" * len(r))
+                    self.db.execute(
+                        f"INSERT OR REPLACE INTO {t}({cols}) VALUES({qm})",
+                        tuple(r.values()))
+                    n += 1
+            self.db.commit()
+        self.audit("server", "store.restore_archive", path, {"rows": n})
+        return n

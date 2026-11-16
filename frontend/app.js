@@ -1,6 +1,9 @@
 /* NeoAG Workspace - frontend logic (vanilla JS, no build step).
-   Data comes from /api/bootstrap + SSE. All writes go through the API;
-   the browser only renders server-persisted state. */
+   Data comes from /api/bootstrap + per-conversation fetches + SSE.
+   All writes go through the API; the browser only renders
+   server-persisted state. Layout contract: nothing at page level
+   scrolls - sidebar, chat log, work body and the drawer each own
+   their scroll; the composer stays pinned at the bottom. */
 "use strict";
 
 const $ = (id) => document.getElementById(id);
@@ -9,11 +12,10 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
 
 const state = {
   boot: null, params: null, view: "tasks", kindFilter: "",
-  jobDetail: null, helpDoc: null, resultsJob: null,
+  jobDetail: null, resultsJob: null,
   manifest: null, agentMode: "mock",
+  convs: [], activeCid: null, convMsgs: [],
 };
-
-const LEGACY_NOTICE_RE = /^MOCK PROTOTYPE/;
 
 /* ---------------- API ---------------- */
 async function api(method, path, body) {
@@ -37,6 +39,16 @@ function toast(msg, err) {
   t.classList.remove("hidden");
   clearTimeout(toast._h);
   toast._h = setTimeout(() => t.classList.add("hidden"), 4200);
+}
+
+function ago(ts) {
+  if (!ts) return "";
+  const d = (Date.now() - new Date(ts).getTime()) / 1000;
+  if (d < 60) return "just now";
+  if (d < 3600) return `${Math.floor(d / 60)}m ago`;
+  if (d < 86400) return `${Math.floor(d / 3600)}h ago`;
+  if (d < 7 * 86400) return `${Math.floor(d / 86400)}d ago`;
+  return new Date(ts).toLocaleDateString();
 }
 
 /* ---------------- markdown (help docs) ---------------- */
@@ -86,14 +98,19 @@ async function boot() {
   try {
     state.boot = await api("GET", "/api/bootstrap");
     state.agentMode = state.boot.agent_mode || "mock";
+    state.convs = state.boot.conversations || [];
+    state.activeCid = state.boot.active_conv || null;
     state.params = await api("GET", "/api/params");
     renderAgentBadge();
-    renderChat();
+    renderSidebar();
+    await openConv(state.activeCid, true);
     renderTasks();
     renderJobs();
+    renderAttention();
     renderResults();
     renderDiscovery();
     renderHelp();
+    initSplitter();
     connectSSE();
   } catch (e) {
     if (e.status === 401) return; // browser shows the login prompt
@@ -110,16 +127,136 @@ function connectSSE() {
   es.onmessage = (m) => {
     let ev = {};
     try { ev = JSON.parse(m.data); } catch { return; }
-    if (ev.type === "chat") refreshChat();
-    else if (ev.type === "job" || ev.type === "approval") { refreshJobs(); refreshChat(); }
-    else if (ev.type === "research") refreshDiscovery();
+    if (ev.type === "chat") {
+      if (!ev.conv_id || ev.conv_id === state.activeCid) refreshConv();
+      refreshSidebar();
+    } else if (ev.type === "conversations") refreshSidebar();
+    else if (ev.type === "job" || ev.type === "approval") {
+      refreshJobs(); renderAttention(); refreshConv();
+    } else if (ev.type === "research") refreshDiscovery();
     else if (ev.type === "manifest") refreshManifests();
     else if (ev.type === "agent_mode") renderAgentBadge();
-    else if (ev.type === "settings") refreshTasks();
+    else if (ev.type === "records_changed") boot();
   };
 }
 
-/* ---------------- chat ---------------- */
+/* ---------------- conversation sidebar ---------------- */
+function renderSidebar() {
+  const host = $("conv-list");
+  host.innerHTML = (state.convs || []).map((c) => `
+    <div class="conv-item ${c.id === state.activeCid ? "active" : ""}"
+         data-conv="${esc(c.id)}">
+      <div class="ct">${esc(c.title || "New chat")}</div>
+      <div class="cm">
+        ${(c.job_state === "working" || c.job_state === "blocked")
+          ? '<span class="live" title="agent session live"></span>' : ""}
+        <span>${ago(c.updated_at)}</span><span>-</span>
+        <span>${c.n_messages || 0} msg</span>
+      </div>
+      <div class="cops">
+        <button class="icon-btn" data-ren="${esc(c.id)}" title="Rename">ren</button>
+        <button class="icon-btn danger" data-del="${esc(c.id)}" title="Delete (kept on server)">del</button>
+      </div>
+    </div>`).join("") || '<div class="empty">No chats yet.</div>';
+  host.querySelectorAll("[data-conv]").forEach((el) =>
+    el.addEventListener("click", (ev) => {
+      if (ev.target.closest("[data-ren],[data-del]")) return;
+      openConv(el.dataset.conv);
+    }));
+  host.querySelectorAll("[data-ren]").forEach((el) =>
+    el.addEventListener("click", () => startRename(el.dataset.ren)));
+  host.querySelectorAll("[data-del]").forEach((el) =>
+    el.addEventListener("click", async () => {
+      const c = state.convs.find((x) => x.id === el.dataset.del);
+      if (!confirm(`Delete chat "${(c && c.title) || "New chat"}"?\n\nIt disappears from this list; the saved messages stay on the server for audit.`)) return;
+      try {
+        await api("POST", `/api/conversations/${el.dataset.del}/delete`, {});
+        if (state.activeCid === el.dataset.del) {
+          state.activeCid = null;
+          await refreshSidebar();
+          await openNextConv();
+        } else await refreshSidebar();
+      } catch (e) { toast("delete failed: " + e.message, true); }
+    }));
+}
+
+async function refreshSidebar() {
+  try { state.convs = (await api("GET", "/api/conversations")).conversations; }
+  catch { return; }
+  renderSidebar();
+}
+
+async function openNextConv() {
+  await openConv(state.convs.length ? state.convs[0].id : null);
+}
+
+async function openConv(cid, quiet) {
+  state.activeCid = cid;
+  renderSidebar();
+  if (!cid) { state.convMsgs = []; renderChat(); return; }
+  try {
+    const d = await api("GET", `/api/conversations/${cid}`);
+    state.convMsgs = d.messages;
+    state.convObj = d.conversation;
+  } catch (e) {
+    if (!quiet) toast("cannot open chat: " + e.message, true);
+    state.convMsgs = []; state.convObj = null;
+  }
+  renderChat();
+}
+
+async function refreshConv() {
+  if (!state.activeCid) return;
+  try {
+    const d = await api("GET", `/api/conversations/${state.activeCid}`);
+    state.convMsgs = d.messages;
+    state.convObj = d.conversation;
+    renderChat();
+  } catch { /* transient */ }
+}
+
+$("new-chat").addEventListener("click", async () => {
+  try {
+    const r = await api("POST", "/api/conversations", {});
+    state.activeCid = r.conversation.id;
+    await refreshSidebar();
+    await openConv(r.conversation.id);
+    $("chat-input").focus();
+  } catch (e) { toast("new chat failed: " + e.message, true); }
+});
+
+function startRename(cid) {
+  const item = document.querySelector(`[data-conv="${CSS.escape(cid)}"] .ct`);
+  const conv = state.convs.find((c) => c.id === cid) || {};
+  if (!item) return;
+  const old = conv.title || "New chat";
+  item.innerHTML = `<input class="rename" value="${esc(old)}">`;
+  const inp = item.querySelector("input");
+  inp.focus(); inp.select();
+  const commit = async () => {
+    const t = inp.value.trim();
+    if (t && t !== old) {
+      try { await api("POST", `/api/conversations/${cid}/rename`, { title: t }); }
+      catch (e) { toast("rename failed: " + e.message, true); }
+    }
+    await refreshSidebar();
+    if (cid === state.activeCid) renderChat();
+  };
+  inp.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") commit();
+    if (ev.key === "Escape") { renderSidebar(); if (cid === state.activeCid) renderChat(); }
+  });
+  inp.addEventListener("blur", commit);
+}
+
+$("chat-rename").addEventListener("click", () => {
+  if (state.activeCid) startRename(state.activeCid);
+});
+$("chat-title").addEventListener("dblclick", () => {
+  if (state.activeCid) startRename(state.activeCid);
+});
+
+/* ---------------- chat pane ---------------- */
 function msgHtml(m) {
   const meta = m.meta || {};
   const badges = (meta.badges || []).map((b) =>
@@ -129,42 +266,66 @@ function msgHtml(m) {
     <div class="body">${esc(m.text)}</div></div>`;
 }
 
+function gateCardHtml(a) {
+  let info = {};
+  try { info = JSON.parse(a.detail || "{}"); } catch { /* raw */ }
+  return `<div class="inline-card confirm">
+    <div class="q">Confirm destructive operation</div>
+    <div class="sub">The execution gate blocked this before it ran. Approving
+      unlocks exactly this one operation; nothing else. It is also recorded
+      in the audit trail.</div>
+    <div class="detail">${esc(info.note || a.detail || "")}</div>
+    <div class="btnrow">
+      <button class="btn primary sm" data-appr="${esc(a.id)}" data-ok="1">Approve once</button>
+      <button class="btn danger sm" data-appr="${esc(a.id)}">Deny</button>
+      <span class="hint">op ${esc((info.op || "").slice(0, 12))}</span>
+    </div></div>`;
+}
+
 function renderChat() {
   const log = $("chat-log");
-  const msgs = (state.boot.messages || []).filter((m) =>
-    !(m.meta && Array.isArray(m.meta.badges) &&
-      m.meta.badges.includes("mock prototype")) &&
-    !LEGACY_NOTICE_RE.test(m.text || ""));
-  const start = state.boot.messages.length < 3;
-  let html = msgs.map(msgHtml).join("");
-  if (start) {
-    html += `<div class="quickstart">
-      <div class="qs-title">Quick starts</div>
-      <button data-say="analyze DEMO-P001">Run a demo analysis of sample DEMO-P001</button>
-      <button data-say="what rules does NeoAG enforce">Explain the scientific policy rules</button>
-      <button data-say="show top candidates">Show top-ranked candidates</button>
+  const conv = state.convObj;
+  $("chat-title").textContent =
+    (conv && (conv.title || "New chat")) || "New chat";
+  const st = conv && conv.job_state;
+  const chip = $("chat-state");
+  if (st === "working" || st === "blocked") {
+    chip.classList.remove("hidden");
+    chip.className = "pill accent";
+    chip.textContent = st === "working" ? "agent working" : "awaiting confirmation";
+  } else chip.classList.add("hidden");
+
+  let html = (state.convMsgs || []).map(msgHtml).join("");
+  const gateCards = (state.boot?.approvals || []).filter((a) => {
+    if (a.state !== "pending" || a.action !== "gate_op") return false;
+    try { return JSON.parse(a.detail || "{}").conv_id === state.activeCid; }
+    catch { return false; }
+  });
+  for (const a of gateCards) html += gateCardHtml(a);
+  if (!(state.convMsgs || []).length && !gateCards.length) {
+    html += `<div class="emptychat">
+      <div class="et">Start a conversation</div>
+      <div class="es">Ask anything about NeoAG, or describe a sample and where its data live.</div>
+      <button id="load-example">Load example - walk through a synthetic case</button>
     </div>`;
-  }
-  const pend = (state.boot.approvals || []).filter((a) => a.state === "pending");
-  for (const a of pend) {
-    html += `<div class="inline-card">
-      <div class="q">Approval required</div>
-      <div class="body" style="font-size:12.5px;color:var(--text-2)">${esc(a.detail || a.action)}</div>
-      <div class="btnrow">
-        <button class="btn primary sm" data-appr="${esc(a.id)}" data-ok="1">Approve</button>
-        <button class="btn danger sm" data-appr="${esc(a.id)}">Deny</button>
-      </div></div>`;
-  }
-  const pdec = (state.boot.decisions || []).filter((d) => d.status === "pending");
-  for (const d of pdec.slice(0, 4)) {
-    html += `<div class="inline-card">
-      <div class="q">${esc(d.question)}</div>
-      <div class="opts">${(d.options || []).map((o) =>
-        `<button class="opt" data-dec="${esc(d.id)}" data-choice="${esc(o.id)}">${esc(o.label)}${o.validated ? '<span class="validated">validated default</span>' : ""}</button>`).join("")}</div>
-      <div class="why">${esc(d.evidence ? d.evidence.join(" - ") : "")}</div></div>`;
   }
   log.innerHTML = html;
   log.scrollTop = log.scrollHeight;
+  const le = $("load-example");
+  if (le) le.addEventListener("click", loadExample);
+}
+
+async function loadExample() {
+  try {
+    if (!state.activeCid) {
+      const r = await api("POST", "/api/conversations", {});
+      state.activeCid = r.conversation.id;
+    }
+    await api("POST", `/api/conversations/${state.activeCid}/example`, {});
+    await refreshConv();
+    await refreshSidebar();
+    await refreshJobs();
+  } catch (e) { toast("example failed: " + e.message, true); }
 }
 
 $("chat-form").addEventListener("submit", async (ev) => {
@@ -173,15 +334,56 @@ $("chat-form").addEventListener("submit", async (ev) => {
   if (!text) return;
   $("chat-input").value = "";
   try {
-    await api("POST", "/api/chat", { text });
-    await refreshChat();
+    const r = await api("POST", "/api/chat",
+                        { text, conv_id: state.activeCid || "" });
+    state.activeCid = r.conv_id;
+    await refreshConv();
+    await refreshSidebar();
+    await refreshJobs();
   } catch (e) { toast("send failed: " + e.message, true); }
 });
-async function refreshChat() {
+$("chat-input").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter" && !ev.shiftKey) {
+    ev.preventDefault();
+    $("chat-form").requestSubmit();
+  }
+});
+
+async function refreshJobs() {
   try {
-    state.boot.messages = (await api("GET", "/api/bootstrap")).messages;
-    renderChat();
+    const b = await api("GET", "/api/bootstrap");
+    state.boot.jobs = b.jobs; state.boot.approvals = b.approvals;
+    state.boot.decisions = b.decisions;
+    renderJobs(); renderAttention();
   } catch (e) { /* transient */ }
+}
+
+/* ---------------- splitter ---------------- */
+function initSplitter() {
+  const shell = $("shell"), sp = $("splitter");
+  const saved = localStorage.getItem("neoag.chatw");
+  if (saved) shell.style.setProperty("--chatw", saved);
+  let drag = null;
+  sp.addEventListener("pointerdown", (ev) => {
+    drag = { x: ev.clientX,
+             w: parseInt(getComputedStyle(shell)
+                  .getPropertyValue("--chatw")) || 400 };
+    sp.classList.add("drag");
+    sp.setPointerCapture(ev.pointerId);
+  });
+  sp.addEventListener("pointermove", (ev) => {
+    if (!drag) return;
+    const w = Math.min(760, Math.max(300, drag.w + ev.clientX - drag.x));
+    shell.style.setProperty("--chatw", w + "px");
+  });
+  const end = () => {
+    if (!drag) return;
+    drag = null; sp.classList.remove("drag");
+    localStorage.setItem("neoag.chatw",
+      shell.style.getPropertyValue("--chatw") || "400px");
+  };
+  sp.addEventListener("pointerup", end);
+  sp.addEventListener("pointercancel", end);
 }
 
 /* ---------------- tasks ---------------- */
@@ -312,49 +514,72 @@ $("nj-submit").addEventListener("click", async () => {
     body.manifest_id = state.manifest.id;
   try {
     const res = await api("POST", "/api/jobs", body);
-    toast(`job ${res.job_id} blocked on approval - approve it in the chat pane`);
-    await refreshJobs(); refreshChat();
+    toast(`job ${res.job_id} waiting for your approval (Tasks panel above)`);
+    await refreshJobs();
   } catch (e) { toast("submit failed: " + e.message, true); }
 });
 
+/* attention strip: anything blocked on a human click */
+function renderAttention() {
+  const host = $("attention");
+  const rows = [];
+  for (const a of (state.boot.approvals || [])) {
+    if (a.state !== "pending" || a.action === "gate_op") continue;
+    rows.push(`<div class="at-row">
+      <span><b>Execute approval</b> - job ${esc(a.job_id)} (${esc(a.risk)} risk)</span>
+      <span class="btnrow" style="margin:0">
+        <button class="btn primary sm" data-appr="${esc(a.id)}" data-ok="1">Approve</button>
+        <button class="btn danger sm" data-appr="${esc(a.id)}">Deny</button>
+      </span></div>`);
+  }
+  for (const d of (state.boot.decisions || [])) {
+    if (d.status !== "pending") continue;
+    rows.push(`<div class="at-row">
+      <span><b>Decision</b> - ${esc(d.question)}</span>
+      <span class="btnrow" style="margin:0">${(d.options || []).map((o) =>
+        `<button class="btn sm" data-dec="${esc(d.id)}" data-choice="${esc(o.id)}">${esc(o.label)}${o.validated ? " (validated)" : ""}</button>`).join("")}</span></div>`);
+  }
+  if (!rows.length) { host.classList.add("hidden"); host.innerHTML = ""; return; }
+  host.classList.remove("hidden");
+  host.innerHTML = `<b>${rows.length} item${rows.length > 1 ? "s" : ""} waiting for you</b>` +
+    rows.join("");
+}
+
 /* ---------------- jobs ---------------- */
+const ACTIVE_STATES = ["queued", "running", "paused", "blocked"];
 function statusPill(st) {
   const cls = { completed: "ok", running: "accent", queued: "accent",
                 blocked: "warn", paused: "warn", failed: "danger",
                 cancelled: "muted" }[st] || "muted";
   return `<span class="pill ${cls}">${esc(st)}</span>`;
 }
-
-function renderJobs() {
-  const host = $("job-list");
-  const kind = state.kindFilter;
-  const jobs = (state.boot.jobs || []).filter((j) => !kind || j.kind === kind);
-  if (!jobs.length) {
-    host.innerHTML = `<div class="empty">No jobs in this category yet.</div>`;
-    return;
-  }
-  host.innerHTML = jobs.map((j) => `
-    <div class="job-row" data-job="${esc(j.id)}">
-      <div class="jr-top">
-        <span class="jr-id">${esc(j.id)}</span>
-        <span class="jr-sample">${esc(j.sample_id)}</span>
-        <span class="pill muted">${esc(j.kind)}</span>
-        ${statusPill(j.state)}
-      </div>
-      <div class="jr-meta">${esc(j.stage || "")} ${esc(j.error || "")}</div>
-      <div class="progress"><i style="width:${j.progress || 0}%"></i></div>
-    </div>`).join("");
-  host.querySelectorAll("[data-job]").forEach((el) =>
-    el.addEventListener("click", () => openJob(el.dataset.job)));
+function jobRowHtml(j) {
+  return `
+    <div class="jr-top">
+      <span class="jr-id">${esc(j.id)}</span>
+      <span class="jr-sample">${esc(j.sample_id)}</span>
+      <span class="pill muted">${esc(j.kind)}</span>
+      ${statusPill(j.state)}
+    </div>
+    <div class="jr-meta">${esc(j.stage || "")} ${esc(j.error || "")}</div>
+    <div class="progress"><i style="width:${j.progress || 0}%"></i></div>`;
 }
 
-async function refreshJobs() {
-  try {
-    const b = await api("GET", "/api/bootstrap");
-    state.boot.jobs = b.jobs; state.boot.approvals = b.approvals;
-    state.boot.decisions = b.decisions;
-    renderJobs(); renderChat();
-  } catch (e) { /* transient */ }
+function renderJobs() {
+  const kind = state.kindFilter;
+  const all = (state.boot.jobs || []).filter((j) => !kind || j.kind === kind);
+  const active = all.filter((j) => ACTIVE_STATES.includes(j.state));
+  const past = all.filter((j) => !ACTIVE_STATES.includes(j.state));
+  const host = $("job-list");
+  host.innerHTML = active.length ? active.map((j) =>
+    `<div class="job-row" data-job="${esc(j.id)}">${jobRowHtml(j)}</div>`).join("")
+    : `<div class="empty">Nothing running or queued. Prepare an analysis above, or ask the agent in chat.</div>`;
+  $("history-count").textContent = past.length ? `(${past.length})` : "";
+  $("history-list").innerHTML = past.length ? past.map((j) =>
+    `<div class="job-row" data-job="${esc(j.id)}">${jobRowHtml(j)}</div>`).join("")
+    : `<div class="empty">No finished jobs yet.</div>`;
+  document.querySelectorAll("[data-job]").forEach((el) =>
+    el.addEventListener("click", () => openJob(el.dataset.job)));
 }
 
 document.querySelectorAll("#kind-filter .chip").forEach((c) =>
@@ -438,7 +663,7 @@ function renderResults() {
       <thead><tr><th>Rank</th><th>Peptide</th><th>Gene</th><th>HLA</th>
       <th>Branch</th><th>Score</th><th>Normal hits</th></tr></thead>
       <tbody>${rows}</tbody></table></div>`;
-  }).catch((e) => { $("res-table").innerHTML = ""; });
+  }).catch(() => { $("res-table").innerHTML = ""; });
 }
 $("res-job").addEventListener("change", () => {
   state.resultsJob = $("res-job").value;
@@ -536,14 +761,14 @@ function renderAgentBadge() {
   $("agent-mode").textContent = real
     ? "CodeBuddy (real)" : "Demo agent (scripted)";
   $("agent-mode").title = real
-    ? "Connected to the real server-side CodeBuddy agent. Click to switch back to the scripted demo agent."
-    : "Scripted demo agent - no LLM. Click to switch to the real server-side CodeBuddy agent.";
+    ? "Connected to the real server-side CodeBuddy agent: ordinary work executes directly; destructive or out-of-workspace operations are blocked until you approve a confirmation card. Click to switch back to the scripted demo agent."
+    : "Scripted demo agent - no LLM. Click to connect the real server-side CodeBuddy agent.";
 }
 $("agent-mode").addEventListener("click", async () => {
   const real = state.agentMode === "real";
   const next = real ? "mock" : "real";
   const ok = confirm(next === "real"
-    ? "Switch to the REAL CodeBuddy agent?\n\nMessages will be sent to the server-side CodeBuddy gateway (one active run; approvals must be given in the operator CodeBuddy Web UI; the gateway rate-limits run creation)."
+    ? "Switch to the REAL CodeBuddy agent?\n\nYour chat messages go to the server-side CodeBuddy gateway. Ordinary reads, diagnostics and workspace work execute directly (logged, not prompted); destructive or out-of-workspace operations are blocked by the execution gate until you approve a confirmation card."
     : "Switch back to the scripted demo agent?");
   if (!ok) return;
   try {
@@ -551,19 +776,19 @@ $("agent-mode").addEventListener("click", async () => {
     state.agentMode = next;
     renderAgentBadge();
     toast(next === "real"
-      ? "real CodeBuddy agent connected - be aware this drives the operator's live gateway"
+      ? "real CodeBuddy agent connected - gated execution, card-based confirmations"
       : "switched to the scripted demo agent");
   } catch (e) { toast("mode switch failed: " + e.message, true); }
 });
 
-/* ---------------- approvals + decisions (chat cards) ---------------- */
+/* ---------------- approvals + decisions ---------------- */
 document.addEventListener("click", async (ev) => {
   const appr = ev.target.closest("[data-appr]");
   if (appr) {
     try {
       await api("POST", `/api/approvals/${appr.dataset.appr}`,
         { approve: appr.dataset.ok === "1" });
-      await refreshJobs(); refreshChat();
+      await refreshJobs(); refreshConv();
     } catch (e) { toast("approval failed: " + e.message, true); }
     return;
   }
@@ -571,16 +796,10 @@ document.addEventListener("click", async (ev) => {
   if (dec) {
     try {
       await api("POST", `/api/decisions/${dec.dataset.dec}/resolve`,
-        { choice: dec.dataset.choice, note: "resolved in chat" });
-      await refreshJobs(); refreshChat();
+        { choice: dec.dataset.choice, note: "resolved in Tasks panel" });
+      await refreshJobs();
     } catch (e) { toast("resolve failed: " + e.message, true); }
   }
 });
-
-document.querySelectorAll("[data-say]").forEach((b) =>
-  b.addEventListener("click", () => {
-    $("chat-input").value = b.dataset.say;
-    $("chat-form").requestSubmit();
-  }));
 
 boot();

@@ -23,7 +23,18 @@
 </header>
 
 <main id="shell">
+  <aside id="sidebar" aria-label="Chat history">
+    <button id="new-chat" class="btn primary block">New chat</button>
+    <div id="conv-list" class="convlist"></div>
+    <div class="sidebar-foot">Chats are saved on the server and survive<br>restarts. Deleting a chat hides it here.</div>
+  </aside>
+
   <section id="agent-pane" aria-label="Agent conversation">
+    <div id="chat-head">
+      <div id="chat-title" title="Double-click to rename">New chat</div>
+      <button id="chat-rename" class="icon-btn" title="Rename chat">rename</button>
+      <span id="chat-state" class="pill muted hidden"></span>
+    </div>
     <div id="chat-log" class="chat-log"></div>
     <form id="chat-form" autocomplete="off">
       <textarea id="chat-input" rows="2"
@@ -31,6 +42,8 @@
       <button id="chat-send" class="btn primary" type="submit">Send</button>
     </form>
   </section>
+
+  <div id="splitter" title="Drag to resize"></div>
 
   <section id="work-pane" aria-label="Workspace">
     <nav id="work-nav">
@@ -42,23 +55,38 @@
     <div id="work-body">
 
       <section id="view-tasks" class="wview active">
-        <div class="grid-2">
-          <div class="card">
-            <div class="card-head">
-              <h2>New analysis</h2>
-              <span class="pill muted">demo engine</span>
-            </div>
 
-            <div class="block">
-              <label class="lbl">Sequencing data location</label>
-              <p class="hint">Tell the agent where your data live. Large sequencing files stay on the server - you describe the location, the agent proposes the input manifest, you confirm or correct it. No per-file hunting.</p>
-              <textarea id="man-desc" rows="2" placeholder="e.g. Sequencing data for case X are under /data/project-x - tumor DNA, matched normal DNA, and RNA-seq."></textarea>
-              <div class="btnrow">
-                <button id="man-propose" class="btn ghost">Propose manifest</button>
-              </div>
-              <div id="manifest-view"></div>
-            </div>
+        <div id="attention" class="attention hidden"></div>
 
+        <div class="card">
+          <div class="card-head">
+            <h2>Before you start</h2>
+            <span class="pill muted">1 - 2 minutes</span>
+          </div>
+          <ul class="journey">
+            <li><b>Know where your data are.</b> You only describe the folder; the agent proposes an input manifest and you confirm or correct it - no per-file hunting.</li>
+            <li><b>Pick a mode.</b> <b>Controlled</b> pauses at each decision point and asks you. <b>Autonomous</b> applies the validated defaults on its own; every choice is recorded for review. Both need one human approval before any execute-class run starts.</li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Prepare an analysis</h2>
+            <span class="pill muted">demo engine</span>
+          </div>
+
+          <div class="block">
+            <label class="lbl">Sequencing data location</label>
+            <p class="hint">Tell us where the data live; we propose the manifest, you confirm it.</p>
+            <textarea id="man-desc" rows="2" placeholder="e.g. Sequencing data for case X are under /data/project-x - tumor DNA, matched normal DNA, and RNA-seq."></textarea>
+            <div class="btnrow">
+              <button id="man-propose" class="btn ghost">Propose manifest</button>
+            </div>
+            <div id="manifest-view"></div>
+          </div>
+
+          <details class="adv" open id="prep-details">
+            <summary>Sample, stages and mode</summary>
             <div class="block">
               <label class="lbl">Sample</label>
               <select id="nj-sample"></select>
@@ -68,44 +96,48 @@
               <div class="mode-row" id="nj-exec-row">
                 <label class="mode-opt">
                   <input type="radio" name="execmode" value="controlled" checked>
-                  <div><b>Controlled</b><span>blocks at decision points and asks you</span></div>
+                  <div><b>Controlled</b><span>pauses at each decision point and asks you</span></div>
                 </label>
                 <label class="mode-opt">
                   <input type="radio" name="execmode" value="autonomous">
-                  <div><b>Autonomous</b><span>validated defaults, every choice recorded</span></div>
+                  <div><b>Autonomous</b><span>validated defaults applied on its own, every choice recorded</span></div>
                 </label>
               </div>
             </div>
+          </details>
 
-            <details class="adv" id="adv-block">
-              <summary>Advanced configuration <span id="adv-count" class="count"></span></summary>
-              <div id="adv-params"></div>
-              <p class="hint">Advanced options map onto real <code>open-neo run</code> flags. The demo engine does not consume them; they are stored with the job for review and reused verbatim when the real gateway is connected.</p>
-            </details>
+          <details class="adv" id="adv-block">
+            <summary>Advanced configuration <span id="adv-count" class="count"></span></summary>
+            <div id="adv-params"></div>
+            <p class="hint">Advanced options map onto real <code>open-neo run</code> flags. The demo engine does not consume them; they are stored with the job for review and reused verbatim when the real gateway is connected.</p>
+          </details>
 
-            <details class="adv">
-              <summary>Demonstration controls</summary>
-              <label class="chk"><input type="checkbox" id="nj-fail"> simulate missing stability tool (demo failure path)</label>
-            </details>
+          <details class="adv">
+            <summary>Demonstration controls</summary>
+            <label class="chk"><input type="checkbox" id="nj-fail"> simulate missing stability tool (demo failure path)</label>
+          </details>
 
-            <div class="btnrow">
-              <button id="nj-submit" class="btn primary">Submit for approval</button>
-              <span class="hint">Execute-class work always requires a human approval click (POL-005), in both modes.</span>
+          <div class="btnrow">
+            <button id="nj-submit" class="btn primary">Submit for approval</button>
+            <span class="hint">Execute-class work always requires a human approval click (POL-005), in both modes.</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Running &amp; recent</h2>
+            <div class="chiprow" id="kind-filter">
+              <button class="chip active" data-kind="">All</button>
+              <button class="chip" data-kind="analysis">Analysis</button>
+              <button class="chip" data-kind="discovery">Discovery</button>
+              <button class="chip" data-kind="diagnostic">Diagnostics</button>
             </div>
           </div>
-
-          <div class="card">
-            <div class="card-head">
-              <h2>Analysis jobs</h2>
-              <div class="chiprow" id="kind-filter">
-                <button class="chip active" data-kind="">All</button>
-                <button class="chip" data-kind="analysis">Analysis</button>
-                <button class="chip" data-kind="discovery">Discovery</button>
-                <button class="chip" data-kind="diagnostic">Diagnostics</button>
-              </div>
-            </div>
-            <div id="job-list" class="joblist"></div>
-          </div>
+          <div id="job-list" class="joblist"></div>
+          <details class="adv" id="history-block">
+            <summary>Task history <span id="history-count" class="count"></span></summary>
+            <div id="history-list" class="joblist"></div>
+          </details>
         </div>
 
         <div id="job-detail" class="drawer hidden"></div>
