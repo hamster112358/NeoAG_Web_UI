@@ -108,7 +108,9 @@ async function boot() {
     renderJobs();
     renderAttention();
     renderResults();
+    renderDiscoveryControls();
     renderDiscovery();
+    renderSkills();
     renderHelp();
     initSplitter();
     connectSSE();
@@ -128,6 +130,7 @@ function connectSSE() {
   es.onopen = () => {
     $("conn-dot").className = "dot on"; $("conn-text").textContent = "live";
     refreshConv(); refreshSidebar(); refreshJobs(); renderAttention();
+    renderResults();
   };
   es.onerror = () => { $("conn-dot").className = "dot off"; $("conn-text").textContent = "reconnecting"; };
   es.onmessage = (m) => {
@@ -139,7 +142,9 @@ function connectSSE() {
     } else if (ev.type === "conversations") refreshSidebar();
     else if (ev.type === "job" || ev.type === "approval") {
       refreshJobs(); renderAttention(); refreshConv();
-    } else if (ev.type === "research") refreshDiscovery();
+    } else if (ev.type === "research" || ev.type === "research_changed") {
+      refreshDiscovery();
+    } else if (ev.type === "skills_changed") refreshSkills();
     else if (ev.type === "manifest") refreshManifests();
     else if (ev.type === "agent_mode") renderAgentBadge();
     else if (ev.type === "records_changed") boot();
@@ -278,13 +283,57 @@ $("chat-title").addEventListener("dblclick", () => {
 });
 
 /* ---------------- chat pane ---------------- */
+function fmtTime(ts) {
+  if (!ts) return "";
+  const d = new Date(ts);
+  return isNaN(d) ? "" : d.toLocaleTimeString([],
+    { hour: "2-digit", minute: "2-digit" });
+}
+const dayKey = (ts) => new Date(ts).toDateString();
+
+/* Tool output arrives as two persisted messages (call + update) with the
+   same tool_call_id; they merge into ONE collapsed entry, and the stored
+   text is RAW (escaped here once) - no more leaked HTML entities. */
+function toolHtml(m) {
+  const meta = m.meta || {};
+  const status = meta.tool_status || "running";
+  const title = meta.tool_title || "tool";
+  const out = meta.tool_output ?? m.text;
+  return `<details class="msg tool toolmsg">
+    <summary><span class="tool-status ${esc(status)}">${
+      status === "completed" ? "done"
+      : status === "failed" ? "failed" : "..."}</span>
+      <b>${esc(title)}</b>
+      <span class="ts">${esc(fmtTime(m.ts))}</span></summary>
+    <pre class="tool-out">${esc(out)}</pre></details>`;
+}
+
 function msgHtml(m) {
   const meta = m.meta || {};
+  if (meta.kind === "tool") return toolHtml(m);
   const badges = (meta.badges || []).map((b) =>
     `<span class="badge">${esc(b)}</span>`).join("");
   return `<div class="msg ${esc(m.role)}">
-    <div class="meta"><span>${esc(m.role)}</span>${badges}</div>
+    <div class="meta"><span>${esc(m.role)}</span>${badges}<span class="ts">${
+      esc(fmtTime(m.ts))}</span></div>
     <div class="body">${esc(m.text)}</div></div>`;
+}
+
+/* final answers deserve more visual weight than tool chatter */
+function mergeToolMsgs(msgs) {
+  const merged = [], idxById = {};
+  for (const m of msgs) {
+    const meta = m.meta || {};
+    if (meta.kind === "tool" && meta.tool_call_id) {
+      if (idxById[meta.tool_call_id] !== undefined) {
+        merged[idxById[meta.tool_call_id]] = m;  // update wins, stays in place
+        continue;
+      }
+      idxById[meta.tool_call_id] = merged.length;
+    }
+    merged.push(m);
+  }
+  return merged;
 }
 
 function gateCardHtml(a) {
@@ -316,13 +365,27 @@ function renderChat() {
     chip.textContent = st === "working" ? "agent working" : "awaiting confirmation";
   } else chip.classList.add("hidden");
 
-  let html = (state.convMsgs || []).map(msgHtml).join("");
+  const merged = mergeToolMsgs(state.convMsgs || []);
+  let lastDay = "";
+  let html = merged.map((m) => {
+    let sep = "";
+    let dk = "";
+    try { dk = dayKey(m.ts); } catch { /* unparseable ts: no separator */ }
+    if (dk && dk !== lastDay) {
+      sep = `<div class="date-sep">${esc(
+        new Date(m.ts).toLocaleDateString([],
+          { year: "numeric", month: "short", day: "numeric" }))}</div>`;
+      lastDay = dk;
+    }
+    return sep + msgHtml(m);
+  }).join("");
   const gateCards = (state.boot?.approvals || []).filter((a) => {
     if (a.state !== "pending" || a.action !== "gate_op") return false;
     try { return JSON.parse(a.detail || "{}").conv_id === state.activeCid; }
     catch { return false; }
   });
   for (const a of gateCards) html += gateCardHtml(a);
+  updateActivity(gateCards.length > 0);
   if (!(state.convMsgs || []).length && !gateCards.length) {
     html += `<div class="emptychat">
       <div class="et">Start a conversation</div>
@@ -335,6 +398,66 @@ function renderChat() {
   const le = $("load-example");
   if (le) le.addEventListener("click", loadExample);
 }
+
+/* B4: activity line right above the composer - what the agent is doing
+   right now, for how long, and a Stop control for the live turn. */
+function currentTurn() {
+  const msgs = state.convMsgs || [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const mt = msgs[i].meta || {};
+    if (mt.turn_state) return { state: mt.turn_state, ts: msgs[i].ts };
+  }
+  return null;
+}
+
+function updateActivity(gatePending) {
+  const bar = $("chat-status"), txt = $("act-text"),
+        el = $("act-elapsed"), stop = $("chat-stop");
+  if (!bar) return;
+  const turn = currentTurn();
+  const working = !!turn && turn.state === "streaming";
+  state.turnWorking = working;
+  state.turnSince = turn && working ? new Date(turn.ts).getTime() : null;
+  let label = "";
+  if (working) {
+    const tools = (state.convMsgs || []).slice(-4).some(
+      (m) => (m.meta || {}).kind === "tool" &&
+             (m.meta || {}).tool_status === "running");
+    label = tools ? "Agent is running a tool..." : "Agent is thinking...";
+  } else if (gatePending || (state.convObj && state.convObj.job_state === "blocked")) {
+    label = "Waiting for your confirmation";
+  } else if (turn) {
+    label = "Last turn: " + turn.state;
+  }
+  if (!label) {
+    bar.classList.add("hidden"); stop.classList.add("hidden");
+    return;
+  }
+  bar.classList.remove("hidden");
+  bar.classList.toggle("working", working);
+  txt.textContent = label;
+  stop.classList.toggle("hidden", !working);
+  tickElapsed();
+}
+
+function tickElapsed() {
+  const el = $("act-elapsed");
+  if (!el || !state.turnSince) { if (el) el.textContent = ""; return; }
+  const s = Math.max(0, Math.floor((Date.now() - state.turnSince) / 1000));
+  el.textContent = s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+}
+setInterval(() => { if (state.turnWorking) tickElapsed(); }, 1000);
+
+$("chat-stop").addEventListener("click", async () => {
+  $("chat-stop").disabled = true;
+  try {
+    const r = await api("POST", "/api/chat/stop",
+                        { conv_id: state.activeCid || "" });
+    toast(r.note || "stop requested");
+    await refreshConv();
+  } catch (e) { toast("stop failed: " + e.message, true); }
+  $("chat-stop").disabled = false;
+});
 
 async function loadExample() {
   try {
@@ -376,6 +499,9 @@ async function refreshJobs() {
     state.boot.jobs = b.jobs; state.boot.approvals = b.approvals;
     state.boot.decisions = b.decisions;
     renderJobs(); renderAttention();
+    // A1: finished runs must appear in Results WITHOUT a page reload -
+    // this was the bug: the Results view was never re-rendered here.
+    renderResults();
   } catch (e) { /* transient */ }
 }
 
@@ -558,7 +684,8 @@ function renderAttention() {
     rows.push(`<div class="at-row">
       <span><b>Decision</b> - ${esc(d.question)}</span>
       <span class="btnrow" style="margin:0">${(d.options || []).map((o) =>
-        `<button class="btn sm" data-dec="${esc(d.id)}" data-choice="${esc(o.id)}">${esc(o.label)}${o.validated ? " (validated)" : ""}</button>`).join("")}</span></div>`);
+        `<button class="btn sm" data-dec="${esc(d.id)}" data-choice="${esc(o.id)}"
+          title="${esc(o.validation_status || "")}">${esc(o.label)}${o.policy_default ? " (policy default)" : ""}</button>`).join("")}</span></div>`);
   }
   if (!rows.length) { host.classList.add("hidden"); host.innerHTML = ""; return; }
   host.classList.remove("hidden");
@@ -613,20 +740,23 @@ document.querySelectorAll("#kind-filter .chip").forEach((c) =>
   }));
 
 async function openJob(id) {
-  let detail;
+  let detail = [], task = null;
   try { detail = await api("GET", `/api/jobs/${id}/events`); }
   catch (e) { toast("cannot open job: " + e.message, true); return; }
+  try { task = await api("GET", `/api/tasks/${id}`); } catch { /* older row */ }
   const job = (state.boot.jobs || []).find((j) => j.id === id);
-  let decisions = [];
-  try { decisions = (await api("GET", `/api/decisions?job_id=${id}`)).decisions; }
-  catch { /* optional */ }
+  const decisions = (task && task.decisions) || [];
   const jobEl = $("job-detail");
   const running = job && job.state === "running";
   jobEl.classList.remove("hidden");
+  const arts = (task && task.artifacts) || [];
+  let snapHtml = `<div class="hint">loading snapshot...</div>`;
   jobEl.innerHTML = `
     <button class="btn sm ghost close" id="jd-close">Close</button>
     <h2>${esc(job ? job.sample_id : id)}</h2>
     <div class="btnrow">${job ? statusPill(job.state) : ""}
+      ${task && task.outcome ? `<span class="pill ${task.outcome === "delivered"
+        ? "ok" : task.outcome ? "warn" : "muted"}">${esc(task.outcome)}</span>` : ""}
       <span class="pill muted">${esc(job ? job.kind : "?")}</span></div>
     <section><h3>Controls</h3><div class="btnrow">
       <button class="btn sm" id="jd-pause" ${running ? "" : "disabled"}>Pause</button>
@@ -639,11 +769,26 @@ async function openJob(id) {
         job.spec.requested_config) || {})
         .map(([k, v]) => `<div class="k">${esc(k)}</div><div>${esc(v)}</div>`).join("") ||
         '<div class="hint">defaults only</div>'}</div></section>
-    <section><h3>Decision history</h3><div class="timeline">${decisions.map((d) => `
+    <section><h3>Output artifacts</h3>
+      ${arts.length ? `<div class="tablewrap"><table class="data">
+        <thead><tr><th>Artifact</th><th>Status</th><th>Rows</th><th>Checksum</th></tr></thead>
+        <tbody>${arts.map((a) => `<tr><td>${esc(a.name)}</td>
+          <td><span class="pill ${a.status === "available" ? "ok"
+            : a.status === "empty" ? "warn" : "danger"}">${esc(a.status)}</span></td>
+          <td>${esc(a.rows ?? "")}</td><td><code>${esc(a.checksum || "")}</code></td></tr>`).join("")}</tbody></table></div>`
+      : '<div class="hint">no artifacts registered (pre-artifact run or nothing generated)</div>'}</section>
+    <section><h3>Decision history (with applied effects)</h3><div class="timeline">${decisions.map((d) => `
       <div class="tl-row"><span class="tl-ts">${esc(d.ts || "")}</span>
-        <span class="tl-kind">${esc(d.decision_type || "")}</span>
-        <span>${esc(d.question || "")} -> <b>${esc(d.chosen || "pending")}</b></span>
+        <span class="tl-kind">${esc(d.key || d.decision_type || "")}</span>
+        <span>${esc(d.question || "")} -> <b>${esc(d.chosen || "pending")}</b>
+        <span class="hint">(${esc(d.decided_by || "")}, ${esc(d.policy_id || "")}${
+          d.policy_version ? " v" + esc(d.policy_version) : ""})</span>
+        ${d.downstream && d.downstream.applied_effect
+          ? `<div class="hint">effect applied: ${esc(
+              JSON.stringify(d.downstream.applied_effect))}</div>` : ""}</span>
       </div>`).join("") || '<div class="hint">no decisions recorded</div>'}</div></section>
+    <section><h3>Immutable run snapshot</h3>
+      <div id="jd-snapshot">${snapHtml}</div></section>
     <section><h3>Live events</h3><div class="logview">${detail.slice(0, 120)
       .map((e) => `${esc(e.ts || "")} ${esc(e.kind || "")} ${esc(e.text || "")}`)
       .join("\n")}</div></section>`;
@@ -652,98 +797,502 @@ async function openJob(id) {
   pc.addEventListener("click", () => api("POST", `/api/jobs/${id}/pause`, {}).then(refreshJobs));
   rc.addEventListener("click", () => api("POST", `/api/jobs/${id}/resume`, {}).then(refreshJobs));
   cc.addEventListener("click", () => api("POST", `/api/jobs/${id}/cancel`, {}).then(refreshJobs));
+  api("GET", `/api/tasks/${id}/snapshot`).then((snap) => {
+    const s = snap.snapshot || {};
+    $("jd-snapshot").innerHTML = `
+      <div class="kv">${Object.entries({ job: s.job_id, engine: s.engine_version,
+        policy: s.policy_version, started: snap.created_at,
+        execution_mode_at_start: s.execution_mode_at_start,
+        dataset: s.dataset_version,
+        seed: s.seed,
+        stage_plan: (s.stage_plan || []).join(", ") })
+        .map(([k, v]) => `<div class="k">${esc(k)}</div><div>${esc(
+          typeof v === "object" ? JSON.stringify(v) : v)}</div>`).join("")}</div>
+      <details class="adv"><summary>full recorded snapshot</summary>
+        <pre class="tool-out">${esc(JSON.stringify(s, null, 1))}</pre></details>
+      <div class="hint">written once when the run started; never updated -
+        later setting/policy/skill changes cannot rewrite this record.</div>`;
+  }).catch(() => {
+    $("jd-snapshot").innerHTML = `<div class="hint">no snapshot recorded for
+      this run (created before the snapshot contract existed)</div>`;
+  });
 }
 
-/* ---------------- results ---------------- */
+/* ---------------- results (rendered from the OUTPUT MANIFEST) --------- */
+const OUTCOME_CLS = { delivered: "ok", zero_candidates: "warn",
+  partial: "warn", generation_failed: "danger", no_artifacts: "danger" };
+
+function candTable(rows) {
+  if (!rows || !rows.length) {
+    return `<div class="mnote"><b>0 rows.</b> An empty candidate table is
+      a legitimate result, not a hidden failure - the artifact above shows
+      status <b>empty</b> and the run outcome reflects it.</div>`;
+  }
+  return `<div class="tablewrap"><table class="data">
+      <thead><tr><th>Rank</th><th>Peptide</th><th>Gene</th><th>HLA</th>
+      <th>Branch</th><th>Score</th><th>Normal hits</th></tr></thead>
+      <tbody>${rows.map((r) => `
+      <tr><td>${esc(r.rank)}</td><td><code>${esc(r.peptide)}</code></td>
+      <td>${esc(r.gene)}</td><td>${esc(r.hla)}</td><td>${esc(r.branch)}</td>
+      <td>${esc(r.mock_combined_score ?? r.combined_score ?? "")}</td>
+      <td>${esc(r.safety_normal_hits ?? "")}</td></tr>`).join("")}</tbody>
+    </table></div>`;
+}
+
 function renderResults() {
   const done = (state.boot.jobs || []).filter((j) => j.state === "completed");
   $("res-job").innerHTML = done.map((j) =>
-    `<option value="${esc(j.id)}">${esc(j.id)} - ${esc(j.sample_id)}</option>`).join("");
+    `<option value="${esc(j.id)}">${esc(j.id)} - ${esc(j.sample_id)}` +
+    `${j.outcome ? " - " + esc(j.outcome) : ""}</option>`).join("");
   if (!done.length) {
-    $("res-meta").innerHTML = `<div class="empty">No completed runs yet.</div>`;
-    $("res-table").innerHTML = "";
+    $("res-outcome").innerHTML = `<div class="empty">No completed runs yet.</div>`;
+    $("res-meta").innerHTML = ""; $("res-table").innerHTML = "";
+    $("res-warnings").innerHTML = ""; $("res-artifacts").innerHTML = "";
+    $("res-strategy").innerHTML = ""; $("res-manifest").innerHTML = "";
     return;
   }
   if (!state.resultsJob || !done.find((j) => j.id === state.resultsJob))
     state.resultsJob = done[0].id;
   $("res-job").value = state.resultsJob;
   api("GET", `/api/results/${state.resultsJob}`).then((res) => {
-    const rel = res.production_release === false
-      ? `<div class="mnote">production release BLOCKED: ${esc(res.release_note || "")}</div>`
-      : "";
-    $("res-meta").innerHTML = rel + `
+    const outcome = res.outcome || "no_artifacts";
+    $("res-outcome").innerHTML = `
+      <div class="outcome ${esc(OUTCOME_CLS[outcome] || "muted")}">
+        <b>${esc(outcome.replace(/_/g, " "))}</b>
+        <div>${esc(res.outcome_note || "")}</div>
+        <div class="hint">${esc(res.delivery_claim || "")}</div>
+      </div>
+      ${res.outcome_drift ? `<div class="mnote warn">${esc(res.outcome_drift)}</div>` : ""}
+      ${res.production_release === false
+        ? `<div class="mnote">production release BLOCKED: ${esc(res.release_note || "")}</div>` : ""}`;
+    $("res-meta").innerHTML = `
       <div class="hint">${esc(res.disclaimer || "")}</div>
       <div class="kv">${Object.entries(res.provenance || {})
         .map(([k, v]) => `<div class="k">${esc(k)}</div><div>${esc(v)}</div>`).join("")}</div>`;
-    const rows = (res.candidates || []).map((r) => `
-      <tr><td>${esc(r.rank)}</td><td><code>${esc(r.peptide)}</code></td>
-      <td>${esc(r.gene)}</td><td>${esc(r.hla)}</td><td>${esc(r.branch)}</td>
-      <td>${esc(r.mock_combined_score)}</td>
-      <td>${esc(r.safety_normal_hits)}</td></tr>`).join("");
-    $("res-table").innerHTML = `<div class="tablewrap"><table class="data">
-      <thead><tr><th>Rank</th><th>Peptide</th><th>Gene</th><th>HLA</th>
-      <th>Branch</th><th>Score</th><th>Normal hits</th></tr></thead>
-      <tbody>${rows}</tbody></table></div>`;
-  }).catch(() => { $("res-table").innerHTML = ""; });
+    $("res-warnings").innerHTML = (res.warnings || []).length
+      ? `<div class="warnlist">${res.warnings.map((w) =>
+          `<div class="mnote warn">warning: ${esc(w)}</div>`).join("")}</div>` : "";
+    const arts = res.artifacts || (res.manifest || {}).artifacts || [];
+    $("res-artifacts").innerHTML = `<h3 class="sec">Output artifacts (${arts.length})</h3>` +
+      (arts.length ? `<div class="tablewrap"><table class="data">
+        <thead><tr><th>Artifact</th><th>Strategy</th><th>Status</th>
+        <th>Rows</th><th>Checksum</th></tr></thead><tbody>${arts.map((a) => `
+          <tr><td>${esc(a.name)}</td><td>${esc(a.strategy || "")}</td>
+          <td><span class="pill ${a.status === "available" ? "ok"
+            : a.status === "empty" ? "warn" : "danger"}">${esc(a.status)}</span></td>
+          <td>${esc(a.rows ?? "")}</td>
+          <td><code>${esc(a.checksum || "")}</code></td></tr>`).join("")}</tbody></table></div>`
+      : `<div class="mnote warn">No artifacts are registered for this run -
+          nothing from it can be described as delivered.</div>`);
+    // A2: every strategy the run produced gets its own table, not one
+    const byS = res.candidates_by_strategy || {};
+    const strategies = Object.keys(byS).length ? Object.keys(byS)
+      : (res.candidates_strategy ? [res.candidates_strategy] : []);
+    if (!state.resultsStrategy || !strategies.includes(state.resultsStrategy))
+      state.resultsStrategy = strategies[0] || null;
+    if (strategies.length) {
+      $("res-strategy").innerHTML = `<div class="row"><label class="lbl">Ranking
+        <select id="res-strategy-sel">${strategies.map((s) => {
+          const a = arts.find((x) => x.strategy === s);
+          return `<option value="${esc(s)}">${esc(s)}${
+            a ? ` (${a.rows} rows, ${a.status})` : ""}</option>`;
+        }).join("")}</select></label></div>`;
+      $("res-strategy-sel").value = state.resultsStrategy;
+      $("res-strategy-sel").addEventListener("change", () => {
+        state.resultsStrategy = $("res-strategy-sel").value;
+        renderResults();
+      });
+      $("res-table").innerHTML = candTable(
+        byS[state.resultsStrategy] || res.candidates || []);
+    } else {
+      $("res-strategy").innerHTML = "";
+      $("res-table").innerHTML = arts.length
+        ? `<div class="mnote">no candidate rows to display</div>` : "";
+    }
+    const man = res.manifest || {};
+    const kv = (o) => Object.entries(o || {}).map(([k, v]) =>
+      `<div class="k">${esc(k)}</div><div>${esc(
+        typeof v === "object" ? JSON.stringify(v) : v)}</div>`).join("");
+    $("res-manifest").innerHTML = `
+      <div class="kv">${kv({ manifest_ref: man.manifest_ref,
+        execution_mode: man.execution_mode,
+        requested_vs_effective_note: man.requested_vs_effective_note,
+        generated_at: man.generated_at, snapshot: man.snapshot })}</div>
+      <h3 class="sec">Requested configuration</h3>
+      <div class="kv">${kv(man.requested_config) || "<div class='hint'>defaults only</div>"}</div>
+      <h3 class="sec">Effective configuration (what this run really applied)</h3>
+      <div class="kv">${kv(man.effective_config)}</div>
+      <h3 class="sec">Versions</h3>
+      <div class="kv">${kv(man.versions)}</div>
+      <h3 class="sec">Decisions this run applied</h3>
+      <div class="timeline">${(man.decisions || []).map((d) => `
+        <div class="tl-row"><span class="tl-kind">${esc(d.key || d.decision_type)}</span>
+        <span>${esc(d.question)} -> <b>${esc(d.chosen || "pending")}</b> (${esc(d.decided_by)}, ${esc(d.policy_id || "")})</span></div>`).join("")
+        || '<div class="hint">none</div>'}</div>`;
+  }).catch((e) => {
+    $("res-outcome").innerHTML = `<div class="mnote warn">results unavailable: ${esc(e.message)}</div>`;
+    $("res-table").innerHTML = "";
+  });
 }
 $("res-job").addEventListener("change", () => {
   state.resultsJob = $("res-job").value;
+  state.resultsStrategy = null;
   renderResults();
 });
 
-/* ---------------- discovery ---------------- */
+/* ---------------- discovery (real retrieval + example fixture) -------- */
+function discoveryTargets() {
+  const d = state.boot?.discovery || {};
+  return ($("res-engine")?.value || "live") === "example"
+    ? (d.example_targets || []) : (d.live_targets || []);
+}
+
+function renderDiscoveryControls() {
+  const scope = $("res-scope").value;
+  const targeted = scope === "targeted";
+  $("res-target-hint").textContent = targeted
+    ? "(one or more; from the configured repository's real stage inventory)"
+    : "- full pipeline review covers every inventoried stage";
+  const box = $("res-targets");
+  box.classList.toggle("off", !targeted);
+  const sel = state.discSel || {};
+  box.innerHTML = discoveryTargets().map((t) => `
+    <label class="stage-row"><input type="checkbox" data-dtarget="${esc(t.id)}"
+      ${sel[t.id] ? "checked" : ""} ${targeted ? "" : "disabled"}>
+      <span>${esc(t.label)}</span>
+      ${t.code_verified ? "" : '<span class="dep">docs-level stage</span>'}
+      ${(t.tools || []).length
+        ? `<span class="dep">uses: ${esc(t.tools.join(", "))}</span>` : ""}
+    </label>`).join("");
+  box.querySelectorAll("[data-dtarget]").forEach((c) =>
+    c.addEventListener("change", () => {
+      state.discSel = state.discSel || {};
+      state.discSel[c.dataset.dtarget] = c.checked;
+    }));
+  $("res-custom").disabled = !targeted;
+}
+
 function renderDiscovery() {
   const list = (state.boot.research || []);
+  const ACTIVE = ["running", "queued"];
   $("res-list").innerHTML = list.length ? list.map((r) => `
     <div class="job-row" data-res="${esc(r.id)}">
       <div class="jr-top"><span class="jr-id">${esc(r.id)}</span>
+        <span class="pill ${r.engine === "live" ? "accent" : "muted"}">${esc(r.engine || "example")}</span>
         <span class="pill muted">${esc(r.scope)}</span>
-        <span class="pill accent">${esc(r.target)}</span>
-        <span class="pill ${r.status === "completed" ? "ok" : "warn"}">${esc(r.status)}</span>
-      </div></div>`).join("")
-    : `<div class="empty">No digests yet.</div>`;
+        <span class="pill ${r.status === "completed" ? "ok"
+          : ACTIVE.includes(r.status) ? "accent" : "warn"}">${esc(r.status)}</span>
+      </div>
+      <div class="jr-meta">${esc(r.target || "")}</div>
+      ${(r.progress && r.progress.note)
+        ? `<div class="jr-meta hint">${esc(r.progress.note)}</div>` : ""}
+    </div>`).join("")
+    : `<div class="empty">No research runs yet.</div>`;
   document.querySelectorAll("[data-res]").forEach((el) =>
     el.addEventListener("click", () => showReport(el.dataset.res)));
-  if (list.length) showReport(list[0].id);
+  if (list.length && !list.some((r) => r.id === state.discOpen))
+    showReport(list[0].id);
+  // keep the view honest while something runs (SSE may be buffered)
+  clearTimeout(renderDiscovery._t);
+  if (list.some((r) => ACTIVE.includes(r.status)))
+    renderDiscovery._t = setTimeout(refreshDiscovery, 2500);
 }
+
+function reportHtmlLive(rep) {
+  const kv = (o) => `<div class="kv">${Object.entries(o || {}).map(([k, v]) =>
+    `<div class="k">${esc(k)}</div><div>${esc(
+      typeof v === "object" ? JSON.stringify(v) : v)}</div>`).join("")}</div>`;
+  const ul = (xs) => `<ul>${(xs || []).map((x) =>
+    `<li>${esc(typeof x === "object" ? JSON.stringify(x) : x)}</li>`).join("")}</ul>`;
+  const rows = (rep.comparison || []).map((c) => `
+    <tr><td><b>${esc(c.tool)}</b></td><td>${esc(c.target || "")}</td>
+    <td>${esc(c.verified_version || "Not verified")}</td>
+    <td>${esc(c.license || "Not verified")}</td>
+    <td>${esc(c.maintenance || "Not verified")}</td>
+    <td>${esc(c.benchmark_evidence || "")}</td>
+    <td>${esc(c.independently_validated || "")}</td>
+    <td class="hint">${esc(c.evidence_gaps || "")}</td></tr>`).join("");
+  const cits = (rep.literature_citations || []).slice(0, 30).map((c) => `
+    <li><b>${esc(c.title || "")}</b> ${esc(c.year || "")} - ${esc(c.source || "")}
+    ${c.url ? esc(c.url) : esc(c.id || "")}</li>`).join("");
+  const prov = rep.provenance || {};
+  return `<div class="card">
+    <div class="mnote">${esc(rep.disclaimer)}</div>
+    <h3 class="sec">Executive summary</h3>${ul(rep.executive_summary)}
+    <h3 class="sec">Code-grounded inventory</h3>
+    ${kv({ repo: rep.inventory?.repo, git_commit: rep.inventory?.git_commit,
+      code_verified: rep.inventory?.code_verified,
+      stages: rep.inventory?.n_stages, captured_at: rep.inventory?.captured_at })}
+    <h3 class="sec">Candidate comparison (registry-verified fields; "Not
+      verified" = could not be confirmed - never guessed)</h3>
+    <div class="tablewrap"><table class="data">
+      <thead><tr><th>Tool</th><th>Target</th><th>Version</th><th>License</th>
+      <th>Maintenance</th><th>Benchmark evidence</th>
+      <th>Independent validation</th><th>Evidence gaps</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    <h3 class="sec">Literature citations (${(rep.literature_citations || []).length}, abstract level)</h3>
+    <ul>${cits || "<li>none retrieved</li>"}</ul>
+    <h3 class="sec">Licenses seen</h3>${ul(rep.license_constraints)}
+    <h3 class="sec">Task metrics (never rank across incomparable metrics)</h3>
+    ${ul((Object.entries(rep.recommended_benchmarks || {})
+      .map(([t, b]) => `${t}: ${(b.metrics || []).join("; ")}${
+        b.warning ? " - WARNING: " + b.warning : ""}`)))}
+    <h3 class="sec">Open questions</h3>${ul(rep.open_questions)}
+    <h3 class="sec">Methodology</h3><p class="hint">${esc(rep.methodology || "")}</p>
+    <h3 class="sec">Limitations</h3>${ul(rep.limitations)}
+    <details class="adv"><summary>Full provenance (query log, counts,
+      exclusions, failures)</summary>
+      ${kv({ sources_consulted: prov.sources_consulted,
+        query_counts: prov.query_counts, dedup_removed: prov.dedup_removed,
+        exclusions: prov.exclusions, selection_criteria: prov.selection_criteria,
+        failures: prov.failures })}
+      <p class="hint">queries persisted: ${(prov.queries || []).length}</p>
+      <ul>${(prov.queries || []).slice(0, 40).map((q) =>
+        `<li class="hint">${esc(JSON.stringify(q))}</li>`).join("")}</ul>
+    </details>
+  </div>`;
+}
+
+function reportHtmlExample(rep) {
+  const rows = (rep.comparison || []).map((c) => `
+    <tr><td><b>${esc(c.tool)}</b> ${esc(c.version || "")}</td>
+    <td>${esc(c.availability_class)}</td><td>${esc(c.license)}</td>
+    <td>${esc(c.evidence_quality)}</td>
+    <td>${esc(c.accuracy_example || "")}</td>
+    <td>${c.independently_benchmarked ? "YES" : "no"}</td>
+    <td>${esc(c.notes || "")}</td></tr>`).join("");
+  return `<div class="card">
+    <div class="mnote warn">${esc(rep.disclaimer)}</div>
+    <div class="tablewrap"><table class="data">
+      <thead><tr><th>Tool</th><th>Availability</th><th>License</th>
+      <th>Evidence</th><th>Example figures</th><th>Independently benchmarked</th>
+      <th>Notes</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <p class="hint">${esc(rep.recommendation.verdict)}</p>
+    <p class="hint">Pre-adoption experiments: ${esc(rep.recommendation.experiments_before_adoption.join(" | "))}</p>
+    </div>`;
+}
+
 async function showReport(id) {
+  state.discOpen = id;
   try {
     const r = await api("GET", `/api/research/${id}`);
-    if (!r.report) { $("res-report").innerHTML = ""; return; }
-    const rep = r.report;
-    const rows = (rep.comparison || []).map((c) => `
-      <tr><td><b>${esc(c.tool)}</b> ${esc(c.version || "")}</td>
-      <td>${esc(c.availability_class)}</td><td>${esc(c.license)}</td>
-      <td>${esc(c.evidence_quality)}</td>
-      <td>${esc(c.accuracy_example || "")}</td>
-      <td>${c.independently_benchmarked ? "YES" : "no"}</td>
-      <td>${esc(c.notes || "")}</td></tr>`).join("");
-    $("res-report").innerHTML = `<div class="card">
-      <div class="mnote">${esc(rep.disclaimer)}</div>
-      <div class="tablewrap"><table class="data">
-        <thead><tr><th>Tool</th><th>Availability</th><th>License</th>
-        <th>Evidence</th><th>Example figures</th><th>Independently benchmarked</th>
-        <th>Notes</th></tr></thead><tbody>${rows}</tbody></table></div>
-      <p class="hint">${esc(rep.recommendation.verdict)}</p>
-      <p class="hint">Pre-adoption experiments: ${esc(rep.recommendation.experiments_before_adoption.join(" | "))}</p>
+    if (!r.report) {
+      const prog = r.progress || {};
+      $("res-report").innerHTML = `<div class="card">
+        <div class="jr-top"><span class="jr-id">${esc(r.id)}</span>
+        <span class="pill accent">${esc(r.status)}</span></div>
+        ${r.progress?.steps?.length ? `<ul>${r.progress.steps.map((s) =>
+          `<li class="hint">${esc(s)}</li>`).join("")}</ul>`
+          : `<p class="hint">no persisted progress yet</p>`}
+        ${["running", "queued"].includes(r.status)
+          ? `<div class="btnrow"><button class="btn danger sm" id="rep-cancel">Cancel run</button>
+             <span class="hint">stops after the current query; progress is kept</span></div>` : ""}
+        ${["incomplete", "failed", "cancelled"].includes(r.status)
+          ? `<div class="btnrow"><button class="btn sm" id="rep-resume">Resume (persisted queries skipped)</button></div>` : ""}
+        ${["incomplete", "failed"].includes(r.status)
+          ? `<div class="mnote warn">This run did not finish; nothing here
+             is a complete review. Resume or accept the partial result.</div>` : ""}
       </div>`;
+      const cb = $("rep-cancel");
+      if (cb) cb.addEventListener("click", async () => {
+        try { await api("POST", `/api/research/${id}/cancel`, {}); refreshDiscovery(); }
+        catch (e) { toast("cancel failed: " + e.message, true); } });
+      const rb = $("rep-resume");
+      if (rb) rb.addEventListener("click", async () => {
+        try { await api("POST", `/api/research/${id}/resume`, {}); refreshDiscovery(); }
+        catch (e) { toast("resume failed: " + e.message, true); } });
+      return;
+    }
+    const rep = r.report;
+    const isLive = (rep.engine || "").includes("live") ||
+      !!rep.inventory;
+    $("res-report").innerHTML = (isLive ? reportHtmlLive : reportHtmlExample)(rep);
   } catch (e) { toast("report failed: " + e.message, true); }
 }
+
 $("res-run").addEventListener("click", async () => {
-  const scope = $("res-scope").value, target = $("res-target").value;
+  const scope = $("res-scope").value;
+  const engine = $("res-engine").value;
+  const targets = [...document.querySelectorAll("[data-dtarget]:checked")]
+    .map((c) => c.dataset.dtarget);
+  const custom = $("res-custom").value.trim()
+    ? $("res-custom").value.trim().split(/\s*,\s*/) : [];
+  if (scope === "targeted" && !targets.length && !custom.length) {
+    toast("pick at least one target (or a custom one) for a targeted review", true);
+    return;
+  }
   try {
-    const r = await api("POST", "/api/research", { scope, target });
-    toast(`digest ${r.research_id} started`);
+    const r = await api("POST", "/api/research",
+                        { scope, engine, targets, custom });
+    toast(`${engine} research ${r.research_id} started` +
+      (r.unknown_targets?.length
+        ? ` - ignored unknown targets: ${r.unknown_targets.join(", ")}` : ""));
+    state.discOpen = r.research_id;
+    $("res-custom").value = "";
     await refreshDiscovery();
-  } catch (e) { toast("research failed: " + e.message, true); }
+  } catch (e) {
+    toast("research failed: " + (e.data?.error || e.message), true);
+  }
 });
+$("res-scope").addEventListener("change", renderDiscoveryControls);
+$("res-engine").addEventListener("change", () => {
+  state.discSel = {};
+  renderDiscoveryControls();
+});
+
 async function refreshDiscovery() {
   try {
     const b = await api("GET", "/api/bootstrap");
     state.boot.research = b.research;
     renderDiscovery();
+    if (state.discOpen) showReport(state.discOpen);
   } catch (e) { /* transient */ }
 }
+
+/* ---------------- skills (advisory instructions, PART C) -------------- */
+function renderSkills() {
+  const skills = state.boot.skills || [];
+  const cats = {};
+  for (const s of skills) (cats[s.category] = cats[s.category] || []).push(s);
+  $("skill-list").innerHTML = Object.entries(cats).map(([cat, rows]) => `
+    <h3 class="sec">${esc(cat)}</h3>
+    ${rows.map((s) => `
+    <div class="job-row skill-row" data-skill="${esc(s.slug)}">
+      <div class="jr-top">
+        <span class="jr-id">${esc(s.title || s.slug)}</span>
+        <span class="pill muted">v${esc(s.version)}</span>
+        <span class="pill ${s.enabled ? "ok" : "muted"}">${s.enabled ? "enabled" : "disabled"}</span>
+        <span class="pill ${s.active_in_new_sessions ? "accent" : "warn"}">${
+          s.active_in_new_sessions ? "deployed - new sessions"
+          : "not deployed (current version)"}</span>
+      </div>
+      <div class="jr-meta hint">slug ${esc(s.slug)} · deployed v${esc(
+        s.deployed_version ?? "never")}${s.deployed_at ? " @ " + esc(s.deployed_at) : ""}</div>
+      <div class="btnrow">
+        <button class="btn sm" data-sedit="${esc(s.slug)}">Edit</button>
+        <button class="btn sm" data-svers="${esc(s.slug)}">Versions</button>
+        <button class="btn sm" data-stest="${esc(s.slug)}">Test</button>
+        <button class="btn sm" data-sdep="${esc(s.slug)}">Deploy</button>
+        <button class="btn sm ${s.enabled ? "danger" : ""}" data-stog="${esc(s.slug)}"
+          data-on="${s.enabled ? "0" : "1"}">${s.enabled ? "Disable" : "Enable"}</button>
+      </div>
+      <div class="skill-versions hidden" id="sv-${esc(s.slug)}"></div>
+      <div class="hint" id="st-${esc(s.slug)}"></div>
+    </div>`).join("")}`).join("") ||
+    `<div class="empty">No skills yet.</div>`;
+  const on = (attr, fn) => document.querySelectorAll(`[data-${attr}]`)
+    .forEach((el) => el.addEventListener("click", (ev) => {
+      ev.stopPropagation(); fn(el); }));
+  on("sedit", (el) => openSkillEditor(el.dataset.sedit));
+  on("stog", async (el) => {
+    try {
+      await api("POST", `/api/skills/${el.dataset.stog}/` +
+        (el.dataset.on === "1" ? "enable" : "disable"), {});
+      await refreshSkills();
+    } catch (e) { toast("toggle failed: " + e.message, true); }
+  });
+  on("sdep", async (el) => {
+    try {
+      const r = await api("POST", `/api/skills/${el.dataset.sdep}/deploy`, {});
+      toast(`${el.dataset.sdep}: ` +
+        (r.results || []).map((x) => x.state).join(", "));
+      $("skill-deploy-note").textContent = r.activation_note || "";
+      await refreshSkills();
+    } catch (e) { toast("deploy failed: " + e.message, true); }
+  });
+  on("stest", async (el) => {
+    try {
+      const r = await api("POST", `/api/skills/${el.dataset.stest}/test`, {});
+      const host = $(`st-${el.dataset.stest}`);
+      host.classList.remove("hidden");
+      host.textContent = (r.valid ? "valid. " : "INVALID: " + r.errors.join("; ") + ". ") + r.note;
+    } catch (e) { toast("test failed: " + e.message, true); }
+  });
+  on("svers", async (el) => {
+    const host = $(`sv-${el.dataset.svers}`);
+    if (!host.classList.contains("hidden")) { host.classList.add("hidden"); return; }
+    try {
+      const d = await api("GET", `/api/skills/${el.dataset.svers}/versions`);
+      host.innerHTML = (d.versions || []).map((v) => `
+        <div class="tl-row"><span class="tl-ts">${esc(v.created_at || "")}</span>
+        <span>v${esc(v.version)} - ${esc(v.source || "")}</span>
+        <button class="btn sm ghost" data-srestore="${esc(el.dataset.svers)}"
+          data-ver="${esc(v.version)}">restore</button></div>`).join("");
+      host.classList.remove("hidden");
+      host.querySelectorAll("[data-srestore]").forEach((b) =>
+        b.addEventListener("click", async () => {
+          try {
+            await api("POST", `/api/skills/${b.dataset.srestore}/restore`,
+                      { version: parseInt(b.dataset.ver, 10) });
+            toast(`restored v${b.dataset.ver} (saved as a NEW version)`);
+            await refreshSkills();
+          } catch (e) { toast("restore failed: " + e.message, true); }
+        }));
+    } catch (e) { toast("versions failed: " + e.message, true); }
+  });
+}
+
+async function refreshSkills() {
+  try {
+    const d = await api("GET", "/api/skills");
+    state.boot.skills = d.skills; state.boot.skillCategories = d.categories;
+    renderSkills();
+  } catch (e) { /* transient */ }
+}
+
+function openSkillEditor(slug) {
+  const host = $("skill-editor");
+  const fill = async (s) => {
+    const cats = state.boot.skillCategories || [];
+    host.innerHTML = `<div class="card">
+      <div class="card-head"><h2>${s ? "Edit skill" : "New skill"}</h2></div>
+      <label class="lbl">Slug ${s ? "" : "(lowercase, dash-separated)"}</label>
+      <input id="sk-slug" value="${esc(s ? s.slug : "")}" ${s ? "disabled" : ""}>
+      <label class="lbl">Title</label>
+      <input id="sk-title" value="${esc(s ? s.title : "")}">
+      <label class="lbl">Category</label>
+      <select id="sk-cat">${cats.map((c) =>
+        `<option ${s && s.category === c ? "selected" : ""}>${esc(c)}</option>`).join("")}</select>
+      <label class="lbl">Content (SKILL.md - frontmatter required: --- name/description ---)</label>
+      <textarea id="sk-body" rows="14" spellcheck="false">${esc(s ? s.content :
+        "---\nname: my-skill\ndescription: one line about when this skill applies\n---\n\n# My skill\n\nWhat the agent should know or do.\n")}</textarea>
+      <div class="btnrow">
+        <button class="btn primary sm" id="sk-save">Save</button>
+        <button class="btn ghost sm" id="sk-cancel">Cancel</button>
+        <span class="hint">saving does NOT deploy; deploy explicitly. Skills are
+        advisory - the gate and policies stay enforced regardless.</span>
+      </div>
+      <div id="sk-err" class="hint"></div></div>`;
+    $("sk-cancel").addEventListener("click", () => host.innerHTML = "");
+    $("sk-save").addEventListener("click", async () => {
+      const body = { slug: $("sk-slug").value.trim(),
+                     title: $("sk-title").value.trim(),
+                     category: $("sk-cat").value,
+                     content: $("sk-body").value };
+      try {
+        if (s) await api("POST", `/api/skills/${s.slug}/update`, body);
+        else await api("POST", "/api/skills", body);
+        host.innerHTML = "";
+        toast("saved (new version recorded)");
+        await refreshSkills();
+      } catch (e) {
+        $("sk-err").textContent = (e.data?.errors || [e.data?.error || e.message]).join("; ");
+      }
+    });
+  };
+  if (!slug) return fill(null);
+  api("GET", `/api/skills/${slug}`).then(fill)
+    .catch((e) => toast("cannot load skill: " + e.message, true));
+}
+$("skill-new").addEventListener("click", () => openSkillEditor(null));
+$("skill-deploy").addEventListener("click", async () => {
+  try {
+    const r = await api("POST", "/api/skills/deploy", {});
+    $("skill-deploy-note").textContent = r.activation_note || "";
+    toast((r.results || []).map((x) => `${x.slug}: ${x.state}`).join(" | "));
+    await refreshSkills();
+  } catch (e) { toast("deploy failed: " + e.message, true); }
+});
 
 /* ---------------- help ---------------- */
 function renderHelp() {

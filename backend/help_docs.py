@@ -113,6 +113,27 @@ is a technically reliable layer outside the model:
   mistakes, misread instructions, ambiguous requests), not a
   deliberately hostile process.
 
+## Task queries from the agent
+
+The chat agent (and any helper script in its workspace) can query
+this workspace's own backend through an official read-only task API
+instead of poking at databases or writing ad-hoc SQL:
+
+- `GET /api/tasks`, `GET /api/tasks/active?conv_id=...`,
+  `GET /api/tasks/<id>`, `GET /api/tasks/<id>/snapshot`,
+  `GET /api/research` + `/events` - job summaries, live status, full
+  task detail (decisions, artifacts, outcome), and the immutable
+  run snapshot.
+- Authenticated with a per-install token
+  (`X-NeoAG-Task-Token` header, file deployed into the agent
+  workspace at startup). The token is scoped to GET on task-query
+  routes only - it cannot read the bootstrap or conversations, and
+  cannot POST anything. Human UI traffic keeps using Basic auth.
+- When several of the operator's conversations could own a task the
+  agent is asking about, `/api/tasks/active` answers per conversation
+  and never guesses "most recent" across them; a missing conv_id
+  honestly returns nothing.
+
 ## Documented limits (do not assume otherwise)
 
 - **One in-flight exchange per chat.** While the agent is answering,
@@ -186,10 +207,13 @@ An approval unlocks exactly that one operation, once.
 
 ## Demo mode
 
-This build runs in demonstration mode: every job is executed by a
-mock engine on synthetic data, clearly badged. No patient data, no real
-pipeline, no network calls. The badge in the header (Demo mode) is the
-single indicator - it is never repeated inside the conversation.
+This build runs in demonstration mode: every analysis job is executed
+by a mock engine on synthetic data, clearly badged. No patient data
+and no real pipeline execution. The one thing that is genuinely real
+is the SOTA Discovery live engine (real public-source retrieval, see
+its section) and, when switched on in Settings, the real CodeBuddy
+chat agent. The badge in the header (Demo mode) is the single
+indicator - it is never repeated inside the conversation.
 
 ## Starting an analysis
 
@@ -203,25 +227,100 @@ single indicator - it is never repeated inside the conversation.
    without a human click, in either mode.
 5. Follow progress in the job view; controlled mode pauses at decision
    points (input mapping, parameter gates, ranking outputs) and asks
-   you; autonomous mode resolves them with validated defaults and
-   records every choice in Decision History.
+   you; autonomous mode resolves them with the policy default of each
+   decision and records every choice - including which policy applied
+   and each option's honest validation status (policy defaults are
+   documented defaults, not scientifically validated ones).
 
 ## Reading results
 
-Completed jobs expose candidate tables, evidence columns and a
-provenance block (job id, seed, engine, dataset version). A skipped
-essential stage forces production_release=false - the run never
-pretends to be production-grade.
+Every formal run writes an output-artifact manifest, and the Results
+panel reads the artifacts back from live storage - it never trusts a
+cached copy. Each run carries an outcome you can rely on:
+
+- delivered - the requested artifacts exist and can be opened;
+- zero candidates - the run completed honestly with an empty table;
+- partial - some requested artifact is missing or empty;
+- failed generation - the stage that should have produced output
+  failed;
+- no artifacts - nothing was produced at all.
+
+A completed job's lifecycle state and its delivery outcome are
+different things: a run can complete and still be not deliverable,
+and the UI says so instead of showing an empty table as success. If
+artifacts change after registration (deleted, replaced), Results
+detects the drift and downgrades the outcome with a note.
+
+When a run was asked for both ranking outputs, Results shows both
+tables (a strategy switcher), and your decision is visible: the
+effective configuration shows the gate value or ranking set actually
+applied, with a warning when a decision overrode the policy default.
+Task detail also exposes the immutable run snapshot: engine version,
+policy version, dataset version, seed, stage plan and requested
+config exactly as they were at start - written once, never updated.
+
+A skipped essential stage forces production_release=false - the run
+never pretends to be production-grade.
 
 ## Two execution modes
 
 - Controlled: the run blocks at each decision point and asks.
-- Autonomous: validated defaults are applied automatically, each
-  recorded; bounded recovery means exactly one retry, then an honest
-  stop with a reason.
+- Autonomous: each decision's policy default is applied automatically
+  and recorded with its policy id/version and validation status;
+  bounded recovery means exactly one retry, then an honest stop with
+  a reason.
 
 Both modes share the same validity gates and the same decision
-records.
+records, and in both modes your choices genuinely change the outputs:
+choosing weighted-only produces exactly one artifact; choosing both
+produces two; relaxing the stability gate changes which candidates
+pass and is recorded as a warning on the run.
+
+## Chat controls
+
+- While the agent works you see what it is doing: a working indicator
+  with elapsed time next to the composer, and a Stop button that
+  cancels the running turn honestly (if nothing is running it says
+  so instead of pretending).
+- Tool calls appear as collapsed lines (running / result status and
+  title); click to see the raw output. Final answers stay prominent.
+- Messages carry timestamps with date separators between days.
+
+## Skills
+
+The Skills tab manages reusable agent instructions in three starting
+categories: NeoAG Operation, NeoAG Web Awareness, and Scientific
+Evidence & Research. You can read, create, edit, enable/disable, and
+inspect version history (any version restorable) for each skill.
+
+Two honest limits:
+
+- Activation is per session: a deployed skill applies to NEW agent
+  sessions only; each skill shows whether its current saved version
+  is the deployed one, so you always know whether a change is live.
+- Skills are advisory text for the agent. They can never change
+  security gates, execution policies, or thresholds - those are
+  enforced outside the model and are not editable through skills.
+
+## SOTA Discovery
+
+The Discovery panel researches tools/evidence for pipeline stages.
+Two engines, clearly labelled:
+
+- Live engine (default): genuine retrieval from public sources
+  (Europe PMC, PubMed, OpenAlex, GitHub, bio.tools, PyPI - no
+  credentials). Every report persists its provenance: the exact
+  queries, hit counts, dedup, exclusions with reasons, and failed
+  sources. Facts that could not be verified are marked "Not
+  verified" - never guessed. If retrieval fails the run reports
+  honestly incomplete results, never fabricated numbers.
+- Example engine: a fixed offline fixture for UI testing, badged as
+  an example on every screen. It never appears inside live reports.
+
+Scope can be a full pipeline review or targeted stages (multiple
+targets plus a free-text custom target). Research jobs are durable:
+progress steps, cancel, and resume after a restart are all real
+operations on the same backend workflow a chat request uses.
 """
 
 

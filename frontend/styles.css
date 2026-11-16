@@ -424,3 +424,60 @@ table.data tr:hover td { background: var(--surface-2); }
   .sidebar-foot, #splitter { display: none; }
   #agent-pane { border-right: none; border-bottom: 1px solid var(--border); }
 }
+
+/* ---------------- Milestone 4: results / chat / discovery / skills ---- */
+
+/* per-run outcome banner - the delivery claim a run may make is bounded
+   by what the artifact table really contains */
+.outcome { border: 1px solid var(--border); border-left: 4px solid var(--text-3);
+  border-radius: var(--r-sm); padding: 9px 11px; margin: 4px 0 10px; font-size: 13px; }
+.outcome.ok { border-left-color: var(--ok); background: var(--ok-soft); }
+.outcome.warn { border-left-color: var(--warn); background: var(--warn-soft); }
+.outcome.danger { border-left-color: var(--danger); background: var(--danger-soft); }
+.outcome b { text-transform: uppercase; font-size: 11.5px; letter-spacing: .04em; }
+.mnote.warn { color: var(--danger); background: var(--danger-soft); }
+.warnlist { margin-bottom: 10px; }
+.warnlist .mnote { margin-bottom: 5px; }
+.sec { font-size: 13.5px; margin: 16px 0 6px; }
+
+/* chat: timestamps, date separators, collapsed tool output */
+.msg .meta .ts { color: var(--text-3); font-size: 10.5px; font-family: var(--mono); margin-left: auto; }
+.msg .meta { display: flex; gap: 6px; align-items: baseline; }
+.date-sep { text-align: center; color: var(--text-3); font-size: 11px;
+  margin: 14px 0 8px; letter-spacing: .04em; }
+details.toolmsg { border: 1px solid var(--border); background: var(--surface-2);
+  border-radius: var(--r-sm); padding: 0; margin: 6px 0; }
+details.toolmsg > summary { cursor: pointer; list-style: none; padding: 6px 10px;
+  font-size: 12px; color: var(--text-2); display: flex; gap: 8px; align-items: center; }
+details.toolmsg > summary::-webkit-details-marker { display: none; }
+details.toolmsg > summary::before { content: "+"; font-family: var(--mono); color: var(--text-3); }
+details.toolmsg[open] > summary::before { content: "-"; }
+details.toolmsg .tool-out { margin: 0; padding: 9px 11px; border-top: 1px solid var(--border);
+  font-family: var(--mono); font-size: 11.5px; white-space: pre-wrap; word-break: break-word;
+  max-height: 280px; overflow: auto; color: var(--text-2); }
+.tool-status { font: 600 10px var(--mono); text-transform: uppercase; padding: 1px 6px;
+  border-radius: 999px; border: 1px solid var(--border); }
+.tool-status.completed { color: var(--ok); background: var(--ok-soft); }
+.tool-status.running { color: var(--accent); background: var(--accent-soft); }
+.tool-status.failed { color: var(--danger); background: var(--danger-soft); }
+
+/* activity line above the composer */
+.chat-status { display: flex; align-items: center; gap: 8px; font-size: 12px;
+  color: var(--text-2); padding: 5px 10px; border-top: 1px solid var(--border);
+  background: var(--surface-2); }
+.chat-status .act-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-3); }
+.chat-status.working .act-dot { background: var(--accent); animation: pulse 1.1s infinite; }
+.chat-status .act-elapsed { font-family: var(--mono); color: var(--text-3); font-size: 11px; }
+.chat-status #chat-stop { margin-left: auto; }
+@keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
+
+/* discovery: target picker + report */
+#res-targets.off { opacity: .45; pointer-events: none; }
+.report-h { font-size: 13.5px; font-weight: 700; margin: 15px 0 6px; }
+
+/* skills tab */
+.skill-row { display: block; }
+.skill-versions { margin-top: 8px; border-top: 1px dashed var(--border); padding-top: 6px; }
+#skill-editor textarea, #skill-editor input, #skill-editor select {
+  width: 100%; font-family: var(--mono); font-size: 12px; }
+#skill-editor textarea { min-height: 260px; }

@@ -34,11 +34,14 @@ with open(AUTH_PATH) as f:
 AUTH_HEADER = "Basic " + base64.b64encode(
     f"{_a['user']}:{_a['password']}".encode()).decode()
 
-# ---------- isolated server (fresh db, own port) ----------
+# ---------- isolated server (fresh db, own port, throwaway deploy dirs
+# so the live agent workspace's skills + task token are never touched) ----------
 _srv = subprocess.Popen(
     [sys.executable, "-u", "-m", "backend.server"], cwd=str(ROOT),
     env=dict(os.environ, NEOAG_DEMO_DB="batterytest.sqlite3",
-             NEOAG_DEMO_PORT=str(PORT)),
+             NEOAG_DEMO_PORT=str(PORT),
+             NEOAG_SKILLS_DIR="/tmp/neoag-battery-skills",
+             NEOAG_TASKQ_DIR="/tmp/neoag-battery-taskq"),
     stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
 
@@ -52,6 +55,9 @@ def _cleanup():
         (ROOT / "data" / "batterytest.sqlite3").unlink()
     except OSError:
         pass
+    import shutil as _sh
+    for _d in ("/tmp/neoag-battery-skills", "/tmp/neoag-battery-taskq"):
+        _sh.rmtree(_d, ignore_errors=True)
 
 
 atexit.register(_cleanup)
@@ -243,11 +249,14 @@ check("14 autonomous result release=true + mode recorded",
 # ---------- 4 mode switch at stage boundary ----------
 jid3, aid3 = submit("DEMO-P003", "controlled")
 approve(aid3)
+# deterministically reach the first blocked decision BEFORE requesting the
+# switch (requesting earlier raced with stage startup and let the engine
+# auto-resolve everything); the switch then applies at the NEXT boundary
+j3, b3 = wait_state(jid3, ["blocked"])
 call(f"/api/jobs/{jid3}/mode", {"mode": "autonomous"})
 # the job is blocked at the input_qc decision created before the switch
 # request - the user still answers it; the switch then applies at the next
 # stage boundary and every later decision is engine-resolved
-j3, b3 = wait_state(jid3, ["blocked"])
 p3 = [d for d in b3["decisions"] if d["job_id"] == jid3 and d["status"] == "pending"]
 resolve(p3[0]["id"], p3[0]["options"][0]["id"])
 j3, b3 = wait_state(jid3, ["completed"])
@@ -325,8 +334,10 @@ check("23 pending decision cancelled not silent",
       all(d["status"] == "cancelled" for d in pend6 if d["status"] != "resolved"),
       str([(d["decision_type"], d["status"]) for d in pend6]))
 
-# ---------- 8 research digests ----------
-st, r = call("/api/research", {"scope": "full", "target": "presentation"})
+# ---------- 8 research digests (EXPLICIT example engine: the testing
+# fixture; live retrieval has its own real-network verification script) ----
+st, r = call("/api/research", {"scope": "full", "target": "presentation",
+                               "engine": "example"})
 assert st == 202
 rid = r["research_id"]
 t0 = time.time()
@@ -346,7 +357,8 @@ check("26 full digest covers 4 targets", rep and len(rep["comparison"]) == 11,
 check("27 recommendation + experiments", rep and
       "No replacement recommended" in rep["recommendation"]["verdict"] and
       len(rep["recommendation"]["experiments_before_adoption"]) == 5)
-st, r = call("/api/research", {"scope": "targeted", "target": "stability"})
+st, r = call("/api/research", {"scope": "targeted", "target": "stability",
+                               "engine": "example"})
 rid2 = r["research_id"]
 t0 = time.time()
 rep2 = None
@@ -728,6 +740,178 @@ check("68 frontend reaches terminal WITHOUT SSE: watchdog + reopen catch-up",
       "refreshConv(); refreshSidebar(); refreshJobs()" in _appjs)
 del os.environ["NEOAG_DEMO_DB"]
 shutil.rmtree(_udb, ignore_errors=True)
+
+# ---------- 69-78 Milestone-4 workflow reliability contract (F2) -------
+# A completed run is IMMEDIATELY queryable through the official task API
+# with its output-artifact manifest - the bug fixed here was Results
+# staying empty until a full page reload (frontend) and results being a
+# stored claim rather than the live artifact table (backend).
+jid_f, aid_f = submit("DEMO-P004", "autonomous")
+approve(aid_f)
+jf, _ = wait_state(jid_f, ["completed"])
+_, res_f = call("/api/results/" + jid_f)
+_, t_f = call("/api/tasks/" + jid_f)
+check("69 auto-results: completed job carries outcome + artifact manifest",
+      jf.get("outcome") in ("delivered", "zero_candidates", "partial") and
+      len(res_f.get("artifacts", [])) == 2,
+      str(jf.get("outcome")) + " arts=" + str(len(res_f.get("artifacts", []))))
+check("70 both-ranking choice really produces BOTH tables",
+      set(res_f.get("candidates_by_strategy", {})) ==
+      {"weighted", "evidence-consensus"})
+_man = res_f.get("manifest", {})
+check("71 requested+effective config, versions and snapshot ref recorded",
+      _man.get("effective_config", {}).get("stability_max_rank") == 1.4 and
+      _man.get("versions", {}).get("engine", "").startswith("mock-job-engine")
+      and "run_snapshots" in str(_man.get("snapshot")))
+# A2 E2E: choosing "weighted" in a controlled run changes the artifacts
+jid_w, aid_w = submit("DEMO-P004", "controlled")
+approve(aid_w)
+for _choice, _pick in (("matched", lambda d: d["key"] == "input.rna_pair"),
+                       ("gate14", lambda d: d["key"] == "presentation.stability_gate"),
+                       ("weighted", lambda d: d["key"] == "ranking.outputs")):
+    jj, bb = wait_state(jid_w, ["blocked"])
+    pd = [d for d in bb["decisions"] if d["job_id"] == jid_w and
+          d["status"] == "pending" and _pick(d)]
+    if pd:
+        resolve(pd[0]["id"], _choice)
+    if jj["state"] != "blocked":
+        break
+    wait_unblocked(jid_w)
+_, res_w = wait_state(jid_w, ["completed"])
+_, res_wres = call("/api/results/" + jid_w)
+check("72 ranking decision genuinely changes outputs (weighted-only = 1 artifact)",
+      len(res_wres.get("artifacts", [])) == 1 and
+      set(res_wres.get("candidates_by_strategy", {})) == {"weighted"},
+      str([(a["strategy"], a["status"])
+           for a in res_wres.get("artifacts", [])]))
+# A2 E2B: the section-2 run overrode the gate to 2.0 - the EFFECT must
+# be visible in the effective config and the warnings (not silently ignored)
+_, res_g = call("/api/results/" + jid)
+check("73 gate override visible: effective config 2.0 + recorded warning",
+      res_g["manifest"]["effective_config"]["stability_max_rank"] == 2.0 and
+      any("relaxed" in w for w in res_g.get("warnings", [])),
+      str(res_g["manifest"]["effective_config"]))
+check("74 applied decision effects stored per resolved decision",
+      all((d.get("downstream") or {}).get("applied_effect")
+          for d in t_f["decisions"]
+          if d["status"] == "resolved" and d.get("effect_class")),
+      str([(d["key"], d.get("effect_class")) for d in t_f["decisions"]]))
+check("75 official task API lists formal runs",
+      jid_f in [t["id"] for t in call("/api/tasks?limit=100")[1]["tasks"]])
+# B2: conversation linkage - a linked job is findable by its conversation;
+# an unknown conversation gets NOTHING (never the most-recent job guessed)
+_, cvl = call("/api/conversations", {"title": "link probe"})
+cid_link = cvl["conversation"]["id"]
+_, jl = call("/api/jobs", {"sample_id": "DEMO-P004", "conv_id": cid_link})
+_, act_l = call("/api/tasks/active?conv_id=" + cid_link)
+_, act_n = call("/api/tasks/active?conv_id=conv-does-not-exist")
+check("76 conv-linked run queryable; unknown conv -> empty (no guessing)",
+      [t["id"] for t in act_l.get("tasks", [])] == [jl["job_id"]] and
+      act_n.get("tasks") == [], str(act_l)[:120])
+call("/api/jobs/" + jl["job_id"] + "/cancel", {})
+# A1 taxonomy as a pure function, incl. zero-candidates vs failure
+from backend.jobs import classify_outcome as _co  # noqa: E402
+check("77 outcome taxonomy: five distinct honest states",
+      _co([{"status": "available"}]) == "delivered" and
+      _co([{"status": "empty"}, {"status": "empty"}]) == "zero_candidates" and
+      _co([{"status": "available"}, {"status": "empty"}]) == "partial" and
+      _co([{"status": "failed_generation"}]) == "generation_failed" and
+      _co([]) == "no_artifacts")
+# never over-claim: if an artifact disappears, results must DOWNGRADE and
+# say so (tested by removing one artifact row from the isolated test DB)
+import sqlite3 as _s3
+_db = ROOT / "data" / "batterytest.sqlite3"
+_with = _s3.connect(str(_db)).execute(
+    "SELECT COUNT(*) FROM artifacts WHERE job_id=?", (jid_f,)).fetchone()[0]
+_c = _s3.connect(str(_db))
+_c.execute("DELETE FROM artifacts WHERE job_id=? AND strategy='evidence-consensus'",
+           (jid_f,))
+_c.commit()
+_c.close()
+_, res_drift = call("/api/results/" + jid_f)
+check("78 missing artifact -> outcome downgraded + drift disclosed (was %d artifacts)" % _with,
+      res_drift["outcome"] == "partial" and "outcome_drift" in res_drift,
+      str(res_drift["outcome"]) + " " + str(res_drift.get("outcome_drift"))[:80])
+# read-only task token: opens GET task routes ONLY
+_tok = json.loads(_s3.connect(str(_db)).execute(
+    "SELECT value_json FROM settings WHERE key='task_token'").fetchone()[0])
+
+
+def _tokget(path, token=None, auth=False):
+    req = urllib.request.Request(BASE + path)
+    if token:
+        req.add_header("X-NeoAG-Task-Token", token)
+    if auth:
+        req.add_header("Authorization", AUTH_HEADER)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as _r:
+            return _r.status
+    except urllib.error.HTTPError as _e:
+        return _e.code
+
+
+check("79 read-only task token: GET task routes ok, everything else 401",
+      _tokget("/api/tasks", token=_tok) == 200 and
+      _tokget("/api/tasks/" + jid_f + "/snapshot", token=_tok) == 200 and
+      _tokget("/api/bootstrap", token=_tok) == 401 and
+      _tokget("/api/conversations", token=_tok) == 401)
+
+# ---------- 80-86 Milestone-4 Skills workspace (F3) --------------------
+_, skl = call("/api/skills")
+check("80 skills seeded: three categories, honest activation flags",
+      len(skl["skills"]) == 3 and
+      {s["category"] for s in skl["skills"]} == set(skl["categories"]) and
+      all("active_in_new_sessions" in s for s in skl["skills"]),
+      str([(s["slug"], s["active_in_new_sessions"]) for s in skl["skills"]]))
+def _status(path, body=None):
+    try:
+        return call(path, body)[0]
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
+st_bad1 = _status("/api/skills", {"slug": "gate.py", "category":
+                     skl["categories"][0], "content":
+                     "---\nname: gate.py\n---\nx"})
+st_bad2 = _status("/api/skills", {"slug": "no-fm", "category":
+                     skl["categories"][0], "content": "plain text"})
+st_bad3 = _status("/api/skills", {"slug": "valid-slug", "category":
+                     "nope", "content": "---\nname: valid-slug\n---\ny"})
+check("81 protected names / missing frontmatter / bad category refused",
+      st_bad1 == 400 and st_bad2 == 400 and st_bad3 == 400)
+_body1 = "---\nname: battery-probe\ndescription: t\n---\nbody one\n"
+_body2 = "---\nname: battery-probe\ndescription: t\n---\nbody two\n"
+st_mk, _ = call("/api/skills", {"slug": "battery-probe",
+                                "title": "Probe",
+                                "category": skl["categories"][0],
+                                "content": _body1})
+call("/api/skills/battery-probe/update", {"content": _body2})
+_, sv = call("/api/skills/battery-probe/versions")
+check("82 edit keeps full version history", st_mk == 201 and
+      len(sv.get("versions", [])) == 2, str(sv)[:120])
+st_rs, rs = call("/api/skills/battery-probe/restore", {"version": 1})
+check("83 restore re-applies v1 content AS A NEW version",
+      st_rs == 200 and rs["version"] == 3 and
+      rs["content"].rstrip().endswith("body one"), str(rs.get("version")))
+_, sk_now = call("/api/skills")
+probe = next(s for s in sk_now["skills"] if s["slug"] == "battery-probe")
+check("84 activation is honest: edited-but-not-deployed != active",
+      probe["active_in_new_sessions"] is False and
+      probe["deployed_version"] != probe["version"],
+      str({k: probe[k] for k in ("version", "deployed_version",
+                                 "active_in_new_sessions")}))
+st_dp, dep = call("/api/skills/battery-probe/deploy", {})
+_written = [r for r in dep.get("results", []) if r.get("state") == "written"]
+check("85 deploy writes inside the skills dir only + activation note "
+      "states NEW sessions",
+      st_dp == 200 and len(_written) == 1 and
+      _written[0]["path"].startswith("/tmp/neoag-battery-skills/") and
+      "NEW" in str(dep.get("activation_note", "")).upper(),
+      str(dep)[:160])
+on_disk_probe = open(
+    "/tmp/neoag-battery-skills/battery-probe/SKILL.md").read()
+check("86 deployed file content == saved skill content (byte-for-byte)",
+      on_disk_probe == _body1, "")
 
 print()
 print(f"RESULT: {len(PASS)} passed, {len(FAIL)} failed")

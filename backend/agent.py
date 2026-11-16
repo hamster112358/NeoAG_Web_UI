@@ -22,6 +22,7 @@ artifact badges - NOT in repeated chat banners.
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -32,9 +33,106 @@ from .store import new_id
 
 AGENT_WS = "/data1/neoag/agents/neoag_agent_ws"
 APPROVALS_DIR = AGENT_WS + "/.neoag-approvals"
+# NEOAG_TASKQ_DIR isolates the deployed task-query helper for
+# verification batteries (fresh DB => fresh token; the live workspace
+# token for the :8712 server must not be overwritten).
+TASKQ_DIR = os.environ.get("NEOAG_TASKQ_DIR", AGENT_WS + "/.neoag")
 CONFIRM_RE = re.compile(
     r"NEOAG_CONFIRM_REQUIRED op=([0-9a-f]{24}) :: (.+?) "
     r"This operation is classified", re.S)
+
+# Official read-only task-query helper (B1): the agent queries the SAME
+# backend records the UI shows, through the API, instead of ad-hoc SQL
+# or chat memory. A dedicated GET-only token (settings-backed) is
+# deployed into the workspace next to the helper.
+TASKQUERY_SRC = '''#!/usr/bin/env python3
+"""NeoAG Web official task-query helper (read-only).
+
+Endpoints are the interface's OWN public query API; the token file
+next to this script grants GET access to task/research/skill routes
+ONLY (never writes, never chat, never secrets). The persisted backend
+records - not chat memory - are authoritative for what has run.
+
+usage:
+  taskquery.py list [n]          recent formal tasks
+  taskquery.py get <job_id>      full detail incl. artifact manifest,
+                                 decision history, failure info
+  taskquery.py snapshot <job_id> immutable per-run config snapshot
+  taskquery.py active [conv_id]  tasks still active (optionally for a
+                                 conversation - resolve 'the run I just
+                                 did' through this, and ask ONE
+                                 clarifying question if several match)
+  taskquery.py research [n]      discovery/research report index
+  taskquery.py research get <id> full report incl. provenance/coverage
+"""
+import json, os, sys, urllib.request
+
+BASE = os.environ.get("NEOAG_WEB_BASE", "http://127.0.0.1:8712")
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _get(path):
+    tok = open(os.path.join(HERE, ".taskquery-token")).read().strip()
+    req = urllib.request.Request(
+        BASE + path, headers={"X-NeoAG-Task-Token": tok})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def main():
+    a = sys.argv[1:]
+    if not a:
+        print(__doc__)
+        return 1
+    cmd = a[0]
+    if cmd == "list":
+        n = a[1] if len(a) > 1 else "20"
+        out = _get(f"/api/tasks?limit={n}")
+    elif cmd == "get":
+        out = _get("/api/tasks/" + a[1])
+    elif cmd == "snapshot":
+        out = _get(f"/api/tasks/{a[1]}/snapshot")
+    elif cmd == "active":
+        out = _get("/api/tasks/active" +
+                   (f"?conv_id={a[1]}" if len(a) > 1 else ""))
+    elif cmd == "research":
+        if len(a) > 1 and a[1] == "get":
+            out = _get("/api/research/" + a[2])
+        else:
+            out = _get("/api/research")
+    else:
+        print(__doc__)
+        return 1
+    print(json.dumps(out, indent=1, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+def ensure_task_gateway(store) -> bool:
+    """Generate (once) the GET-only task token and deploy the helper +
+    token into the agent workspace."""
+    import secrets as _secrets
+    tok = store.setting("task_token", "")
+    if not tok:
+        tok = _secrets.token_urlsafe(24)
+        store.setting_set("task_token", tok)
+    os.makedirs(TASKQ_DIR, exist_ok=True)
+    helper = os.path.join(TASKQ_DIR, "taskquery.py")
+    if not os.path.exists(helper):
+        with open(helper, "w") as f:
+            f.write(TASKQUERY_SRC)
+        os.chmod(helper, 0o755)
+    tokfile = os.path.join(TASKQ_DIR, ".taskquery-token")
+    if not os.path.exists(tokfile) or \
+            open(tokfile).read().strip() != tok:
+        with open(tokfile, "w") as f:
+            f.write(tok)
+        os.chmod(tokfile, 0o600)
+    return True
 
 
 class DemoAgent:
@@ -72,7 +170,31 @@ class DemoAgent:
             return self._conv.setdefault(
                 conv_id, {"job": None, "busy": False, "seen": set(),
                           "ops": set(), "replies": {}, "delivered": set(),
-                          "kick": None})
+                          "kick": None, "stop": False})
+
+    def stop_turn(self, conv_id: str) -> dict:
+        """User-initiated interrupt of the CURRENT agent turn: set the
+        cooperative flag (the relay stamps an honest terminal state) and
+        ask the gateway to stop the worker. The session ends - the next
+        message starts a fresh session rebuilt from saved history."""
+        st = self._cstate(conv_id)
+        job_id = st.get("job")
+        out = {"ok": True, "interrupted": False, "gateway_stopped": False}
+        if not st.get("busy"):
+            out["note"] = ("no agent turn is running in this chat right "
+                           "now (nothing to stop)")
+            return out
+        st["stop"] = True
+        out["interrupted"] = True
+        if job_id and self._client:
+            try:
+                r = self._client.stop(job_id)
+                out["gateway_stopped"] = r.get("http") == 200
+            except Exception as e:
+                out["gateway_error"] = str(e)[:160]
+        self.store.audit("user", "agent.turn.stop", conv_id,
+                         {"job": job_id, **out})
+        return out
 
     @staticmethod
     def title_from(text: str) -> str:
@@ -94,8 +216,13 @@ class DemoAgent:
     CHAT_PREAMBLE = (
         "You are the NeoAG assistant inside the NeoAG Web chat "
         "(the workspace rules in CODEBUDDY.md apply). Keep answers "
-        "grounded: never invent files, numbers or results. The user's "
-        "message follows.\n\n")
+        "grounded: never invent files, numbers or results. For any "
+        "question about analyses/tasks/reports this interface has "
+        "produced, query the authoritative records via "
+        "`python3 .neoag/taskquery.py` (never from chat memory); if "
+        "several tasks could match 'the run I just did', ask ONE "
+        "focused clarifying question naming the candidates. The "
+        "user's message follows.\n\n")
 
     def handle_real(self, text: str, conv_id: str) -> list[dict]:
         """Route one user turn to the conversation's real agent job
@@ -143,6 +270,10 @@ class DemoAgent:
                            "(fresh agent session - the previous one ended; "
                            "saved history rides along):\n"
                            + "\n".join(f"- {h}" for h in hist) + "\n\n")
+                try:
+                    ensure_task_gateway(self.store)
+                except Exception:
+                    pass  # helper absence degrades, never blocks chat
                 d = client.dispatch(self.CHAT_PREAMBLE + ctx + text,
                                     cwd=AGENT_WS,
                                     name="neoag-web-chat")
@@ -161,6 +292,7 @@ class DemoAgent:
                 conv_id=conv_id)]
         st["job"] = job_id
         st["busy"] = True
+        st["stop"] = False
         msgs = []
         if started == "started" and had_prior_session:
             # honest ONLY for a re-dispatch after a real session ended -
@@ -210,8 +342,9 @@ class DemoAgent:
         confirmation cards for gate CONFIRM denials, post the assistant
         reply when the turn settles. Content only from the gateway -
         never fabricated. ANY exit path ends in an honest terminal
-        state (the kickoff notice leaves 'streaming')."""
-        import html as _html
+        state (the kickoff notice leaves 'streaming'). Tool output is
+        stored RAW (the frontend escapes once at render time, so no
+        HTML entities leak into the UI)."""
         from .server import publish
         st = self._cstate(conv_id)
         client = self._client
@@ -262,6 +395,25 @@ class DemoAgent:
                     return
                 state = detail.get("state")
                 self.store.conv_touch(conv_id, job_state=str(state))
+                if st.get("stop"):
+                    # user pressed Stop: honest terminal, no fabricated tail
+                    self.store.audit("agent", "relay.user_interrupt",
+                                     conv_id, {"job": job_id})
+                    self.store.msg_add(
+                        "agent",
+                        "(This turn was interrupted at your request. "
+                        "Anything recorded above really happened; "
+                        "nothing after this point did. The agent "
+                        "session ends here - your next message starts "
+                        "a fresh session rebuilt from the saved "
+                        "conversation.)",
+                        {"badges": ["real agent",
+                                    "cancelled (user interrupt)"],
+                         "job_id": job_id}, conv_id)
+                    st["stop"] = False
+                    self._finish_turn(st, "cancelled (user interrupt)")
+                    publish({"type": "chat", "conv_id": conv_id})
+                    return
                 for u in items:
                     kind = str(u.get("sessionUpdate") or "")
                     if kind in ("tool_call", "tool_call_update"):
@@ -269,21 +421,29 @@ class DemoAgent:
                         if key in st["seen"]:
                             continue
                         st["seen"].add(key)
+                        title = str(u.get("title") or "tool")
+                        status = str(u.get("status") or "")
+                        meta = {"badges": ["tool output", "real agent"],
+                                "job_id": job_id, "kind": "tool",
+                                "tool_call_id": str(u.get("toolCallId")
+                                                    or ""),
+                                "tool_status": status,
+                                "tool_title": title}
                         if kind == "tool_call":
-                            body = (f"[running] {u.get('title') or 'tool'}")
+                            # body stays the short running line; the UI
+                            # renders this collapsed under the title
+                            body = f"[running] {title}"
                         else:
                             raw = u.get("rawOutput")
                             if isinstance(raw, dict):
                                 raw = raw.get("text") or json.dumps(
                                     raw, ensure_ascii=False)
+                            # stored RAW: frontend escapes once at render
                             out = str(raw or "")[:600]
-                            body = (f"[tool {u.get('status')}] "
-                                    f"{_html.escape(out)}")
+                            body = f"[tool {status}] {out}"
+                            meta["tool_output"] = out
                             self._scan_gate_confirm(u, conv_id, st)
-                        self.store.msg_add(
-                            "tool", body,
-                            {"badges": ["tool output", "real agent"],
-                             "job_id": job_id}, conv_id)
+                        self.store.msg_add("tool", body, meta, conv_id)
                         publish({"type": "chat", "conv_id": conv_id})
                     elif kind == "agent_message_chunk":
                         mid = str(u.get("messageId") or "")
@@ -441,7 +601,8 @@ class DemoAgent:
             "is on.", conv_id=conv_id))
         res = self.jobs.submit("DEMO-P001",
                                [s["id"] for s in mock_data.STAGES
-                                if s["required"]], "auto")
+                                if s["required"]], "auto",
+                               conv_id=conv_id)
         out.append(self._say(
             f"Prepared demo analysis {res['job_id']} for DEMO-P001 - "
             "blocked on your approval (execute-class work always "
@@ -510,24 +671,35 @@ class DemoAgent:
 
         if any(k in t for k in ("research", "discover", "sota", "alternativ",
                                 "compare tool", "benchmark tool")):
-            import threading
-            from .server import publish  # prototype wiring
-            from .store import new_id
-            target = next((x for x in ("fusion", "splice", "hla", "stability",
-                                       "presentation") if x in t), None)
-            scope = "full" if not target or "pipeline" in t else "targeted"
-            rid = new_id("res")
-            self.store.research_add(rid, scope, target or "presentation")
-            threading.Thread(
-                target=__import__("backend.research", fromlist=["run_research"])
-                .run_research, args=(rid, scope, target or "presentation",
-                                     self.store, publish), daemon=True).start()
+            from .research import submit_research
+            # same backend workflow as the structured Discovery UI (E3) -
+            # the LIVE retrieval engine, not the example digest
+            target_map = {"fusion": "fusion_discovery", "splice":
+                          "splice_discovery", "hla": "hla_typing",
+                          "stability": "presentation", "presentation":
+                          "presentation"}
+            hit = next(((v, k) for k, v in target_map.items() if k in t),
+                       None)
+            scope = "full" if not hit or "pipeline" in t else "targeted"
+            try:
+                res = submit_research(
+                    self.store, scope,
+                    [hit[0]] if scope == "targeted" else None,
+                    conv_id=conv_id, actor="agent", engine="live")
+            except Exception as e:
+                out.append(self._say(
+                    f"Could not start the live research task: {e}",
+                    conv_id=conv_id))
+                return out
             out.append(self._policy("POL-002", conv_id))
             out.append(self._say(
-                f"Started a SOTA discovery digest ({scope} scope, "
-                f"{target or 'presentation'}). Every row is labelled "
-                "literature-derived example content - no live search, no "
-                "downloads, no benchmarks. Open the Discovery view.",
+                f"Started a LIVE SOTA discovery task ({scope} scope, "
+                f"{res['research_id']}) through the same Discovery "
+                "workflow as the UI. It performs real retrieval now "
+                "(literature + registries) and persists every query; "
+                "unreachable sources will be reported as gaps, not "
+                "filled in. Open the Discovery view for progress and "
+                "the provenance log.",
                 conv_id=conv_id))
             return out
 
@@ -581,7 +753,9 @@ class DemoAgent:
             else:
                 stage_ids = [s["id"] for s in mock_data.STAGES if s["required"]]
             res = self.jobs.submit(sample, stage_ids, mode,
-                                   simulate_failure=bool(settings.get("simulate_failure")))
+                                   simulate_failure=bool(settings.get(
+                                       "simulate_failure")),
+                                   conv_id=conv_id)
             out.append(self._say(
                 f"I prepared a formal analysis for {sample} with "
                 f"{len(stage_ids)} stages ({mode} settings). It is blocked on "
@@ -636,24 +810,46 @@ class DemoAgent:
         return out
 
     def _results(self, _which: str, conv_id: str = "") -> list[dict]:
-        done = [j for j in self.store.job_list(20) if j["state"] == "completed"]
+        """Answer from the persisted OUTPUT manifest, not from memory:
+        artifact statuses decide what can be called delivered."""
+        mine = ([j for j in self.store.job_list(20, conv_id=conv_id)
+                 if j["state"] == "completed"] if conv_id else [])
+        done = mine or [j for j in self.store.job_list(20)
+                        if j["state"] == "completed"]
         if not done:
-            out = [self._say(
+            return [self._say(
                 "No completed demo run yet - run \"analyze DEMO-P001\" and "
                 "approve it in the Approvals panel.", conv_id=conv_id)]
-            return out
+        if len(done) > 1 and conv_id and not mine:
+            return [self._say(
+                "Several completed runs match. Which one: "
+                + ", ".join(j["id"] for j in done[:3]) + "?",
+                conv_id=conv_id)]
         job = done[0]
-        rows = json.loads(job["result_json"] or "{}").get("candidates", [])[:3]
+        result = json.loads(job["result_json"] or "{}")
+        arts = self.store.artifact_list(job["id"])
+        art_lines = [f"- {a['name']}: {a['status']}"
+                     + (f" ({a['rows']} rows, checksum {a['checksum']})"
+                        if a["status"] == "available" else "")
+                     for a in arts]
+        outcome = result.get("outcome", "unknown (pre-manifest run)")
+        rows = (result.get("candidates") or [])[:3]
         lines = "\n".join(
             f"- #{r['rank']} {r['peptide']} ({r['gene']}, {r['hla']}, "
             f"{r['branch']}): mock score {r['mock_combined_score']}"
             for r in rows)
+        body = (f"Latest completed run {job['id']} ({job['sample_id']}) - "
+                f"outcome: {outcome}.\nOutput manifest:\n"
+                + ("\n".join(art_lines) or "- no artifacts registered")
+                + ("\n\nTop rows from the primary table ("
+                   + str(result.get("candidates_strategy"))
+                   + f"):\n{lines}" if rows else
+                   "\n\nNo candidate rows are available - empty results "
+                   "are reported as empty."))
         return [
             self._policy("POL-002", conv_id),
             self._say(
-                f"Top mock candidates from {job['id']} ({job['sample_id']}):\n"
-                + lines +
-                "\n\nOpen the Results view for full evidence columns. "
-                "These are synthetic demo numbers, not predictions about "
-                "anything real.", conv_id=conv_id),
+                body + "\n\nOpen the Results view for full evidence "
+                "columns. These are synthetic demo numbers, not "
+                "predictions about anything real.", conv_id=conv_id),
         ]

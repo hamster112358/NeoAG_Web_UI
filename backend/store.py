@@ -70,6 +70,34 @@ CREATE TABLE IF NOT EXISTS conversations(
   id TEXT PRIMARY KEY, created_at TEXT, updated_at TEXT, title TEXT,
   job_id TEXT, job_state TEXT, deleted INTEGER DEFAULT 0
 );
+-- Per-run OUTPUT manifest (A3): every artifact a formal run produced,
+-- with an honest availability status. A job is only ever described as
+-- having "delivered" what this table shows as available.
+CREATE TABLE IF NOT EXISTS artifacts(
+  id TEXT PRIMARY KEY, job_id TEXT, created_at TEXT, type TEXT, name TEXT,
+  strategy TEXT, path TEXT, status TEXT, rows INTEGER, checksum TEXT,
+  meta_json TEXT
+);
+-- Immutable per-run effective-config snapshot (A5): written ONCE when a
+-- job starts and never updated afterwards (INSERT OR IGNORE), so later
+-- default/policy/skill changes cannot rewrite what a past run recorded.
+CREATE TABLE IF NOT EXISTS run_snapshots(
+  job_id TEXT PRIMARY KEY, created_at TEXT, snapshot_json TEXT
+);
+-- Agent Skills (PART C): editable advisory instructions with full
+-- version history. Deployment to the agent workspace is explicit and
+-- only affects NEW agent sessions; enforcement (gate/policies) lives
+-- elsewhere and is NOT stored here.
+CREATE TABLE IF NOT EXISTS skills(
+  id TEXT PRIMARY KEY, slug TEXT UNIQUE, name TEXT, title TEXT,
+  category TEXT, content TEXT, enabled INTEGER DEFAULT 1,
+  version INTEGER DEFAULT 1, created_at TEXT, updated_at TEXT,
+  deployed_version INTEGER DEFAULT 0, deployed_at TEXT, deployed_hash TEXT
+);
+CREATE TABLE IF NOT EXISTS skill_versions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, skill_id TEXT, version INTEGER,
+  content TEXT, created_at TEXT, source TEXT
+);
 """
 
 JOB_STATES = {"queued", "running", "paused", "blocked", "completed", "failed",
@@ -94,11 +122,33 @@ class Store:
         self.db.row_factory = sqlite3.Row
         with self.lock:
             self.db.executescript(SCHEMA)
-            try:  # migration for pre-conversation databases
-                self.db.execute("ALTER TABLE messages ADD COLUMN conv_id "
-                                "TEXT DEFAULT ''")
-            except sqlite3.OperationalError:
-                pass  # column already present
+            for stmt in (
+                # migration for pre-conversation databases
+                "ALTER TABLE messages ADD COLUMN conv_id TEXT DEFAULT ''",
+                # Milestone 4 migrations (each idempotent via except):
+                "ALTER TABLE jobs ADD COLUMN conv_id TEXT DEFAULT ''",
+                "ALTER TABLE jobs ADD COLUMN outcome TEXT",
+                "ALTER TABLE decisions ADD COLUMN key TEXT",
+                "ALTER TABLE decisions ADD COLUMN category "
+                "TEXT DEFAULT 'pipeline'",
+                "ALTER TABLE decisions ADD COLUMN trigger TEXT",
+                "ALTER TABLE decisions ADD COLUMN source TEXT",
+                "ALTER TABLE decisions ADD COLUMN mandatory INTEGER "
+                "DEFAULT 1",
+                "ALTER TABLE decisions ADD COLUMN effect_class TEXT",
+                "ALTER TABLE decisions ADD COLUMN downstream_json "
+                "TEXT DEFAULT '{}'",
+                "ALTER TABLE research ADD COLUMN engine "
+                "TEXT DEFAULT 'example'",
+                "ALTER TABLE research ADD COLUMN conv_id TEXT DEFAULT ''",
+                "ALTER TABLE research ADD COLUMN cancel_requested "
+                "INTEGER DEFAULT 0",
+                "ALTER TABLE research ADD COLUMN progress_json TEXT",
+            ):
+                try:
+                    self.db.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass  # column already present
             self.db.commit()
 
     # ---------- audit ----------
@@ -117,13 +167,14 @@ class Store:
 
     # ---------- jobs ----------
     def job_create(self, job_id: str, kind: str, sample_id: str, spec: dict,
-                   state: str, approval_id: str | None) -> None:
+                   state: str, approval_id: str | None,
+                   conv_id: str = "") -> None:
         with self.lock:
             self.db.execute(
                 "INSERT INTO jobs(id,created_at,updated_at,state,kind,sample_id,"
-                "spec_json,approval_id) VALUES(?,?,?,?,?,?,?,?)",
+                "spec_json,approval_id,conv_id) VALUES(?,?,?,?,?,?,?,?,?)",
                 (job_id, now(), now(), state, kind, sample_id,
-                 json.dumps(spec, ensure_ascii=False), approval_id))
+                 json.dumps(spec, ensure_ascii=False), approval_id, conv_id))
             self.db.commit()
 
     def job_set(self, job_id: str, **fields) -> None:
@@ -141,11 +192,22 @@ class Store:
             row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         return dict(row) if row else None
 
-    def job_list(self, limit: int = 50) -> list[dict]:
+    def job_list(self, limit: int = 50, conv_id: str | None = None,
+                 kinds: list[str] | None = None) -> list[dict]:
+        q = "SELECT * FROM jobs"
+        where, args = [], []
+        if conv_id:
+            where.append("conv_id=?")
+            args.append(conv_id)
+        if kinds:
+            where.append("kind IN (%s)" % ",".join("?" * len(kinds)))
+            args.extend(kinds)
+        if where:
+            q += " WHERE " + " AND ".join(where)
+        q += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+        args.append(limit)
         with self.lock:
-            rows = self.db.execute(
-                "SELECT * FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?",
-                (limit,)).fetchall()
+            rows = self.db.execute(q, args).fetchall()
         return [dict(r) for r in rows]
 
     def recover_interrupted(self) -> list[str]:
@@ -413,13 +475,28 @@ class Store:
             self.db.execute(
                 "INSERT INTO decisions(id,ts,decided_at,job_id,stage,decision_type,"
                 "question,options_json,chosen,rationale,evidence_json,policy_id,"
-                "policy_version,decided_by,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "policy_version,decided_by,status,key,category,trigger,source,"
+                "mandatory,effect_class,downstream_json) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (d["id"], d["ts"], d.get("decided_at"), d["job_id"], d["stage"],
                  d["decision_type"], d["question"],
                  json.dumps(d["options"], ensure_ascii=False), d.get("chosen"),
                  d.get("rationale"), json.dumps(d.get("evidence", []), ensure_ascii=False),
                  d.get("policy_id"), d.get("policy_version"), d.get("decided_by"),
-                 d.get("status", "pending")))
+                 d.get("status", "pending"),
+                 d.get("key"), d.get("category", "pipeline"),
+                 d.get("trigger"), d.get("source"),
+                 1 if d.get("mandatory", True) else 0,
+                 d.get("effect_class"),
+                 json.dumps(d.get("downstream") or {}, ensure_ascii=False)))
+            self.db.commit()
+
+    def decision_set_effect(self, d_id: str, downstream: dict) -> None:
+        """Record what the resolved choice actually mapped to downstream
+        (the applied option->execution effect)."""
+        with self.lock:
+            self.db.execute("UPDATE decisions SET downstream_json=? WHERE id=?",
+                            (json.dumps(downstream, ensure_ascii=False), d_id))
             self.db.commit()
 
     def decision_get(self, d_id: str) -> dict | None:
@@ -431,6 +508,7 @@ class Store:
         d = dict(row)
         d["options"] = json.loads(d.pop("options_json") or "[]")
         d["evidence"] = json.loads(d.pop("evidence_json") or "[]")
+        d["downstream"] = json.loads(d.pop("downstream_json") or "{}")
         return d
 
     def decision_set(self, d_id: str, chosen: str, rationale: str,
@@ -469,15 +547,22 @@ class Store:
             d = dict(r)
             d["options"] = json.loads(d.pop("options_json") or "[]")
             d["evidence"] = json.loads(d.pop("evidence_json") or "[]")
+            d["downstream"] = json.loads(d.pop("downstream_json") or "{}")
             out.append(d)
         return out
 
     # ---------- research reports ----------
-    def research_add(self, rid: str, scope: str, target: str) -> None:
+    def research_add(self, rid: str, scope: str, target: str,
+                     engine: str = "example", conv_id: str = "",
+                     targets: list[str] | None = None) -> None:
         with self.lock:
             self.db.execute(
-                "INSERT INTO research(id,created_at,status,scope,target) "
-                "VALUES(?,?, 'queued', ?, ?)", (rid, now(), scope, target))
+                "INSERT INTO research(id,created_at,status,scope,target,engine,"
+                "conv_id,progress_json) VALUES(?,?, 'queued', ?,?,?,?,?)",
+                (rid, now(), scope, target, engine, conv_id,
+                 json.dumps({"steps": [], "targets": targets or [target],
+                             "sources_done": [], "note": "queued"},
+                            ensure_ascii=False)))
             self.db.commit()
 
     def research_set(self, rid: str, status: str, report: dict | None = None,
@@ -491,6 +576,48 @@ class Store:
                  now() if finished else None, rid))
             self.db.commit()
 
+    def research_event_add(self, rid: str, text: str) -> None:
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO research_events(research_id,ts,text) "
+                "VALUES(?,?,?)", (rid, now(), text))
+            self.db.commit()
+
+    def research_events(self, rid: str, after: int = 0) -> list[dict]:
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT * FROM research_events WHERE research_id=? AND id>?"
+                " ORDER BY id ASC", (rid, after)).fetchall()
+        return [dict(r) for r in rows]
+
+    def research_set_progress(self, rid: str, progress: dict) -> None:
+        """Durable progress for live research jobs (cancellation check and
+        resume-after-restart both read this)."""
+        with self.lock:
+            self.db.execute("UPDATE research SET progress_json=? WHERE id=?",
+                            (json.dumps(progress, ensure_ascii=False), rid))
+            self.db.commit()
+
+    def research_progress(self, rid: str) -> dict:
+        with self.lock:
+            row = self.db.execute(
+                "SELECT progress_json,cancel_requested,status,engine,scope,"
+                "target,conv_id FROM research WHERE id=?", (rid,)).fetchone()
+        if not row:
+            return {}
+        p = json.loads(row["progress_json"] or "{}")
+        p["cancel_requested"] = bool(row["cancel_requested"])
+        p["status"] = row["status"]
+        return p
+
+    def research_cancel_request(self, rid: str) -> bool:
+        with self.lock:
+            cur = self.db.execute(
+                "UPDATE research SET cancel_requested=1 WHERE id=? "
+                "AND status IN ('queued','running')", (rid,))
+            self.db.commit()
+        return cur.rowcount > 0
+
     def research_get(self, rid: str) -> dict | None:
         with self.lock:
             row = self.db.execute("SELECT * FROM research WHERE id=?",
@@ -500,13 +627,15 @@ class Store:
         r = dict(row)
         raw = r.pop("report_json", None)
         r["report"] = json.loads(raw) if raw else None
+        r["progress"] = json.loads(r.get("progress_json") or "{}")
         return r
 
     def research_list(self, limit: int = 50) -> list[dict]:
         with self.lock:
             rows = self.db.execute(
-                "SELECT id,created_at,finished_at,status,scope,target FROM "
-                "research ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+                "SELECT id,created_at,finished_at,status,scope,target,engine,"
+                "conv_id FROM research ORDER BY created_at DESC LIMIT ?",
+                (limit,)).fetchall()
         return [dict(r) for r in rows]
 
     # ---------- input manifests ----------
@@ -561,13 +690,154 @@ class Store:
                 (limit,)).fetchall()
         return [dict(r) for r in rows]
 
+    # ---------- output artifacts (per-run output manifest, A3) ----------
+    def artifact_add(self, job_id: str, type_: str, name: str,
+                     strategy: str | None, path: str, status: str,
+                     rows: int | None, checksum: str | None,
+                     meta: dict | None = None) -> dict:
+        aid = new_id("art")
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO artifacts(id,job_id,created_at,type,name,strategy,"
+                "path,status,rows,checksum,meta_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (aid, job_id, now(), type_, name, strategy, path, status,
+                 rows, checksum, json.dumps(meta or {}, ensure_ascii=False)))
+            self.db.commit()
+        return self.artifact_get(aid)
+
+    def artifact_get(self, aid: str) -> dict | None:
+        with self.lock:
+            row = self.db.execute("SELECT * FROM artifacts WHERE id=?",
+                                  (aid,)).fetchone()
+        if not row:
+            return None
+        a = dict(row)
+        a["meta"] = json.loads(a.pop("meta_json") or "{}")
+        return a
+
+    def artifact_list(self, job_id: str | None = None) -> list[dict]:
+        q = "SELECT * FROM artifacts"
+        args: list = []
+        if job_id:
+            q += " WHERE job_id=?"
+            args.append(job_id)
+        q += " ORDER BY rowid ASC"
+        with self.lock:
+            rows = self.db.execute(q, args).fetchall()
+        out = []
+        for r in rows:
+            a = dict(r)
+            a["meta"] = json.loads(a.pop("meta_json") or "{}")
+            out.append(a)
+        return out
+
+    # ---------- immutable run snapshots (A5) ----------
+    def snapshot_add(self, job_id: str, snapshot: dict) -> None:
+        """Write-once: later calls with the same job_id are ignored, so a
+        run's recorded inputs/config/versions can never drift."""
+        with self.lock:
+            self.db.execute(
+                "INSERT OR IGNORE INTO run_snapshots(job_id,created_at,"
+                "snapshot_json) VALUES(?,?,?)",
+                (job_id, now(), json.dumps(snapshot, ensure_ascii=False)))
+            self.db.commit()
+
+    def snapshot_get(self, job_id: str) -> dict | None:
+        with self.lock:
+            row = self.db.execute(
+                "SELECT * FROM run_snapshots WHERE job_id=?", (job_id,)).fetchone()
+        if not row:
+            return None
+        return {"job_id": row["job_id"], "created_at": row["created_at"],
+                "snapshot": json.loads(row["snapshot_json"] or "{}")}
+
+    # ---------- agent skills (advisory, PART C) ----------
+    def skill_create(self, slug: str, name: str, title: str, category: str,
+                     content: str, source: str = "created in Skills editor",
+                     enabled: bool = True) -> dict:
+        sid = new_id("skill")
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO skills(id,slug,name,title,category,content,enabled,"
+                "version,created_at,updated_at) VALUES(?,?,?,?,?,?,?,1,?,?)",
+                (sid, slug, name, title, category, content,
+                 1 if enabled else 0, now(), now()))
+            self.db.execute(
+                "INSERT INTO skill_versions(skill_id,version,content,created_at,"
+                "source) VALUES(?,1,?,?,?)", (sid, content, now(), source))
+            self.db.commit()
+        return self.skill_get(sid)
+
+    def skill_get(self, sid: str, by_slug: bool = False) -> dict | None:
+        col = "slug" if by_slug else "id"
+        with self.lock:
+            row = self.db.execute(
+                f"SELECT * FROM skills WHERE {col}=?", (sid,)).fetchone()
+        return dict(row) if row else None
+
+    def skill_list(self) -> list[dict]:
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT * FROM skills ORDER BY category, name").fetchall()
+        return [dict(r) for r in rows]
+
+    def skill_update(self, sid: str, content: str, source: str,
+                     title: str | None = None,
+                     category: str | None = None) -> dict | None:
+        s = self.skill_get(sid)
+        if not s:
+            return None
+        new_v = int(s["version"]) + 1
+        with self.lock:
+            self.db.execute(
+                "UPDATE skills SET content=?, version=?, updated_at=?, "
+                "title=COALESCE(?,title), category=COALESCE(?,category) "
+                "WHERE id=?",
+                (content, new_v, now(), title, category, sid))
+            self.db.execute(
+                "INSERT INTO skill_versions(skill_id,version,content,"
+                "created_at,source) VALUES(?,?,?,?,?)",
+                (sid, new_v, content, now(), source))
+            self.db.commit()
+        return self.skill_get(sid)
+
+    def skill_set_enabled(self, sid: str, enabled: bool) -> dict | None:
+        with self.lock:
+            self.db.execute("UPDATE skills SET enabled=?, updated_at=? "
+                            "WHERE id=?", (1 if enabled else 0, now(), sid))
+            self.db.commit()
+        return self.skill_get(sid)
+
+    def skill_versions(self, sid: str) -> list[dict]:
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT id,version,created_at,source,length(content) AS "
+                "chars FROM skill_versions WHERE skill_id=? "
+                "ORDER BY version DESC", (sid,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def skill_version_content(self, sid: str, version: int) -> str | None:
+        with self.lock:
+            row = self.db.execute(
+                "SELECT content FROM skill_versions WHERE skill_id=? AND "
+                "version=?", (sid, version)).fetchone()
+        return row["content"] if row else None
+
+    def skill_set_deployed(self, sid: str, version: int, digest: str) -> None:
+        with self.lock:
+            self.db.execute(
+                "UPDATE skills SET deployed_version=?, deployed_at=?, "
+                "deployed_hash=? WHERE id=?", (version, now(), digest, sid))
+            self.db.commit()
+
     # ---------- reversible archive cleanup (developer records) ----------
     def archive_and_purge(self, keep_audit: bool = True) -> dict:
         """Export every user-facing table to data/archive-<ts>.json, then
         delete those rows (audit + settings stay). Reversible: the JSON
         file contains full rows; re-import with restore_archive()."""
         tables = ["messages", "jobs", "job_events", "approvals", "decisions",
-                  "research", "research_events", "manifests", "conversations"]
+                  "research", "research_events", "manifests", "conversations",
+                  "artifacts", "run_snapshots", "skills", "skill_versions"]
         dump = {"archived_at": now(), "reason": "developer demo records "
                 "moved out of the visible workspace (reversible)",
                 "tables": {}}

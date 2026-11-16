@@ -36,6 +36,12 @@
       <span id="chat-state" class="pill muted hidden"></span>
     </div>
     <div id="chat-log" class="chat-log"></div>
+    <div id="chat-status" class="chat-status hidden" role="status">
+      <span id="act-dot" class="act-dot"></span>
+      <span id="act-text"></span>
+      <span id="act-elapsed" class="act-elapsed"></span>
+      <button id="chat-stop" class="btn danger sm hidden" type="button">Stop</button>
+    </div>
     <form id="chat-form" autocomplete="off">
       <textarea id="chat-input" rows="2"
         placeholder="Describe your goal - e.g. analyze a sample, or tell the agent where your sequencing data are stored"></textarea>
@@ -50,6 +56,7 @@
       <button class="wtab active" data-view="tasks">Tasks</button>
       <button class="wtab" data-view="results">Results</button>
       <button class="wtab" data-view="discovery">Discovery</button>
+      <button class="wtab" data-view="skills">Skills</button>
       <button class="wtab" data-view="help">Help</button>
     </nav>
     <div id="work-body">
@@ -150,8 +157,16 @@
             <label class="lbl">Completed run
               <select id="res-job"></select></label>
           </div>
+          <div id="res-outcome"></div>
           <div id="res-meta"></div>
+          <div id="res-warnings"></div>
+          <div id="res-artifacts"></div>
+          <div id="res-strategy"></div>
           <div id="res-table"></div>
+          <details class="adv" id="res-manifest-wrap">
+            <summary>Output manifest, decisions and provenance</summary>
+            <div id="res-manifest"></div>
+          </details>
         </div>
       </section>
 
@@ -159,27 +174,58 @@
         <div class="card">
           <div class="card-head">
             <h2>SOTA tool discovery &amp; benchmarking</h2>
-            <span class="pill muted">mock digests</span>
+            <span class="pill muted">real retrieval</span>
           </div>
           <div class="row">
+            <label class="lbl">Engine
+              <select id="res-engine">
+                <option value="live">Live retrieval (real sources)</option>
+                <option value="example">Example fixture (testing only)</option>
+              </select></label>
             <label class="lbl">Scope
               <select id="res-scope">
-                <option value="full">Full pipeline review</option>
                 <option value="targeted">Targeted review</option>
+                <option value="full">Full pipeline review</option>
               </select></label>
-            <label class="lbl">Target
-              <select id="res-target">
-                <option value="presentation">Presentation</option>
-                <option value="stability">Stability</option>
-                <option value="fusion">Fusion discovery</option>
-                <option value="hla_typing">HLA typing</option>
-              </select></label>
-            <button id="res-run" class="btn primary">Run digest</button>
+            <button id="res-run" class="btn primary">Start research run</button>
           </div>
-          <p class="hint">Produces a labelled mock digest: no live literature search, no downloads, no benchmarks. Literature-derived rows are always separated from independently benchmarked rows (none exist yet).</p>
+          <div class="block">
+            <label class="lbl">Targets <span class="hint" id="res-target-hint"></span></label>
+            <div id="res-targets" class="stages"></div>
+            <label class="lbl">Custom target (not in the pipeline inventory)</label>
+            <input id="res-custom" type="text"
+              placeholder="e.g. neoantigen clonality scoring">
+          </div>
+          <p class="hint">Live mode queries real public sources (Europe PMC, PubMed,
+            OpenAlex, GitHub, PyPI, bio.tools) and the code-grounded inventory of the
+            configured NeoAG repository. It verifies existence, version and license
+            and quotes benchmark claims at abstract level - it does NOT execute or
+            benchmark anything, and unverified fields stay <b>Not verified</b>.
+            Example fixture mode is a fixed testing dataset, never real evidence.</p>
           <div id="res-list"></div>
         </div>
         <div id="res-report"></div>
+      </section>
+
+      <section id="view-skills" class="wview">
+        <div class="card">
+          <div class="card-head">
+            <h2>Agent skills</h2>
+            <span class="pill muted" id="skill-activation-note">advisory only</span>
+          </div>
+          <p class="hint">Skills are <b>advisory instructions</b> the agent loads at the
+            start of a session. They cannot change the execution gate, the policies, the
+            thresholds or the approvals - those live elsewhere and stay enforced.
+            Deploying writes files into the agent workspace; only <b>new</b> agent
+            sessions pick them up.</p>
+          <div class="btnrow">
+            <button id="skill-new" class="btn ghost">New skill</button>
+            <button id="skill-deploy" class="btn primary">Deploy enabled skills</button>
+            <span id="skill-deploy-note" class="hint"></span>
+          </div>
+          <div id="skill-list"></div>
+        </div>
+        <div id="skill-editor"></div>
       </section>
 
       <section id="view-help" class="wview">

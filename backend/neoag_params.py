@@ -245,17 +245,20 @@ STAGE_GRAPH = [
      "source": f"{TOML} [stages.splice_peptides] source=pVACsplice"},
 ]
 
+# Derived at import time from the job engine's OWN definition (jobs.py),
+# so this inventory can never drift from what the engine actually asks and
+# applies (Milestone-4 A4: one formalized source of truth per decision).
+from .jobs import DECISION_POINTS as _RUN_DP  # noqa: E402
+
 DECISION_POINTS = [
-    {"stage": "input_qc", "type": "input_mapping",
-     "question": "Which RNA FASTQ pair feeds the RNA branch?",
-     "policy": "POL-007",
-     "default": "matched (sample-id matched, same run)"},
-    {"stage": "presentation", "type": "parameter_choice",
-     "question": "Stability gate threshold?",
-     "policy": "POL-001", "default": "stability rank <= 1.4"},
-    {"stage": "ranking", "type": "parameter_choice",
-     "question": "Which ranking outputs?",
-     "policy": "POL-003", "default": "weighted + evidence-consensus"},
+    {"stage": sid, "type": dp["decision_type"], "question": dp["question"],
+     "policy": dp["policy_id"], "key": dp["key"],
+     "mandatory": bool(dp.get("mandatory")),
+     "default": next((o["label"] for o in dp["options"]
+                      if o.get("policy_default")),
+                     "no default - always asks"),
+     "source": dp.get("source", "jobs.py DECISION_POINTS")}
+    for sid, dp in _RUN_DP.items()
 ]
 
 HUMAN_REQUIRED = [

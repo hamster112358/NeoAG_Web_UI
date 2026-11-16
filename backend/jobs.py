@@ -28,6 +28,7 @@ decision point differs):
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import threading
@@ -36,6 +37,45 @@ import time
 from . import mock_data
 from .store import Store, new_id, now
 from .policies import POLICY_VERSION
+
+# Version stamping for per-run snapshots: a recorded run keeps the version
+# strings it actually ran under; later releases never rewrite them.
+ENGINE_VERSION = "mock-job-engine-2026.11-r3"
+# Declared (NOT executed) tool stack of the mock engine - honest labels,
+# so a snapshot can never be mistaken for a real software manifest.
+MOCK_TOOLCHAIN = {
+    "label": ("declared mock toolchain - the demo engine simulates these "
+              "stages; no real tool binary was invoked"),
+    "mock_dataset": mock_data.DEMO_DATASET_VERSION,
+    "mock_predictors": ["mock-NetMHCpan-scoring", "mock-MHCflurry-scoring",
+                        "mock-NetMHCstabpan-scoring", "mock-NetChop-scoring"],
+}
+GATE_RANKS = {"gate14": 1.4, "gate20": 2.0}
+RANKING_ARTIFACTS = {"both": ["weighted", "evidence-consensus"],
+                     "weighted": ["weighted"]}
+
+
+def classify_outcome(registered: list[dict]) -> str:
+    """Honest terminal classification (A1). Derived ONLY from the
+    artifact availability statuses actually registered for the run:
+      delivered         - every requested artifact generated, rows > 0
+      zero_candidates   - all artifacts generated but contain zero rows
+      partial           - some artifacts available, some empty/missing
+      generation_failed - output generation itself failed
+      no_artifacts      - nothing was registered at all
+    None of these may be reported as 'delivery' when artifacts are
+    missing; the job lifecycle state ('completed') stays separate."""
+    if any(a["status"] == "failed_generation" for a in registered):
+        return "generation_failed"
+    if not registered:
+        return "no_artifacts"
+    if all(a["status"] == "empty" for a in registered):
+        return "zero_candidates"
+    if all(a["status"] == "missing" for a in registered):
+        return "no_artifacts"
+    if any(a["status"] in ("empty", "missing") for a in registered):
+        return "partial"
+    return "delivered"
 
 # substeps x 0.35s sleep per stage (tuned so a full mock run takes ~30 s)
 STAGE_WEIGHTS = {
@@ -64,32 +104,62 @@ STAGE_LINES = {
 }
 
 # Decision points exist in BOTH modes; mode only changes who resolves them.
-# options[0] is the VALIDATED default (mirrors POL-007 'validated defaults').
+# Each pipeline decision is fully specified (A4): stable key, category,
+# trigger, policy + version, mandatory flag, source, effect class, and an
+# EXPLICIT option->execution mapping that the engine actually applies.
+# The old "validated" option flag suggested scientific validation that the
+# mock engine has never performed; options now carry `policy_default` (a
+# documented default to apply autonomously) plus an honest
+# `validation_status` string, and the UI labels the default accordingly.
 DECISION_POINTS = {
     "input_qc": {
+        "key": "input.rna_pair",
+        "category": "pipeline",
         "decision_type": "input_mapping",
+        "trigger": "2 candidate RNA FASTQ pairs match the sample in the "
+                   "mock input inventory",
         "question": ("Two RNA FASTQ pairs in the mock inventory match this "
                      "sample. Which pair feeds the RNA expression branch?"),
         "options": [
             {"id": "matched", "label": "tumor.rna_R1/R2.fastq.gz (paired, "
-             "sample-id matched, same run)", "validated": True},
+             "sample-id matched, same run)", "policy_default": True,
+             "validation_status": ("documented default (route plan); not "
+                                   "independently validated on this data"),
+             "effect": {"rna_inputs": "matched_pair"}},
             {"id": "legacy", "label": "legacy_run_R1/R2.fastq.gz (older run, "
-             "labelling ambiguity)", "validated": False},
+             "labelling ambiguity)", "policy_default": False,
+             "validation_status": "not validated - labelling ambiguity known",
+             "effect": {"rna_inputs": "legacy_pair",
+                        "warning": "legacy RNA pair: expression evidence "
+                                   "carries a labelling-ambiguity caveat"}},
         ],
         "rationale_default": ("sample-id match and same sequencing run - "
                               "mirrors the route plan documented in Skill2"),
         "evidence": ["mock inventory: 2 candidate pairs", "sample-id prefix match",
                      "both pairs indexed (mock)"],
         "policy_id": "POL-007",
+        "mandatory": True,
+        "effect_class": "input_selection",
+        "source": "jobs.py DECISION_POINTS (mock mirror of Skill2 route plan)",
     },
     "presentation": {
+        "key": "presentation.stability_gate",
+        "category": "pipeline",
         "decision_type": "parameter_choice",
+        "trigger": "entry to the presentation stage",
         "question": "Stability gate threshold applied to presentation evidence.",
         "options": [
-            {"id": "gate14", "label": "stability rank <= 1.4 (validated "
-             "production gate)", "validated": True},
+            {"id": "gate14", "label": "stability rank <= 1.4 (deployed "
+             "production gate)", "policy_default": True,
+             "validation_status": ("deployed criterion per POL-001; the mock "
+                                   "engine does not re-validate it"),
+             "effect": {"stability_max_rank": 1.4,
+                        "evidence_tier": "production"}},
             {"id": "gate20", "label": "stability rank <= 2.0 (relaxed, "
-             "exploratory only)", "validated": False},
+             "exploratory only)", "policy_default": False,
+             "validation_status": "exploratory setting; changes evidence tier",
+             "effect": {"stability_max_rank": 2.0,
+                        "evidence_tier": "exploratory"}},
         ],
         "rationale_default": ("1.4 is the deployed production criterion; the "
                               "relaxed option exists for exploration and "
@@ -97,20 +167,36 @@ DECISION_POINTS = {
         "evidence": ["mock: deployed gate max_stabpan_rank=1.4",
                      "relaxing the gate would change the evidence tier"],
         "policy_id": "POL-001",
+        "mandatory": True,
+        "effect_class": "threshold_selection",
+        "source": "policies.py POL-001 (NeoAG README / PRODUCTION_REQUIRED_TOOLS)",
     },
     "ranking": {
+        "key": "ranking.outputs",
+        "category": "pipeline",
         "decision_type": "parameter_choice",
+        "trigger": "entry to the ranking stage",
         "question": "Which ranking output(s) should the run produce?",
         "options": [
             {"id": "both", "label": "weighted + evidence-consensus (both, as "
-             "production requires)", "validated": True},
+             "production requires)", "policy_default": True,
+             "validation_status": ("documented production pairing; the mock "
+                                   "consensus rules are demo rules"),
+             "effect": {"ranking_artifacts": ["weighted",
+                                              "evidence-consensus"]}},
             {"id": "weighted", "label": "weighted only (exploratory)",
-             "validated": False},
+             "policy_default": False,
+             "validation_status": "exploratory setting; no consensus "
+                                  "comparison artifact is produced",
+             "effect": {"ranking_artifacts": ["weighted"]}},
         ],
         "rationale_default": ("production ranking emits weighted and "
                               "evidence-consensus rankings together"),
         "evidence": ["mock: consensus comparison is the review baseline"],
         "policy_id": "POL-003",
+        "mandatory": True,
+        "effect_class": "output_selection",
+        "source": "policies.py POL-003 + production workflow docs",
     },
 }
 REQUIRED_STAGES = {s["id"] for s in mock_data.STAGES if s["required"]}
@@ -130,7 +216,8 @@ class JobManager:
                execution_mode: str = "controlled", simulate_failure: bool = False,
                requested_by: str = "user", kind: str = "mock-analysis",
                manifest_id: str | None = None,
-               requested_config: dict | None = None) -> dict:
+               requested_config: dict | None = None,
+               conv_id: str = "") -> dict:
         stages = [mock_data.STAGE_BY_ID[s] for s in stage_ids if s in mock_data.STAGE_BY_ID]
         if not stages:
             raise ValueError("no valid stages selected")
@@ -155,7 +242,7 @@ class JobManager:
             "Approving queues the MOCK job. No real pipeline is connected; "
             "with the real gateway this class maps to HIGH risk / approved=true.")
         self.store.job_create(job_id, kind, sample_id, spec,
-                              "blocked", appr["id"])
+                              "blocked", appr["id"], conv_id=conv_id)
         self.store.event_add(job_id, "state",
                              f"blocked: waiting for approval {appr['id']}")
         self.store.audit(requested_by, "job.create.blocked", job_id,
@@ -295,28 +382,62 @@ class JobManager:
             "chosen": None, "rationale": None,
             "evidence": dp.get("evidence", []), "policy_id": dp.get("policy_id"),
             "policy_version": POLICY_VERSION, "decided_by": None,
-            "status": "pending"})
+            "status": "pending",
+            "key": dp.get("key"), "category": dp.get("category", "pipeline"),
+            "trigger": dp.get("trigger"), "source": dp.get("source"),
+            "mandatory": dp.get("mandatory", True),
+            "effect_class": dp.get("effect_class"),
+            "downstream": {"option_effects":
+                           {o["id"]: o.get("effect", {})
+                            for o in dp["options"]}}})
         self.store.event_add(job_id, "log",
                              f"decision point ({dp['decision_type']}): waiting "
                              f"for user - see Approvals/Decisions ({d_id})")
         return d_id
 
-    def _auto_decide(self, job_id: str, stage: dict, dp: dict) -> str:
-        validated = next(o["id"] for o in dp["options"] if o.get("validated"))
+    def _auto_decide(self, job_id: str, stage: dict, dp: dict) -> tuple[str, str]:
+        """Returns (decision_id, chosen_option_id)."""
+        default = next(o["id"] for o in dp["options"] if o.get("policy_default"))
+        d_id = new_id("dec")
         self.store.decision_add({
-            "id": new_id("dec"), "ts": now(), "decided_at": now(),
+            "id": d_id, "ts": now(), "decided_at": now(),
             "job_id": job_id, "stage": stage["name"],
             "decision_type": dp["decision_type"], "question": dp["question"],
-            "options": dp["options"], "chosen": validated,
-            "rationale": ("autonomous mode: applied validated default - "
+            "options": dp["options"], "chosen": default,
+            "rationale": ("autonomous mode: applied documented policy "
+                          "default (not a scientific validation claim) - "
                           + dp["rationale_default"]),
             "evidence": dp.get("evidence", []), "policy_id": dp.get("policy_id"),
             "policy_version": POLICY_VERSION, "decided_by": "engine",
-            "status": "resolved"})
+            "status": "resolved",
+            "key": dp.get("key"), "category": dp.get("category", "pipeline"),
+            "trigger": dp.get("trigger"), "source": dp.get("source"),
+            "mandatory": dp.get("mandatory", True),
+            "effect_class": dp.get("effect_class")})
         self.store.event_add(job_id, "log",
                              f"autonomous: resolved {dp['decision_type']} -> "
-                             f"'{validated}' (validated default, recorded)")
-        return validated
+                             f"'{default}' (policy default, recorded)")
+        return d_id, default
+
+    def _apply_effect(self, job_id: str, d_id: str | None, dp: dict,
+                      choice: str) -> dict:
+        """Look up what the chosen option maps to and record it on the
+        decision row - the decision history then states, per decision,
+        exactly what downstream configuration the choice produced."""
+        effect = {}
+        for o in dp["options"]:
+            if o["id"] == choice:
+                effect = o.get("effect", {})
+                break
+        if d_id:
+            self.store.decision_set_effect(d_id, {
+                "chosen": choice, "applied_effect": effect,
+                "effect_class": dp.get("effect_class"),
+                "applied_at": now()})
+        self.store.event_add(job_id, "log",
+                             f"decision effect applied ({dp.get('effect_class')}): "
+                             f"{json.dumps(effect, ensure_ascii=False)}")
+        return effect
 
     def _await_decision(self, job_id: str, d_id: str) -> str:
         """Block the worker until the user resolves the decision (or the job
@@ -341,10 +462,38 @@ class JobManager:
         done = 0
         skipped_essential: list[str] = []
         failed_stage: dict | None = None
+        chosen_by_key: dict[str, str] = {}
+        # Immutable per-run snapshot (A5): inputs, versions, requested
+        # config and the decision-option map AS OF THIS RUN. Written once
+        # (INSERT OR IGNORE); policy/default changes afterwards cannot
+        # retroactively alter what this run recorded.
+        self.store.snapshot_add(job_id, {
+            "captured_at": now(), "job_id": job_id,
+            "kind": job["kind"], "sample_id": job["sample_id"],
+            "conv_id": job.get("conv_id") or "",
+            "manifest_id": spec.get("manifest_id"),
+            "stage_plan": stage_ids,
+            "requested_config": spec.get("requested_config") or {},
+            "execution_mode_at_start": exec_mode,
+            "simulate_failure": bool(spec.get("simulate_failure")),
+            "engine_version": ENGINE_VERSION,
+            "policy_version": POLICY_VERSION,
+            "dataset_version": spec.get("dataset_version"),
+            "toolchain": MOCK_TOOLCHAIN,
+            "seed": f"{job_id}:{job['sample_id']}",
+            "decision_point_definitions": {
+                sid: {"key": dp.get("key"), "policy": dp.get("policy_id"),
+                      "policy_version": POLICY_VERSION,
+                      "option_effects": {o["id"]: o.get("effect", {})
+                                         for o in dp["options"]}}
+                for sid, dp in DECISION_POINTS.items()},
+        })
         self.store.job_set(job_id, state="running", started_at=now())
         self.store.event_add(job_id, "state",
                              f"running ({exec_mode} mode) - MOCK execution, no "
-                             "real pipeline connected")
+                             "real pipeline connected (per-run snapshot "
+                             "recorded: config + versions are frozen for "
+                             "this run)")
         self.publish({"type": "job", "id": job_id})
         for sid in stage_ids:
             stage = mock_data.STAGE_BY_ID.get(sid)
@@ -365,7 +514,15 @@ class JobManager:
                     "evidence": [f"previous mode {exec_mode}",
                                  "identical validity gates in both modes"],
                     "policy_id": None, "policy_version": POLICY_VERSION,
-                    "decided_by": "user", "status": "resolved"})
+                    "decided_by": "user", "status": "resolved",
+                    "key": "execution.mode", "category": "pipeline",
+                    "trigger": "user requested a mode switch mid-run",
+                    "source": "UI mode control",
+                    "mandatory": False,
+                    "effect_class": "execution_mode",
+                    "downstream": {"chosen": req_mode,
+                                   "applied_effect": {"execution_mode":
+                                                      req_mode}}})
                 exec_mode = req_mode
                 self.store.event_add(job_id, "state",
                                      f"mode switched to {exec_mode} at stage "
@@ -397,7 +554,10 @@ class JobManager:
                                          f"resumed: decision '{choice}' applied")
                     self.publish({"type": "job", "id": job_id})
                 else:
-                    choice = self._auto_decide(job_id, stage, dp)
+                    d_id, choice = self._auto_decide(job_id, stage, dp)
+                if choice != "skip_stage":
+                    self._apply_effect(job_id, d_id, dp, choice)
+                    chosen_by_key[dp["key"]] = choice
                 if choice == "skip_stage":
                     if sid in REQUIRED_STAGES:
                         skipped_essential.append(stage["name"])
@@ -483,19 +643,28 @@ class JobManager:
                     # retry is bounded - the option disappears after one use
                     opts = [
                         {"id": "retry", "label": "Retry stage once (re-run "
-                         "this stage; bounded recovery)", "validated": True},
+                         "this stage; bounded recovery)",
+                         "policy_default": True,
+                         "effect": {"action": "re-run this stage once"}},
                         {"id": "skip", "label": "Skip stage - allowed only "
                          "as explicit override; run marked "
-                         "production_release=false", "validated": False},
+                         "production_release=false",
+                         "policy_default": False,
+                         "effect": {"action": "skip stage",
+                                    "production_release": False}},
                         {"id": "terminate", "label": "Terminate run",
-                         "validated": True},
+                         "policy_default": False,
+                         "effect": {"action": "fail the run"}},
                     ] if attempts < 1 else [
                         {"id": "skip", "label": "Skip stage - allowed only "
                          "as explicit override; run marked "
                          "production_release=false (retry already used)",
-                         "validated": False},
+                         "policy_default": False,
+                         "effect": {"action": "skip stage",
+                                    "production_release": False}},
                         {"id": "terminate", "label": "Terminate run",
-                         "validated": True},
+                         "policy_default": False,
+                         "effect": {"action": "fail the run"}},
                     ]
                     d_id = new_id("dec")
                     self.store.decision_add({
@@ -510,13 +679,27 @@ class JobManager:
                                      "policy: missing stability evidence blocks "
                                      "production release (POL-001)"],
                         "policy_id": "POL-001", "policy_version": POLICY_VERSION,
-                        "decided_by": None, "status": "pending"})
+                        "decided_by": None, "status": "pending",
+                        "key": f"recovery.{sid}", "category": "pipeline",
+                        "trigger": f"stage '{sid}' failed (mock injection)",
+                        "source": "jobs.py failure path (POL-001)",
+                        "mandatory": True,
+                        "effect_class": "error_recovery",
+                        "downstream": {"option_effects":
+                                       {o["id"]: o.get("effect", {})
+                                        for o in opts}}})
                     self.store.job_set(job_id, state="blocked", error=gate
                                        + " - awaiting decision")
                     self.store.event_add(job_id, "error", gate)
                     self.publish({"type": "job", "id": job_id})
                     choice = self._await_decision(job_id, d_id)
                     self.resolutions.get(job_id, {}).pop(d_id, None)
+                    chosen_effect = next(
+                        (o.get("effect", {}) for o in opts
+                         if o["id"] == choice), {"action": "aborted"})
+                    self.store.decision_set_effect(d_id, {
+                        "chosen": choice, "applied_effect": chosen_effect,
+                        "effect_class": "error_recovery", "applied_at": now()})
                     if choice == "aborted":
                         self.store.job_set(job_id, state="failed",
                                            finished_at=now(),
@@ -557,9 +740,123 @@ class JobManager:
                                    "than silently skipping (POL-001)"))
             self.publish({"type": "job", "id": job_id})
             return
-        rows = mock_data.make_candidates(job_id, job["sample_id"],
-                                         top_n=int(spec.get("top_n", 12)))
+        # ---- execution completed: generate the OUTPUT artifacts the
+        # decisions asked for, register each with an honest availability
+        # status, then classify the run's outcome (A1/A2/A3). The job's
+        # lifecycle state stays 'completed' (execution really finished);
+        # what EXISTS and is AVAILABLE is whatever the artifacts table
+        # shows - never an assumption.
         release_ok = not skipped_essential
+        warnings: list[str] = []
+        gate_rank = GATE_RANKS.get(chosen_by_key.get(
+            "presentation.stability_gate", "gate14"), 1.4)
+        want = RANKING_ARTIFACTS.get(chosen_by_key.get(
+            "ranking.outputs", "both"), ["weighted", "evidence-consensus"])
+        if chosen_by_key.get("input.rna_pair") == "legacy":
+            warnings.append("legacy RNA pair chosen by decision: expression "
+                            "evidence carries a labelling-ambiguity caveat")
+        if gate_rank > 1.4:
+            warnings.append(f"stability gate relaxed to {gate_rank} by "
+                            "decision: evidence tier is exploratory")
+        self.store.event_add(job_id, "log",
+                             "execution completed - generating output "
+                             f"artifacts per decisions (gate={gate_rank}, "
+                             f"ranking={'+'.join(want)})")
+        self.publish({"type": "job", "id": job_id})
+        registered: list[dict] = []
+        tables: dict[str, list[dict]] = {}
+        gen_meta: dict[str, dict] = {}
+        try:
+            tables, gen_meta = mock_data.make_rankings(
+                job_id, job["sample_id"], top_n=int(spec.get("top_n", 12)),
+                gate_rank=gate_rank, want=want)
+        except Exception as e:            # honest generation-failure path
+            for strat in want:
+                registered.append(self.store.artifact_add(
+                    job_id, "candidate_table", strat + ".tsv", strat,
+                    f"(mock)/{job_id}/ranking/{strat}.tsv",
+                    "failed_generation", None, None,
+                    {"error": str(e)[:300]}))
+            warnings.append(f"output generation failed: {e}")
+        for strat in want:
+            rows = tables.get(strat)
+            if rows is None:      # generator produced no table for a
+                                   # requested artifact: that is a real gap
+                registered.append(self.store.artifact_add(
+                    job_id, "candidate_table", f"{strat}_ranking.tsv", strat,
+                    f"(mock)/{job_id}/ranking/{strat}.tsv",
+                    "missing", None, None,
+                    {"reason": "output generator returned no table for this "
+                               "requested artifact"}))
+                continue
+            status = "available" if rows else "empty"
+            checksum = hashlib.sha256(
+                json.dumps(rows, sort_keys=True, ensure_ascii=False)
+                .encode("utf-8")).hexdigest()[:16]
+            meta = {"generated_by": ENGINE_VERSION, **gen_meta.get(strat, {}),
+                    "rule": ("mock weighted composite score, rows below the "
+                             "chosen stability gate excluded (counted)"
+                             if strat == "weighted" else
+                             f"mock consensus rules >= "
+                             f"{mock_data.CONSENSUS_TIER}/7")}
+            if meta.get("below_gate_excluded"):
+                warnings.append(
+                    f"{meta['below_gate_excluded']} candidate(s) excluded "
+                    f"from the weighted table by stability gate "
+                    f"{gate_rank} (rule recorded in artifact meta)")
+            registered.append(self.store.artifact_add(
+                job_id, "candidate_table", f"{strat}_ranking.tsv", strat,
+                f"(mock)/{job_id}/ranking/{strat}.tsv",
+                status, len(rows), checksum, meta))
+        for a in registered:
+            self.store.event_add(
+                job_id, "log",
+                f"artifact registered: {a['name']} [{a['status']}] "
+                + (f"{a['rows']} row(s), checksum {a['checksum']}"
+                   if a["status"] == "available" else
+                   ("0 rows - zero candidates is a real result, not hidden"
+                    if a["status"] == "empty" else
+                    ("requested artifact missing - NOT deliverable"
+                     if a["status"] == "missing" else "generation failed"))))
+        outcome = classify_outcome(registered)
+        if not release_ok:
+            warnings.append("essential stage(s) skipped by decision: "
+                            + ", ".join(skipped_essential))
+        outcome_notes = {
+            "delivered": "all requested output artifacts generated and "
+                         "registered as available",
+            "zero_candidates": "execution completed; every requested "
+                               "candidate table legitimately contains ZERO "
+                               "candidates - this is a result, not a failure",
+            "partial": "execution completed, but at least one requested "
+                       "output artifact is empty/missing - results shown "
+                       "are PARTIAL",
+            "generation_failed": "execution completed but output "
+                                 "GENERATION failed - there are no usable "
+                                 "results despite completed execution",
+            "no_artifacts": "execution completed but produced no output "
+                            "artifacts at all - nothing is deliverable"}
+        if release_ok:
+            warnings.append("production release permitted (mock gate)")
+        primary = next((t for t in ("weighted", "evidence-consensus")
+                        if t in tables), None)
+        primary_rows = tables.get(primary, []) if primary else []
+        decisions_summary = [
+            {"key": d.get("key"), "decision_type": d["decision_type"],
+             "question": d["question"], "chosen": d["chosen"],
+             "decided_by": d["decided_by"], "policy_id": d.get("policy_id"),
+             "policy_version": d.get("policy_version")}
+            for d in self.store.decision_list(job_id)
+            if d["status"] == "resolved"]
+        effective_config = dict(spec.get("requested_config") or {})
+        effective_config.update({
+            "stability_max_rank": gate_rank,
+            "ranking_artifacts": want,
+            "rna_pair": chosen_by_key.get("input.rna_pair", "matched"),
+            "execution_mode_final": exec_mode,
+            "top_n": int(spec.get("top_n", 12))})
+        unavailable = [a["name"] for a in registered
+                       if a["status"] != "available"]
         result = {
             "disclaimer": ("COMPUTATIONAL PREDICTIONS ON MOCK DATA - not "
                            "experimentally validated, not clinical results"),
@@ -570,16 +867,57 @@ class JobManager:
                              "production release BLOCKED: essential stage(s) "
                              f"{', '.join(skipped_essential)} skipped by explicit "
                              "user decision (recorded in decision history)"),
-            "candidates": rows,
-            "provenance": {"job_id": job_id, "engine": "mock",
+            "outcome": outcome,
+            "outcome_note": outcome_notes[outcome],
+            "delivery_claim": ("this run DELIVERS: " + ", ".join(
+                a["name"] for a in registered
+                if a["status"] == "available")) if any(
+                a["status"] == "available" for a in registered) else
+                "this run delivers NOTHING - see outcome_note",
+            "unavailable_artifacts": unavailable,
+            "warnings": warnings,
+            "manifest": {
+                "job_id": job_id,
+                "manifest_ref": "artifacts table, job_id=" + job_id,
+                "requested_config": spec.get("requested_config") or {},
+                "effective_config": effective_config,
+                "requested_vs_effective_note": (
+                    "effective_config merges the requested config with the "
+                    "decisions actually applied by this run; keys the mock "
+                    "engine does not consume stay listed as requested"),
+                "execution_mode": exec_mode,
+                "versions": {"engine": ENGINE_VERSION,
+                             "policy": POLICY_VERSION,
+                             "dataset": spec.get("dataset_version"),
+                             "toolchain": MOCK_TOOLCHAIN},
+                "artifacts": [{"id": a["id"], "name": a["name"],
+                               "type": a["type"], "strategy": a["strategy"],
+                               "path": a["path"], "status": a["status"],
+                               "rows": a["rows"], "checksum": a["checksum"],
+                               "generated_at": a["created_at"]}
+                              for a in registered],
+                "decisions": decisions_summary,
+                "snapshot": "run_snapshots table, job_id=" + job_id,
+                "generated_at": now()},
+            "candidates": primary_rows,
+            "candidates_strategy": primary,
+            # A2: choosing "both" rankings must SHOW both tables;
+            # each strategy's rows travel with the run result.
+            "candidates_by_strategy": tables,
+            "provenance": {"job_id": job_id, "engine": ENGINE_VERSION,
                            "sample": job["sample_id"],
                            "execution_mode": exec_mode,
                            "generator_seed": f"{job_id}:{job['sample_id']}"}}
-        self.store.job_set(job_id, state="completed", finished_at=now(), progress=100.0,
-                           stage=None, result_json=json.dumps(result, ensure_ascii=False))
+        self.store.job_set(job_id, state="completed", finished_at=now(),
+                           progress=100.0, stage=None, outcome=outcome,
+                           result_json=json.dumps(result, ensure_ascii=False))
         self.store.event_add(job_id, "state",
-                             f"completed (mock): {len(rows)} synthetic candidates"
+                             f"completed (mock): outcome={outcome} - "
+                             + ", ".join(f"{a['name']}[{a['status']}]"
+                                         for a in registered)
                              + ("" if release_ok else " - release blocked"))
         self.store.audit("engine", "job.completed", job_id,
-                         {"production_release": release_ok})
+                         {"production_release": release_ok,
+                          "outcome": outcome,
+                          "artifacts": [a["status"] for a in registered]})
         self.publish({"type": "job", "id": job_id})
