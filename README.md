@@ -35,6 +35,13 @@ Environment overrides used by the verification suites:
 `NEOAG_DEMO_PORT`. Both suites spawn their own isolated server, so
 the live demo state is never touched by tests.
 
+Push transport on this host: system DNS is poisoned for github.com,
+so pushes go through a localhost CONNECT proxy pinning github.com to
+a known-good GitHub IP, with a retry loop - mid-transfer resets
+("Proxy CONNECT aborted", GnuTLS -110) are transient; a successful
+push has needed up to 10 attempts. Credentials come from the saved
+askpass helper, and the remote is addressed by explicit URL.
+
 ## Layout (phase B)
 
 Three panes, the app filling the viewport exactly - the page itself
