@@ -387,7 +387,24 @@ class JobManager:
                              "benchmark")
         ds = brief.get("dataset") or {}
         src = str(ds.get("source") or "demo_fixture")
+        # M6 PART C: the consent request must STATE every field a human
+        # needs to decide - size, destination, compute, metrics, whether
+        # software must be installed and whether the production NeoAG
+        # installation is touched. The backend refuses incomplete
+        # briefs; enforcement is code, not an instruction to the agent.
+        size = str(ds.get("download_size") or "").strip()
+        dest = str(ds.get("destination") or "").strip()
         if src != "demo_fixture":
+            if not size:
+                raise ValueError(
+                    "consent brief needs dataset.download_size stated "
+                    "(e.g. '~1.2 GB (3x sample.fastq.gz)') - a consent "
+                    "request without a stated download size is not "
+                    "actionable")
+            if not dest:
+                raise ValueError(
+                    "consent brief needs dataset.destination stated - "
+                    "the user must see WHERE the data will be stored")
             cid = str(ds.get("consent_approval_id") or "")
             appr = self.store.approval_get(cid) if cid else None
             ds_ref = str(ds.get("id") or src)
@@ -398,6 +415,32 @@ class JobManager:
                     "an APPROVED dataset-download consent card "
                     "(dataset-specific) - benchmark jobs never download "
                     "datasets, an operator must supply the data first")
+        else:
+            size = size or "0 B (no download - read-only synthetic fixture)"
+            dest = dest or "(read-only) synthetic demo fixture directory"
+        compute = str(brief.get("compute_estimate") or "").strip()
+        if not compute:
+            raise ValueError(
+                "consent brief needs compute_estimate stated (expected "
+                "CPU/GPU/memory/wall-clock for the full comparison)")
+        install = str(brief.get("software_installation") or "").strip()
+        if not install:
+            raise ValueError(
+                "consent brief must state whether software installation "
+                "is necessary (say 'none - all arms already installed' "
+                "when that is the case)")
+        modifies = brief.get("modifies_neoag_installation")
+        if not isinstance(modifies, bool):
+            raise ValueError(
+                "consent brief must state modifies_neoag_installation "
+                "as an explicit true/false - the user must never have to "
+                "guess whether production is touched")
+        if modifies:
+            raise ValueError(
+                "modifies_neoag_installation must be false: a benchmark "
+                "never modifies the production NeoAG installation or "
+                "replaces production tools - candidate software must go "
+                "into an isolated environment")
         cfg = brief.get("config") or {}
         try:
             gate_b = float(cfg.get("baseline_gate", 1.4))
@@ -419,10 +462,12 @@ class JobManager:
                 "baseline_strategy": "weighted",
                 "candidate_strategy": strat,
                 "metrics": metrics,
-                "compute_estimate": str(brief.get("compute_estimate")
-                                        or "not stated"),
+                "compute_estimate": compute,
+                "software_installation": install,
+                "modifies_neoag_installation": modifies,
                 "risks": [str(r) for r in (brief.get("risks") or [])],
                 "dataset": {"source": src, "id": ds.get("id") or src,
+                            "download_size": size, "destination": dest,
                             "consent_approval_id":
                                 ds.get("consent_approval_id")},
                 "gates": {"baseline": gate_b, "candidate": gate_c}},
@@ -433,22 +478,50 @@ class JobManager:
         job_id = new_id("job")
         summary = (f"BENCHMARK proposal - hypothesis: {hyp[:180]} | "
                    f"candidate '{cand}' vs baseline '{base}' on dataset "
-                   f"{ds.get('id') or src} | metrics: "
-                   f"{', '.join(metrics)} | compute: "
-                   f"{spec['benchmark']['compute_estimate']}")
+                   f"{ds.get('id') or src} | download: {size[:60]} | "
+                   f"destination: {dest[:60]} | metrics: "
+                   f"{', '.join(metrics)} | compute: {compute[:80]} | "
+                   f"installation: {install[:60]}")
         note = ("Approving runs the benchmark harness on this host. Arms "
                 "using the deployment's own ranking strategies execute "
                 "for real on identical seeded inputs with a full "
                 "reproducibility record; a candidate tool that is not "
                 "installed here is NOT simulated - its arm records a "
                 "reviewable run plan and the result states that. No "
-                "dataset downloads happen at run time.")
+                "dataset downloads happen at run time. Installation "
+                f"stated: {install}. Production NeoAG installation "
+                "modified: NO (enforced - briefs claiming otherwise are "
+                "rejected at submit).")
         if spec["benchmark"]["risks"]:
             note += (" Stated risks: "
                      + "; ".join(spec["benchmark"]["risks"])[:400])
+        # M6 PART C: structured consent card - the UI renders these
+        # labelled fields verbatim so the approval request visibly
+        # carries dataset+source / question / tools / size / destination
+        # / compute / metrics / installation / production-modification.
+        consent_fields = [
+            {"label": "Dataset and source",
+             "value": f"{ds.get('id') or src} (source: {src})"},
+            {"label": "Scientific question", "value": hyp},
+            {"label": "Comparison tools",
+             "value": f"candidate {cand} vs baseline {base} "
+                      f"(baseline strategy: weighted)"},
+            {"label": "Download size", "value": size},
+            {"label": "Storage destination", "value": dest},
+            {"label": "Expected computing", "value": compute},
+            {"label": "Evaluation metrics", "value": ", ".join(metrics)},
+            {"label": "Software installation necessary",
+             "value": install},
+            {"label": "Modifies current NeoAG installation",
+             "value": "NO - production tools are never replaced or "
+                      "modified (enforced at submit)"}]
+        detail = json.dumps({"kind": "benchmark_consent",
+                             "fields": consent_fields, "note": note},
+                            ensure_ascii=False)
         appr = self.store.approval_create(
             new_id("appr"), job_id, summary,
-            "MEDIUM (benchmark harness on synthetic demo fixture)", note)
+            "MEDIUM (benchmark harness on synthetic demo fixture)",
+            detail)
         self.store.job_create(job_id, "benchmark", sample_id, spec,
                               "blocked", appr["id"], conv_id=conv_id)
         self.store.event_add(job_id, "state",
@@ -758,7 +831,15 @@ class JobManager:
                           "wall_s": wall})
         self.publish({"type": "job", "id": job_id})
 
-    def on_approval_decided(self, appr_id: str, approve: bool) -> None:
+    def on_approval_decided(self, appr_id: str, approve: bool,
+                            decision: str = "", scope_note: str = "") -> None:
+        """Human answered an execution/consent card. M6 PART C: a
+        benchmark consent card may be answered four ways - approve,
+        reject, limit scope, or literature-only. Anything but approve
+        ends the formal job HERE (nothing runs), but each outcome is
+        recorded with its own reason so the audit trail says what the
+        human actually decided, not just 'denied'."""
+        decision = decision or ("approve" if approve else "reject")
         with self.store.lock:
             rows = self.store.db.execute(
                 "SELECT id FROM jobs WHERE approval_id=?", (appr_id,)).fetchall()
@@ -771,9 +852,28 @@ class JobManager:
                 self.store.event_add(job["id"], "state", "queued (approval granted)")
                 self._launch(job["id"])
             else:
+                why = {"limit_scope":
+                       "scope limited by user - the experiment must be "
+                       "re-scoped and re-submitted for a new approval",
+                       "literature_only":
+                       "user requested a literature-only assessment - "
+                       "no download, no execution",
+                       }.get(decision, "approval denied by user")
+                if scope_note and decision == "limit_scope":
+                    why += " | allowed scope: " + scope_note[:300]
                 self.store.job_set(job["id"], state="cancelled", finished_at=now(),
-                                   error="approval denied by user")
-                self.store.event_add(job["id"], "state", "cancelled (approval denied)")
+                                   error=why[:400])
+                self.store.event_add(job["id"], "state",
+                                     f"cancelled ({decision.replace('_', ' ')})")
+                if job.get("conv_id"):
+                    # the human answered IN THIS APP; tell the owning
+                    # conversation what happened to its formal job
+                    self.store.msg_add(
+                        "system",
+                        f"Job {job['id']}: {why[:300]}",
+                        {"kind": "approval_outcome", "decision": decision,
+                         "job_id": job["id"]},
+                        conv_id=job["conv_id"])
             self.publish({"type": "job", "id": job["id"]})
 
     # ----- controls -----

@@ -35,6 +35,14 @@ For routine failures, diagnose from logs, retry a recoverable step at
 most once with a concrete correction, then stop and report the exact
 error with what you tried. Do not silently fall back to a different
 analysis.
+A failure with an already-clear cause needs an ANSWER, not an
+investigation: if a file is missing, a tool is not installed, a
+license is absent, the task API records a gate denial, or a prior
+report documents this error, say in a few sentences what failed, why,
+and the next step - and stop. Do not start open-ended tool
+exploration (repeated listings, repeated runs, searching for a
+different route) after such an error; several minutes of tool churn
+on a known cause is a failure, not diligence.
 
 ## The execution gate (how approvals actually work here)
 A gate checks every tool call. Routine work passes silently. You will
@@ -67,9 +75,23 @@ any approval path - never attempt them.
 - Never paraphrase around a dataset block (renaming hosts, chunking,
   or bespoke downloader scripts); the approval flow exists precisely
   so downloads are visible decisions.
-- Running a benchmark is a FORMAL run: get the dataset consent first,
-  then register the job via taskquery job submit - never run the
-  comparison silently in chat.
+- Existing literature must be evaluated BEFORE proposing a new
+  experiment; a missing performance number alone is NOT a reason to
+  download data.
+- Proposing a substantive benchmark = a consent request, and a
+  FORMAL run afterwards: first assemble the full brief - dataset and
+  source, the scientific question, comparison tools, download size,
+  storage destination, expected computing requirements, evaluation
+  metrics, whether software installation is necessary, and whether
+  the current NeoAG installation would be modified (answer: never -
+  the backend rejects briefs that claim otherwise) - then register it
+  via taskquery job submit (kind=benchmark); the backend validates
+  every field and blocks the job on the consent card. The user may
+  answer APPROVE, REJECT, LIMIT SCOPE (with the allowed scope - redo
+  the request inside it, on a fresh card) or LITERATURE ONLY (finish
+  the comparison from retrieved papers and state its limits). Never
+  run a comparison silently in chat, never retry a limited request
+  unchanged, and never replace or modify production tools.
 
 ## Formal NeoAG runs go through the task API (enforced)
 Launching the real pipeline from your shell (`open-neo run --mode

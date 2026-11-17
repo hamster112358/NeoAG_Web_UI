@@ -305,7 +305,130 @@ CONCERN_BY_ITEM = {  # overrides inside mixed groups
     "approved": "managed", "mode": "execution",
     "outdir": "execution", "allow_partial": "execution",
     "timeout": "execution",
+    # M6 PART E: resource knobs, reference locations and file-override
+    # paths are execution/environment matters, not scientific choices -
+    # the science panel keeps only structured controls that demonstrably
+    # change native execution (SCIENCE_CONTROLS below).
+    "rna_threads": "execution", "easyfuse_ref": "execution",
+    "snaf_workflow": "execution", "splicemutr_workflow": "execution",
+    "sv_vcf": "inputs", "sv_threads": "execution",
+    "sv_memory_gb": "execution",
+    "reports": "execution", "weighted_baseline": "execution",
+    "evidence_consensus_rules": "execution",
+    "genome_build": "execution",  # rendered as a radio in the science
+                                  # panel (SCIENCE_CONTROLS), not here
 }
+
+# ---------------------------------------------------------------------------
+# Milestone 6 PART E: the curated SCIENTIFIC control set.
+# A control appears here only if, on 2026-11-17, all three hold:
+#   - the flag exists in the deployed unified entry (open_neo/cli.py run
+#     subparser) AND in the gateway /open/run ROUTE_SPECS optional list
+#     (src/neoag/controlled_execution/gateway.py), so the choice genuinely
+#     changes what a native run does;
+#   - the Web layer forwards it (backend/native.py _INPUT_KEYS /
+#     _SCIENTIFIC_KEYS -> build_plan_argv and the gateway payload);
+#   - the value is fully constrained (fixed choices, bounded integers,
+#     checkboxes) and re-validated server-side (native.validate_scientific)
+#     - no free-text CLI parameter is ever shown as a scientific control.
+# Unset on every control means "native default" - nothing is forwarded and
+# the deployed defaults (cited per row) apply.
+# Scientific decisions the deployed code makes on its own have NO knob
+# here; they are listed in SCIENCE_INFO with their code citations instead.
+SCIENCE_SECTIONS = {
+    "rna_fusion_splice": "RNA expression evidence",
+    "tool_routing": "Evidence-source routing when a primary tool is missing",
+    "structural_variants": "Structural-variant branch",
+    "ranking_reporting": "Ranking windows",
+    "reference_consistency": "Reference build consistency",
+}
+SCIENCE_CONTROLS = [
+    {"id": "rna_quant_method", "section": "rna_fusion_splice",
+     "label": "Transcript quantification backend",
+     "control": "radio", "options": ["auto", "salmon", "rsem"],
+     "native_default": "auto",
+     "affects": "Which quantifier produces the expression evidence that "
+                "feeds the fusion/splice branches and expression scoring.",
+     "evidence": f"{RUN_CLI} run.add_argument('--rna-quant-method', "
+                 "choices=[auto, salmon, rsem])"},
+    {"id": "automatic_tool_policy", "section": "tool_routing",
+     "label": "Alternative-tool policy",
+     "control": "radio",
+     "options": ["all-available", "balanced", "minimal"],
+     "native_default": "all-available",
+     "affects": "Which alternative tools the planner may route to when a "
+                "primary tool is unavailable - changes the evidence "
+                "sources that reach scoring, not just resource use.",
+     "evidence": f"{RUN_CLI} run.add_argument('--automatic-tool-policy', "
+                 "choices=[all-available, balanced, minimal])"},
+    {"id": "skip_dna_sv", "section": "structural_variants",
+     "label": "Disable the DNA SV calling branch",
+     "control": "checkbox", "native_default": False,
+     "affects": "The run produces no SV-derived peptide events at all; "
+                "supplying an SV VCF input is then pointless.",
+     "evidence": f"{RUN_CLI} run.add_argument('--skip-dna-sv')"},
+    {"id": "skip_bam_matcher", "section": "structural_variants",
+     "label": "Skip the tumor/normal identity check",
+     "control": "checkbox", "native_default": False,
+     "affects": "Turns off the BAM sample-identity (contamination/swap) "
+                "guard. Only tick when identity was verified elsewhere - "
+                "this weakens a safety check.",
+     "evidence": f"{RUN_CLI} run.add_argument('--skip-bam-matcher')"},
+    {"id": "event_top_n", "section": "ranking_reporting",
+     "label": "Event top-N",
+     "control": "number", "min": 1, "max": 500, "step": 1,
+     "native_default": 20,
+     "affects": "How many event-level rows the final ranking keeps - the "
+                "review window for junction/fusion/SV events.",
+     "evidence": f"{RUN_CLI} run.add_argument('--event-top-n', type=int, "
+                 "default=20)"},
+    {"id": "candidate_top_n", "section": "ranking_reporting",
+     "label": "Candidate top-N",
+     "control": "number", "min": 1, "max": 2000, "step": 1,
+     "native_default": 100,
+     "affects": "How many peptide-HLA candidates are kept per track - "
+                "the window the shortlist is drawn from.",
+     "evidence": f"{RUN_CLI} run.add_argument('--candidate-top-n', "
+                 "type=int, default=100)"},
+    {"id": "genome_build", "section": "reference_consistency",
+     "label": "Genome build",
+     "control": "radio", "options": ["GRCh38", "GRCh37"],
+     "native_default": "GRCh38",
+     "affects": "Consistency key locking reference FASTA, VEP cache and "
+                "loci assets to one build; a mismatch silently produces "
+                "stale calls, so only builds this deployment has "
+                "validated assets for may be chosen.",
+     "evidence": f"{RUN_CLI} run.add_argument('--genome-build', "
+                 "default=GRCh38); build check "
+                 "src/neoag/open_neo/auto_config.py:367-376"},
+]
+
+# Scientific decisions with NO exposed knob: the deployed code decides
+# them, and the UI says where instead of pretending to offer a control.
+SCIENCE_INFO = [
+    {"title": "Presentation predictors & consensus",
+     "decided": "the capability planner derives the predictor set and its "
+                "required minimum from the installed toolchain - a web "
+                "choice could not run tools that are not installed.",
+     "evidence": "src/neoag/open_neo/capability_planner.py:831-871"},
+    {"title": "HLA-LOH handling",
+     "decided": "LOH evidence (a manifest input) marks LOH alleles during "
+                "scoring; the scoring rule itself is fixed in code, so "
+                "there is no threshold knob to offer.",
+     "evidence": "src/neoag/scoring.py:262-267"},
+    {"title": "CNV / CCF uncertainty",
+     "decided": "CCF and CNV evidence feed fixed caution notes and caps "
+                "in scoring (clonality caution below CCF 0.75; RNA-only "
+                "unresolved events handled explicitly) - no exposed "
+                "weight or threshold.",
+     "evidence": "src/neoag/scoring.py:281-298"},
+    {"title": "Fusion evidence quality",
+     "decided": "RNA-only fusion events get a priority cap read from the "
+                "weighted ranking profile; overriding that profile file "
+                "is the expert execution path (--weighted-baseline), not "
+                "a science toggle.",
+     "evidence": "src/neoag/scoring.py:401-404"},
+]
 # module label/purpose for concern B; the tools column is NOT stated
 # here - it is derived at request time from the code-grounded inventory
 # (load_inventory stages), so it can never drift from the repo.

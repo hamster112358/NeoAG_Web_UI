@@ -25,13 +25,44 @@ UA = ("NeoAGWebDemo/1.0 (research adapter on a research server; "
 TIMEOUT = 15
 
 
-def _http_json(url: str, timeout: int = TIMEOUT):
-    req = urllib.request.Request(url, headers={"User-Agent": UA,
-                                               "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        raw = r.read().decode("utf-8", "replace")
-    # PubMed/PyPI are strict JSON; Europe PMC too. Tolerate control chars.
-    return json.loads(raw, strict=False)
+def _http_json(url: str, timeout: int = TIMEOUT, retries: int = 2):
+    """M6 A8: transient failures (Europe PMC read timeouts, GitHub's
+    10/min search budget) are RETRIED with the endpoint's own advice
+    (X-RateLimit-Reset) before being recorded as failures - one 403
+    must not silently make a whole candidate batch 'unverified'.
+    A final failure is still returned as an error, never as fake data."""
+    import time
+    last = None
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(url, headers={"User-Agent": UA,
+                                                   "Accept":
+                                                   "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw = r.read().decode("utf-8", "replace")
+            # PubMed/PyPI are strict JSON; Europe PMC too. Tolerate
+            # control chars.
+            return json.loads(raw, strict=False)
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code == 403:
+                reset = e.headers.get("X-RateLimit-Reset")
+                wait = 20
+                if reset:
+                    try:
+                        wait = max(5, min(65, int(reset) - int(time.time())
+                                          + 1))
+                    except ValueError:
+                        pass
+            elif e.code in (429, 500, 502, 503, 504):
+                wait = 10
+            else:
+                raise
+        except (TimeoutError, urllib.error.URLError) as e:
+            last, wait = e, 8
+        if attempt < retries:
+            time.sleep(wait)
+    raise last
 
 
 def _rec(source: str, rid: str, url: str, title: str, year=None,
@@ -356,6 +387,12 @@ def biotools_search(name: str, max_results: int = 3):
                             "page_size": max_results}), timeout=12)
         out = []
         for r in j.get("list") or []:
+            if not (r.get("toolID") or "").strip():
+                # a registry record without an id is not evidence of
+                # a tool (measured 2026-11-17: bio.tools returned an
+                # id-less record that made the virus string "CoV-2"
+                # look "found on bio.tools" + registry-verified)
+                continue
             lic = ((r.get("licence") or {}) if isinstance(
                 r.get("licence"), dict) else {})
             out.append(_rec(

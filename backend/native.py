@@ -76,14 +76,77 @@ _probe_cache = {"ts": 0.0, "val": None}
 # keys the Web may forward; each maps 1:1 to a real open-neo CLI flag /
 # gateway /open/run field (ROUTE_SPECS optional list). Unknown web keys
 # must never leak through.
+# M6 PART D1/D3: the deployed unified entry (`open-neo run`, help text
+# "Detect inputs, route, run the pipeline") consumes RAW inputs directly
+# - --input-dir / BAM / FASTQ were verified present in the deployed
+# cli.py run subparser AND in the gateway /open/run ROUTE_SPECS optional
+# list on 2026-11-17, so the Web layer must be able to pass them: the
+# user names a data directory, discovery maps files to these roles, and
+# NeoAG's own planner decides which branches run.
 _INPUT_KEYS = ("somatic_vcf", "hla_alleles", "hla_file", "expression_tsv",
                "transcript_expression_tsv", "rna_evidence_tsv",
                "fusion_tsv", "splice_junction_tsv", "sv_vcf", "purity_tsv",
                "cnv_tsv", "hla_loh_tsv", "normal_expression",
                "normal_hla_ligands", "reference_proteome", "capture_bed",
                "peptide_csv", "raw_peptides", "tumor_sample_id",
-               "normal_sample_id", "assay_type")
-_SCIENTIFIC_KEYS = ("event_top_n", "candidate_top_n", "genome_build")
+               "normal_sample_id", "assay_type",
+               "input_dir", "tumor_dna_bam", "normal_dna_bam",
+               "tumor_rna_bam", "tumor_dna_fastq", "normal_dna_fastq",
+               "tumor_rna_fastq", "rna_quant_method",
+               "skip_bam_matcher", "skip_dna_sv")
+# CLI flags declared action="append": a list value repeats the flag
+_LIST_KEYS = ("tumor_dna_fastq", "normal_dna_fastq", "tumor_rna_fastq",
+              "sv_vcf")
+# genome_build is passed explicitly in build_plan_argv (never looped -
+# it would duplicate the flag). automatic_tool_policy added for M6 PART E;
+# assay_type / rna_quant_method / skip_* already ride _INPUT_KEYS. Each
+# row verified against the deployed cli.py AND gateway /open/run
+# ROUTE_SPECS optional list on 2026-11-17 (see neoag_params
+# SCIENCE_CONTROLS for the user-facing statement of the same set).
+_SCIENTIFIC_KEYS = ("event_top_n", "candidate_top_n", "genome_build",
+                    "automatic_tool_policy")
+
+# M6 PART E: server-side validation of every scientific override before
+# it can reach a run - the UI shows only constrained controls, and the
+# backend independently rejects anything else ("no unvalidated free-text
+# CLI params"). Choice sets/ranges mirror the deployed code defaults.
+_SCIENCE_CHOICE = {
+    "assay_type": ("WGS", "WES", "PANEL", "CAPTURE", "RNA"),
+    "rna_quant_method": ("auto", "salmon", "rsem"),
+    "automatic_tool_policy": ("all-available", "balanced", "minimal"),
+    "genome_build": ("GRCh38", "GRCh37"),
+}
+_SCIENCE_RANGE = {"event_top_n": (1, 500), "candidate_top_n": (1, 2000)}
+_SCIENCE_BOOL = ("skip_bam_matcher", "skip_dna_sv")
+
+
+def validate_scientific(params):
+    """Return a list of human-readable problems with scientific overrides
+    (empty = every value is a real, in-range option). Unknown keys are
+    NOT reported here - they are already dropped by the forward whitelist;
+    this guards the values of keys that WILL be forwarded."""
+    errs = []
+    for k, allowed in _SCIENCE_CHOICE.items():
+        v = params.get(k)
+        if v not in (None, "") and str(v) not in allowed:
+            errs.append(f"{k}={v!r} is not one of {list(allowed)}")
+    for k, (lo, hi) in _SCIENCE_RANGE.items():
+        v = params.get(k)
+        if v in (None, ""):
+            continue
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            errs.append(f"{k}={v!r} is not an integer")
+            continue
+        if not lo <= n <= hi:
+            errs.append(f"{k}={n} is outside the supported range "
+                        f"{lo}..{hi}")
+    for k in _SCIENCE_BOOL:
+        v = params.get(k)
+        if v not in (None, "", True, False):
+            errs.append(f"{k} must be true or false")
+    return errs
 
 
 def _env():
@@ -261,6 +324,12 @@ def build_plan_argv(params, outdir):
         if k == "hla_alleles":
             argv += ["--hla-alleles", json.dumps(list(v))
                      if not isinstance(v, str) else v]
+        elif k in ("skip_bam_matcher", "skip_dna_sv"):
+            if v:                          # store_true flags: no value
+                argv += ["--" + k.replace("_", "-")]
+        elif k in _LIST_KEYS and isinstance(v, (list, tuple)):
+            for item in v:                 # action=append: repeat the flag
+                argv += ["--" + k.replace("_", "-"), str(item)]
         else:
             argv += ["--" + k.replace("_", "-"), str(v)]
     return argv
@@ -405,6 +474,254 @@ def tail_log(outdir, name="run_full.log", limit=4000):
         except OSError:
             continue
     return ""
+
+
+# --------------------------------------------------------------------------
+# M6 PART D2: real input discovery for the unified native entry. The
+# user names a data directory; this is a READ-ONLY scan of file NAMES
+# (contents are never read - patient data safety), mapping discovered
+# files onto the entry point's input roles. The proposal becomes the
+# manifest the human confirms; the manifest is then authoritative and
+# the native planner stays the authority on what can run (its --mode
+# plan pass is the honest preflight).
+_DISCOVER_MAX_FILES = 1500
+_DISCOVER_MAX_DEPTH = 3
+_SKIP_DIR_NAMES = (".git", "__pycache__", "node_modules", ".snakemake",
+                   ".nextflow")
+
+
+def _toks(fn: str) -> str:
+    import re as _re
+    return _re.sub(r"[^a-z0-9*]+", " ", fn.lower())
+
+
+def _modality(lc: str) -> str:
+    """tumor | normal | rna | unknown from filename words. Single-letter
+    T/N tokens (the classic T/N pairing convention) count; R1/R2 are read
+    numbers, never RNA. Human confirmation of the manifest is the safety
+    net for genuinely ambiguous names."""
+    words = [w for w in _toks(lc).split() if w]
+    if any(w in ("rna", "trna", "rnaseq", "rnaseq") or
+               (w.startswith("rna") and w != "rnaseq") for w in words):
+        return "rna"
+    if any(w in ("normal", "norm", "germline", "blood", "n", "ng")
+           for w in words):
+        return "normal"
+    if any(w in ("t", "tum", "tumor", "tumour", "tumort") for w in words) \
+            or "tumor" in lc or "tumour" in lc:
+        return "tumor"
+    return "unknown"
+
+
+def _classify_file(fn: str):
+    """Return (flag, role_label, confidence, basis) or a tuple with
+    flag in ('ambiguous', 'germline_vcf', None)."""
+    lc = fn.lower()
+    toks = " " + _toks(fn) + " "
+    tabular = lc.endswith((".tsv", ".csv", ".txt"))
+    is_fastq = lc.endswith((".fastq", ".fq", ".fastq.gz", ".fq.gz"))
+    is_vcf = lc.endswith((".vcf", ".vcf.gz"))
+    is_bam = lc.endswith((".bam", ".cram"))
+    if "fusion" in toks and tabular:
+        return ("fusion_tsv", "Fusion caller table", 0.9,
+                "fusion named tabular output")
+    if ("junction" in toks or "sj.out" in lc or "splice" in toks) \
+            and tabular:
+        return ("splice_junction_tsv", "Splice junction table", 0.85,
+                "junction-named tabular output")
+    if "loh" in toks and tabular:
+        return ("hla_loh_tsv", "HLA LOH evidence", 0.85,
+                "LOH-named tabular output")
+    if ("purity" in toks or "ploidy" in toks) and tabular:
+        return ("purity_tsv", "Purity/ploidy", 0.85,
+                "purity/ploidy-named table")
+    if any(w in toks for w in ("cnv", "sequenza", "facets", "segments",
+                               "purple")) and tabular:
+        return ("cnv_tsv", "Copy-number segments", 0.8,
+                "CNV-tool-named table")
+    if ("hla" in toks or "typing" in toks) and tabular:
+        return ("hla_file", "HLA typing result", 0.8,
+                "HLA-named tabular output")
+    if any(w in toks for w in ("expression", "tpm", "fpkm", "counts",
+                               "quant", "salmon", "rsem")) and tabular:
+        return ("expression_tsv", "Gene expression", 0.75,
+                "expression-named table")
+    if is_fastq:
+        mod = _modality(lc)
+        flag = {"tumor": "tumor_dna_fastq", "normal": "normal_dna_fastq",
+                "rna": "tumor_rna_fastq"}.get(mod)
+        if flag is None:
+            return ("ambiguous", f"FASTQ reads with no tumor/normal/RNA "
+                                 f"signal in the name", 0.4,
+                    "filename lacks modality hints")
+        return (flag, {"tumor_dna_fastq": "Tumor DNA reads",
+                       "normal_dna_fastq": "Normal DNA reads",
+                       "tumor_rna_fastq": "RNA reads"}[flag],
+                0.7, "fastq + modality name hint")
+    if is_bam:
+        mod = _modality(lc)
+        flag = {"tumor": "tumor_dna_bam", "normal": "normal_dna_bam",
+                "rna": "tumor_rna_bam"}.get(mod)
+        if flag is None:
+            return ("ambiguous", "alignment with no tumor/normal/RNA "
+                                 "signal in the name", 0.4,
+                    "filename lacks modality hints")
+        return (flag, {"tumor_dna_bam": "Tumor DNA alignments",
+                       "normal_dna_bam": "Normal DNA alignments",
+                       "tumor_rna_bam": "RNA alignments"}[flag],
+                0.8, "bam/cram + modality name hint")
+    if is_vcf:
+        if any(w in toks for w in ("sv", "structural", "delly", "manta",
+                                   "sopra")):
+            return ("sv_vcf", "Structural variant calls", 0.85,
+                    "SV-named VCF")
+        if any(w in toks for w in ("somatic", "tn", "snpindel", "mutect",
+                                   "strelka", "varscan", "msisensor",
+                                   "snpeff", "vep", "filtered",
+                                   "tumor")):
+            return ("somatic_vcf", "Somatic variant calls", 0.85,
+                    "somatic-caller-named VCF")
+        if any(w in toks for w in ("germline", "normal", "gatk hc",
+                                   "freebayes")):
+            return ("germline_vcf", "Germline VCF (informational)", 0.7,
+                    "germline-named VCF")
+        return ("ambiguous", "VCF with no somatic/germline/SV signal",
+                0.4, "filename lacks caller/modality hints")
+    if lc.endswith(".bed"):
+        return ("capture_bed", "Capture kit BED", 0.7, ".bed extension")
+    return (None, "", 0.0, "")
+
+
+def discover_inputs(data_dir: str) -> dict:
+    """Read-only discovery of native entry inputs under data_dir."""
+    out = {"data_dir": data_dir, "exists": False, "scanned_at": _now(),
+           "inputs": [], "ambiguous": [], "informational": [],
+           "unclassified": [], "missing": [], "notes": [],
+           "sample_guess": "", "n_files_seen": 0, "capped": False}
+    if not os.path.isdir(data_dir):
+        out["error"] = "not a directory or not readable"
+        return out
+    out["exists"] = True
+    base = os.path.abspath(data_dir)
+    stem = os.path.basename(base.rstrip("/"))
+    import re as _re
+    if _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{2,24}", stem or "") \
+            and stem.lower() not in ("data", "input", "inputs", "files",
+                                     "raw", "bam", "vcf", "fastq"):
+        out["sample_guess"] = stem
+    n = 0
+    capped = False
+    stack = [(base, 0)]
+    while stack:
+        d, depth = stack.pop()
+        if depth > _DISCOVER_MAX_DEPTH:
+            continue
+        try:
+            entries = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for fn in entries:
+            p = os.path.join(d, fn)
+            if fn.startswith(".") and depth:
+                continue
+            if os.path.isdir(p):
+                if not os.path.islink(p) and fn not in _SKIP_DIR_NAMES:
+                    stack.append((p, depth + 1))
+                continue
+            n += 1
+            if n > _DISCOVER_MAX_FILES:
+                capped = True
+                break
+            flag, role, conf, basis = _classify_file(fn)
+            rel = os.path.relpath(p, base)
+            if flag is None:
+                if len(out["unclassified"]) < 60:
+                    out["unclassified"].append(rel)
+            elif flag == "ambiguous":
+                out["ambiguous"].append({"file": rel, "reason": role})
+            elif flag == "germline_vcf":
+                out["informational"].append(
+                    {"file": rel, "role": role,
+                     "note": "the unified entry consumes somatic calls; "
+                             "a germline VCF is recorded, not forwarded"})
+            else:
+                out["inputs"].append({"flag": flag, "role": role,
+                                      "path": p, "confidence": conf,
+                                      "basis": basis})
+        if capped:
+            break
+    out["n_files_seen"] = n
+    out["capped"] = capped
+    if capped:
+        out["notes"].append(f"scan stopped after {_DISCOVER_MAX_FILES} "
+                            "files - move the case's files into one "
+                            "flatter directory if inputs are missing")
+    got = {i["flag"] for i in out["inputs"]}
+    if not ({"somatic_vcf", "tumor_dna_bam", "tumor_dna_fastq"} & got):
+        out["missing"].append(
+            "no somatic variant calls AND no tumor DNA alignments/reads - "
+            "the entry needs at least one of somatic VCF, tumor DNA BAM "
+            "or tumor DNA FASTQ")
+    if "hla_file" not in got:
+        out["notes"].append(
+            "no HLA typing result found - HLA stays unset; the native "
+            "planner types HLA itself from DNA inputs when the toolchain "
+            "is installed, and its plan reports exactly what is missing")
+    if not ({"tumor_rna_bam", "tumor_rna_fastq"} & got):
+        out["notes"].append(
+            "no RNA inputs found - RNA-dependent branches (fusion, "
+            "splice, RNA evidence) will be skipped by the plan")
+    # deterministic order, and only the first file per single-valued flag
+    # is forwarded; additional candidates surface as ambiguity for the
+    # human - never a silent pick
+    first = {}
+    merged = []
+    for i in out["inputs"]:
+        if i["flag"] in _LIST_KEYS:
+            merged.append(i)
+            continue
+        if i["flag"] not in first:
+            first[i["flag"]] = i
+            merged.append(i)
+        else:
+            prev = first[i["flag"]]
+            out["ambiguous"].append(
+                {"file": i["path"],
+                 "reason": f"second candidate for "
+                           f"{prev['role'].lower()} "
+                           f"(kept: {os.path.basename(prev['path'])})"})
+    out["inputs"] = merged
+    return out
+
+
+def params_from_manifest(manifest: dict) -> dict:
+    """Confirmed manifest -> native_params (manifest is authoritative;
+    this only maps what the human confirmed - removals and the final
+    sample_id from the confirmation step included - and adds nothing
+    the human did not see)."""
+    params = {}
+    prop = manifest.get("proposal") or {}
+    conf = manifest.get("confirmed") or {}
+    if not isinstance(conf, dict):
+        conf = {}
+    removed = {str(x) for x in (conf.get("removed") or [])}
+    inputs = [i for i in (prop.get("inputs") or [])
+              if i.get("path") not in removed]
+    for i in (conf.get("added") or []):
+        if isinstance(i, dict) and i.get("flag") and i.get("path"):
+            inputs.append(i)
+    for i in inputs:
+        flag, path = i.get("flag"), i.get("path")
+        if not flag or not path:
+            continue
+        if flag in _LIST_KEYS:
+            params.setdefault(flag, []).append(path)
+        else:
+            params.setdefault(flag, path)
+    sid = str(conf.get("sample_id") or prop.get("sample_id") or "")
+    if sid:
+        params["sample_id"] = sid
+    return params
 
 
 # --------------------------------------------------------------------------

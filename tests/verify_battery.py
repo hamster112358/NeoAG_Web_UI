@@ -497,6 +497,16 @@ wait_state(rj["job_id"], ["completed"], limit=60)
 _, d10 = call(f"/api/decisions?job_id={rj['job_id']}")
 check("43 decisions filter by job", len(d10["decisions"]) >= 1 and
       all(d["job_id"] == rj["job_id"] for d in d10["decisions"]))
+# M6 F5 added backend protection for mode switches (409 while work runs):
+# wait for a quiet moment so THIS check (persisting a switch) is not
+# racing a demo job that started moments ago. The protected path itself
+# is check 137.
+for _ in range(80):
+    _bq = call("/api/bootstrap")[1]
+    if not [j for j in _bq["jobs"]
+            if j["state"] in ("running", "paused")]:
+        break
+    time.sleep(0.5)
 call("/api/agent/mode", {"mode": "real"})
 _, b11 = call("/api/bootstrap")
 check("44 agent-mode switch persists", b11["agent_mode"] == "real")
@@ -1216,9 +1226,20 @@ check("104 performance evidence is CONTEXT-GATED: the contextual row "
       and "1 of 2" in _ev4.comparability_note(_r01))
 
 def _cand4(nm, role="named in retrieved title (pubmed)",
-           cat="software (registry-verified)", ev=()):
+           cat="software (registry-verified)", ev=(), baseline=False,
+           eligibility=None):
+    # eligibility is set by the scientific screen (science.screen_
+    # candidate) in the real pipeline; fixtures state it explicitly
+    elig = eligibility or (
+        "current baseline (not an alternative)" if baseline
+        else "direct alternative")
     return {"name": nm, "task": "Presentation & APPM Scoring",
             "role_in_neoag": role, "category": cat,
+            "eligibility": elig,
+            "eligibility_reasons": ["battery fixture"],
+            "is_baseline": baseline,
+            "comparable_for_replacement":
+                elig == "direct alternative",
             "artifact_class": "algorithm (method implementation)",
             "verified_version": "1.0", "license": "MIT",
             "maintenance": "active (last push 2026-06-01)",
@@ -1229,20 +1250,37 @@ def _cand4(nm, role="named in retrieved title (pubmed)",
                               "input/output format"],
             "installed_version": "n/a",
             "published_benchmark_evidence": list(ev)}
-_cur4 = _cand4("mhcflurry", role="configured NeoAG workflow TOML")
+_cur4 = _cand4("mhcflurry", role="configured NeoAG workflow TOML",
+               baseline=True)
 _row4 = {"metric": "AUROC", "value": "0.9", "dataset": "ICBC",
          "context_established": True, "tested_version": "v1.0",
          "evidence_level": "abstract: independent comparative text"}
 _t4 = {"id": "presentation", "label": "Presentation & APPM Scoring"}
-_concl4 = [_res4._module_conclusion(_t4, a) for a in (
+_st4 = {"baseline": {"identified": True, "consensus": False,
+                     "tools": [{"name": "mhcflurry",
+                                "role": "current baseline",
+                                "evidence": ["planner code"],
+                                "pinned_version": None}],
+                     "note": ""}}
+_concl4 = [_res4._module_decision(_t4, a, _st4) for a in (
     [], [_cur4], [_cur4, _cand4("A")], [_cur4, _cand4("B", ev=[_row4])],
     [_cand4("C", cat="mentioned in literature only")])]
 _tc4 = _res4._task_comparisons(
-    [_t4], [_cur4, _cand4("B", ev=[_row4]),
-            dict(_cand4("W"), artifact_class="workflow wrapper")], {})
-def _cnd155(nm, task, role, ev=(), cat="software (registry-verified)"):
+    [_t4], [_cur4, _cand4("A"), _cand4("B", ev=[_row4]),
+            _cand4("W", eligibility="wrapper/integration (not an "
+                                    "independent algorithm)")],
+    {"presentation": _st4})
+def _cnd155(nm, task, role, ev=(), cat="software (registry-verified)",
+            baseline=False):
+    elig = ("current baseline (not an alternative)" if baseline
+            else "direct alternative")
     return {"name": nm, "task": task, "role_in_neoag": role,
             "category": cat,
+            "eligibility": elig,
+            "eligibility_reasons": ["battery fixture"],
+            "is_baseline": baseline,
+            "comparable_for_replacement":
+                elig == "direct alternative",
             "artifact_class": "algorithm (method implementation)",
             "verified_version": "1.0 (stable; PyPI)", "license": "MIT",
             "maintenance": "active (last push 2026-06-01)",
@@ -1253,7 +1291,14 @@ def _cnd155(nm, task, role, ev=(), cat="software (registry-verified)"):
             "performance_summary": "x", "evidence_gaps": ["exact version"],
             "independent_validation": bool(ev)}
 _inv155 = {"stages": [{"id": "presentation", "name": "P",
-                       "current_tools": ["mhcflurry"]},
+                       "current_tools": ["mhcflurry"],
+                       "baseline": {"identified": True,
+                                    "consensus": False,
+                                    "tools": [{"name": "mhcflurry",
+                                               "role": "current baseline",
+                                               "evidence": ["planner"],
+                                               "pinned_version": None}],
+                                    "note": ""}},
                       {"id": "sv", "name": "S", "current_tools": []},
                       {"id": "reports", "name": "R",
                        "current_tools": []}],
@@ -1267,63 +1312,78 @@ _row155 = {"metric": "AUROC", "value": "0.9", "dataset": "ICBC",
 _rep155 = _res4._live_report(
     "res_t", {"targets": _rt155}, _inv155, {}, "completed",
     candidates=[_cnd155("mhcflurry", "Presentation & APPM Scoring",
-                        "configured NeoAG workflow TOML"),
+                        "configured NeoAG workflow TOML", baseline=True),
                 _cnd155("ALT", "Presentation & APPM Scoring",
                         "named in title", ev=[_row155])],
     citations=[], resolved_targets=_rt155)
 _cov155 = _rep155["coverage_accounting"]
 _mc155 = _rep155["module_conclusions"]["presentation"]
 check("105 evidence COVERAGE is accounted per inventory module "
-      "(identified/researched/sufficient/thin/missing+reason); completion "
-      "means coverage, not 'queries returned'",
+      "(identified/researched/sufficient/thin/missing+reason); "
+      "completion means coverage, not 'queries returned'; a TARGETED "
+      "run is complete FOR ITS SCOPE and out-of-scope modules are "
+      "labelled as such (never 'stopped early')",
       _cov155["identified_modules"] == 3 and
       _cov155["researched_modules"] == 2 and
-      _cov155["completeness"] == "partial" and
+      _cov155["completeness"] == "complete" and
       "presentation" in _cov155["sufficient_evidence"] and
       {m["id"] for m in _cov155["not_researched"]} == {"reports"}
+      and all("scope" in m["reason"]
+              for m in _cov155["not_researched"])
       and _rep155["status"] == "completed",
       str(_cov155)[:150])
-check("106 every conclusion explains evidence/advantage/comparability/"
-      "usability/remaining-verification and insufficient evidence yields "
-      "a CONCRETE evaluation instead of a guess; Open Questions are gone",
-      set(_mc155["explanation"]) == {
-          "what_evidence_supports_it", "expected_advantage",
-          "directly_comparable", "directly_comparable_note",
-          "usable_in_current_deployment", "remains_to_verify"}
-      and "ALT: AUROC 0.9 on ICBC" in _mc155["explanation"]["expected_advantage"]
-      and _mc155.get("recommended_evaluation", "").startswith(
-          "Controlled comparison on THIS deployment")
+check("106 every researched module gets a recommendation + an "
+      "evidence-derived rationale + a concrete action, computed FROM "
+      "stated evidence facts (A9: the vocabulary entry cannot "
+      "contradict the numbers it is derived from); a module without a "
+      "code-grounded baseline is honestly 'Research incomplete'; Open "
+      "Questions are gone",
+      _mc155["recommendation"] == "Promising candidate - evaluate"
+      and _mc155["conclusion"] == _mc155["recommendation"]
+      and _mc155["evidence_facts"]["direct_alternatives"] == 1
+      and _mc155["evidence_facts"]["independent_rows"] == 1
+      and _mc155["evidence_facts"]["superiority_rows"] == 0
+      and _mc155["rationale"] and "evaluate" in _mc155["action"]
+      and _rep155["module_conclusions"]["sv"]["recommendation"]
+      == "Research incomplete"
       and "open_questions" not in _rep155
       and _rep155["recommended_next_actions"]
-      and _rep155["recommended_next_actions"][0].startswith("[presentation]")
-      and any("reports" in a
-              for a in _rep155["recommended_next_actions"]))
+      and _rep155["recommended_next_actions"][0].startswith("[presentation]"))
 _rep155b = _res4._live_report(
     "res_t2", {"targets": _rt155}, _inv155, {}, "cancelled",
     candidates=[], resolved_targets=_rt155, reached_ids=set())
 check("107 a run stopped mid-way publishes NO premature conclusions: "
-      "unreached modules are listed with the stop reason and resume note",
+      "scheduled-but-unreached modules carry the stop reason + resume "
+      "note (making the run honestly PARTIAL), while modules that were "
+      "never in scope keep their scope label",
       _rep155b["module_conclusions"] == {}
       and all(("run stopped" in m["reason"] and "resume" in m["reason"])
+              for m in _rep155b["coverage_accounting"]["not_researched"]
+              if m["id"] in ("presentation", "sv"))
+      and any(m["id"] == "reports" and "scope" in m["reason"]
               for m in _rep155b["coverage_accounting"]["not_researched"])
       and _rep155b["coverage_accounting"]["completeness"] == "partial")
 
-check("108 conclusions use ONLY the fixed vocabulary and never invent a "
-      "winner from one-sided evidence; task comparisons group by artifact "
-      "kind, compare within one task, and gate performance by context",
+check("108 recommendations use ONLY the fixed vocabulary and never "
+      "invent a winner from one-sided evidence (a candidate number "
+      "without a same-label baseline number never licenses 'Candidate "
+      "supported by comparative evidence'); task comparisons put ONLY "
+      "direct alternatives in rows, name wrappers separately, and gate "
+      "every row's performance by context",
       all(c["conclusion"] in _res4.CONCLUSION_VOCABULARY
           for c in _concl4)
       and all(c["conclusion"] !=
-              "Candidate appears superior under specified conditions"
+              "Candidate supported by comparative evidence"
               for c in _concl4)
-      and set(_tc4[0]["alternatives_by_kind"]) == {
-          "algorithm (method implementation)", "workflow wrapper"}
-      and "AUROC=0.9 on ICBC" in [r for r in _tc4[0]["rows"]
-                                  if r["tool"] == "B"][0]
-      ["published_performance"]
-      and "no value with established" in [
-          r for r in _tc4[0]["rows"] if r["tool"] == "W"][0]
-      ["published_performance"],
+      and [r["tool"] for r in _tc4[0]["rows"]] == ["A", "B"]
+      and "0.9" in [r for r in _tc4[0]["rows"] if r["tool"] == "B"][0]
+      ["evidence"]
+      and "ICBC" in [r for r in _tc4[0]["rows"] if r["tool"] == "B"][0]
+      ["evidence"]
+      and "no performance number with established" in [
+          r for r in _tc4[0]["rows"] if r["tool"] == "A"][0]["evidence"]
+      and _tc4[0]["wrappers_integrations"] == ["W"]
+      and _tc4[0]["baseline"]["identified"],
       str([c["conclusion"] for c in _concl4])[:150])
 
 # ---------- 109-115 M5 PART 7: downloadable exports -----------------------
@@ -1357,7 +1417,8 @@ check("109 research HTML export: first download renders once + persists, "
       and _hd1.get("X-Export-Sha256") == hashlib.sha256(_hb1).hexdigest()
       and _st1b == 200 and _hb1b == _hb1
       and _hd1b.get("X-Export-Version") == "1"
-      and b"tool-research report" in _hb1
+      and (b"NeoAG scientific tool review" in _hb1
+           or b"Example (mock) research digest" in _hb1)
       and any(p.is_file() for p in _expdir.rglob("*.html")),
       str(_st1) + " " + str(_hd1.get("X-Export-Version")))
 _sj, _hdj, _bj = _raw(f"/api/research/{rid}/export/json")
@@ -1481,6 +1542,8 @@ _BENCH_BRIEF = {
     "metrics": ["top_k_overlap", "rank_correlation_spearman",
                 "candidate_set_fraction"],
     "compute_estimate": "seconds, in-process, same pool",
+    "software_installation": "none - both arms already installed",
+    "modifies_neoag_installation": False,
     "risks": ["synthetic pool only - not a biological claim"],
     "dataset": {"source": "demo_fixture"},
     "top_n": 12}
@@ -1543,6 +1606,8 @@ _s118a, _p118a = _post("/api/jobs", {"kind": "benchmark", "benchmark": {
 _s118b, _p118b = _post("/api/jobs", {"kind": "benchmark", "benchmark": {
     **_BENCH_BRIEF,
     "dataset": {"source": "public_repo", "id": "SOMETHING-ELSECAT",
+                "download_size": "~80 MB (2x fastq.gz)",
+                "destination": "/tmp/bench-data/SOMETHING-ELSECAT",
                 "consent_approval_id": _aid116}}})
 _cid118 = "appr-consent-batt-" + str(int(time.time()))
 _c118 = _s3.connect(str(_db))
@@ -1557,10 +1622,14 @@ _c118.close()
 _s118c, _p118c = _post("/api/jobs", {"kind": "benchmark", "benchmark": {
     **_BENCH_BRIEF,
     "dataset": {"source": "public_repo", "id": "SEED-BENCH-2",
+                "download_size": "~40 MB (1x bam)",
+                "destination": "/tmp/bench-data/SEED-BENCH-2",
                 "consent_approval_id": _cid118}}})
 _s118d, _p118d = _post("/api/jobs", {"kind": "benchmark", "benchmark": {
     **_BENCH_BRIEF,
     "dataset": {"source": "public_repo", "id": "SEED-BENCH-1",
+                "download_size": "~40 MB (1x bam)",
+                "destination": "/tmp/bench-data/SEED-BENCH-1",
                 "consent_approval_id": _cid118}}})
 check("118 dataset consent is enforced the PART 3 way: an external "
       "dataset needs an APPROVED dataset-download consent card naming "
@@ -1657,6 +1726,393 @@ check("121 a DENIED benchmark dies there: the job is cancelled with the "
       and not os.path.isdir(os.path.join(str(ROOT / "data"),
                                          "benchmarks", _jid121)),
       f"decide={_sd121} state={_b121.get('state')} results={_s121r}")
+
+# ---- M6 PART C: consent card completeness + four-way answers -------
+_s128a, _p128a = _post("/api/jobs", {"kind": "benchmark", "benchmark": {
+    **{k: v for k, v in _BENCH_BRIEF.items()},
+    "software_installation": "", "modifies_neoag_installation": False,
+    "dataset": {"source": "public_repo", "id": "X-1"}}})
+_s128b, _p128b = _post("/api/jobs", {"kind": "benchmark", "benchmark": {
+    **_BENCH_BRIEF, "software_installation": ""}})
+_s128c, _p128c = _post("/api/jobs", {"kind": "benchmark", "benchmark": {
+    **_BENCH_BRIEF, "modifies_neoag_installation": True}})
+_s128, _p128 = _post("/api/jobs", {"kind": "benchmark",
+                                   "benchmark": _BENCH_BRIEF})
+_a128 = next((a for a in call("/api/bootstrap")[1]["approvals"]
+              if a["id"] == _p128.get("approval_id", "")), {})
+_f128 = {}
+try:
+    _f128 = {f["label"]: f["value"]
+             for f in json.loads(_a128.get("detail", "{}")).get(
+                 "fields", [])}
+except Exception:
+    pass
+check("128 M6 C the backend REFUSES consent-incomplete briefs (no "
+      "download size / no installation statement / production "
+      "modification claim) and a complete brief yields a consent card "
+      "stating all nine fields: dataset+source, question, tools, size, "
+      "destination, compute, metrics, installation, production impact",
+      _s128a == 400 and "download_size" in str(_p128a)
+      and _s128b == 400 and "software installation" in str(_p128b)
+      and _s128c == 400 and "production" in str(_p128c)
+      and _s128 == 202
+      and all(lbl in _f128 for lbl in (
+          "Dataset and source", "Scientific question", "Comparison tools",
+          "Download size", "Storage destination", "Expected computing",
+          "Evaluation metrics", "Software installation necessary",
+          "Modifies current NeoAG installation")),
+      f"{_s128a}/{_s128b}/{_s128c}/{_s128} fields={sorted(_f128)[:2]}")
+_s129a, _p129a = _post("/api/jobs", {"kind": "benchmark",
+                                     "benchmark": _BENCH_BRIEF})
+try:
+    _sd129, _pd129 = call("/api/approvals/" + _p129a.get("approval_id", ""),
+                          {"decision": "limit_scope",
+                           "scope": "CPU only, 5 samples max"})
+except urllib.error.HTTPError as e:
+    _sd129, _pd129 = e.code, {}
+_j129 = next((j for j in call("/api/bootstrap")[1]["jobs"]
+              if j["id"] == _p129a.get("job_id", "")), {})
+_s129b, _p129b = _post("/api/jobs", {"kind": "benchmark",
+                                     "benchmark": _BENCH_BRIEF})
+try:
+    _sd129b, _ = call("/api/approvals/" + _p129b.get("approval_id", ""),
+                      {"decision": "literature_only"})
+except urllib.error.HTTPError as e:
+    _sd129b = e.code
+_j129b = next((j for j in call("/api/bootstrap")[1]["jobs"]
+               if j["id"] == _p129b.get("job_id", "")), {})
+try:
+    _sd129c, _ = call("/api/approvals/" + _p129b.get("approval_id", ""),
+                      {"decision": "banana"})
+except urllib.error.HTTPError as e:
+    _sd129c = e.code
+check("129 M6 C the four answers are DISTINCT recorded outcomes: "
+      "limit_scope cancels the job quoting the allowed scope, "
+      "literature_only cancels it naming the literature-only request, "
+      "an unknown decision is a 400",
+      _sd129 == 200 and _j129.get("state") == "cancelled"
+      and "CPU only, 5 samples max" in str(_j129.get("error", ""))
+      and "re-scoped" in str(_j129.get("error", ""))
+      and _sd129b == 200 and _j129b.get("state") == "cancelled"
+      and "literature-only" in str(_j129b.get("error", ""))
+      and _sd129c == 400,
+      f"{_sd129}/{_j129.get('state')}/{_sd129b}/{_sd129c}")
+# limit_scope without a scope note is rejected (nothing runs, card
+# stays pending) - the backend enforces the contract, not prose
+_s129d, _p129d = _post("/api/jobs", {"kind": "benchmark",
+                                     "benchmark": _BENCH_BRIEF})
+try:
+    _sd129d, _bd129d = call(
+        "/api/approvals/" + _p129d.get("approval_id", ""),
+        {"decision": "limit_scope"})
+except urllib.error.HTTPError as e:
+    _sd129d = e.code
+    try:
+        _bd129d = json.loads(e.read().decode() or "{}")
+    except Exception:
+        _bd129d = {}
+_a129d = next((a for a in call("/api/bootstrap")[1]["approvals"]
+               if a["id"] == _p129d.get("approval_id", "")), {})
+check("130 M6 C limit_scope demands the scope text ('what will you "
+      "allow') - without it the answer is a 400 whose error names the "
+      "missing scope note, and the card is still pending; approved "
+      "benchmark work stays a FORMAL task, never a silent production "
+      "change",
+      _sd129d == 400 and "scope" in str(_bd129d)
+      and _a129d.get("state") == "pending",
+      f"{_sd129d} state={_a129d.get('state')} body={str(_bd129d)[:80]}")
+
+# ---- M6 PART D: unified native entry (one data directory) -----------
+import tempfile as _tf131
+_droot = _tf131.mkdtemp(prefix="m6batt-disc-")
+_case = os.path.join(_droot, "PAT-B1")
+for _sub, _names in (("fastq", ["P1_T_R1.fastq.gz", "P1_T_R2.fastq.gz",
+                                "P1_N_R1.fastq.gz"]),
+                     ("bam", ["tumor_WGS.bam", "normal_WGS.bam",
+                              "mystery.bam"]),
+                     ("vcf", ["somatic.mutect2.filtered.vcf.gz",
+                              "normal.gatk.vcf.gz"]),
+                     (None, ["rnaseq.gene_tpm.tsv"])):
+    _dd = _case if _sub is None else os.path.join(_case, _sub)
+    os.makedirs(_dd, exist_ok=True)
+    for _n in _names:
+        open(os.path.join(_dd, _n), "w").close()
+_s131, _p131 = call("/api/native/discover", {"data_dir": _case})
+_flags131 = {i["flag"]: i["path"] for i in _p131.get("inputs", [])
+             if i["flag"] not in ("tumor_dna_fastq", "normal_dna_fastq",
+                                  "tumor_rna_fastq", "sv_vcf")}
+_multi131 = {}
+for _i in _p131.get("inputs", []):
+    _multi131.setdefault(_i["flag"], []).append(
+        os.path.basename(_i["path"]))
+check("131 M6 D real input discovery from ONE data directory: roles map "
+      "onto real open-neo run flags (somatic VCF, tumor/normal BAM, "
+      "T/N FASTQ pairing, expression), an unnamed BAM surfaces as "
+      "AMBIGUOUS instead of a silent pick, a germline VCF is recorded "
+      "not forwarded, and the sample id is guessed from the directory",
+      _s131 == 200 and _p131.get("sample_guess") == "PAT-B1"
+      and "somatic_vcf" in _flags131
+      and _flags131.get("tumor_dna_bam", "").endswith("tumor_WGS.bam")
+      and _flags131.get("normal_dna_bam", "").endswith("normal_WGS.bam")
+      and sorted(_multi131.get("tumor_dna_fastq", [])) ==
+      ["P1_T_R1.fastq.gz", "P1_T_R2.fastq.gz"]
+      and _multi131.get("normal_dna_fastq") == ["P1_N_R1.fastq.gz"]
+      and _flags131.get("expression_tsv", "").endswith(
+          "rnaseq.gene_tpm.tsv")
+      and any("mystery.bam" in a["file"] for a in _p131.get(
+          "ambiguous", []))
+      and any("normal.gatk" in a["file"] for a in _p131.get(
+          "informational", []))
+      and _p131.get("missing") == [],
+      f"{_s131} {sorted(_flags131)}")
+_s132a, _p132m = call("/api/native/manifest", {"data_dir": _case})
+_mid132 = _p132m.get("id", "")
+_prop132 = _p132m.get("proposal") or {}
+_s132b, _p132b = _post("/api/jobs", {"engine": "native",
+                                     "manifest_id": _mid132})
+_expr = _flags131.get("expression_tsv", "")
+_s132c, _p132c = call(f"/api/manifests/{_mid132}/confirm", {
+    "edits": {"removed": [_expr], "sample_id": "PAT-B1"}})
+_s132, _p132 = _post("/api/jobs", {"engine": "native",
+                                   "manifest_id": _mid132})
+_jid132 = _p132.get("job_id", "")
+_c132 = _s3.connect(str(_db))
+_spec132 = json.loads(_c132.execute(
+    "SELECT spec_json FROM jobs WHERE id=?", (_jid132,)).fetchone()[0])
+_mstat132 = _c132.execute("SELECT status FROM manifests WHERE id=?",
+                          (_mid132,)).fetchone()[0]
+_c132.close()
+check("132 M6 D the CONFIRMED manifest is the authoritative input: an "
+      "unconfirmed manifest is refused (409), submission derives every "
+      "native param from the manifest (no profile chosen by the user), "
+      "an unticked input is REMOVED from the run, and the manifest ends "
+      "linked to the formal job",
+      _s132a == 201 and _prop132.get("kind") == "native"
+      and _s132b == 409
+      and _s132c == 200 and _p132c.get("status") == "confirmed"
+      and _s132 == 202
+      and _spec132.get("native_profile") == "gateway"
+      and _spec132["native_params"].get("somatic_vcf") == \
+      _flags131["somatic_vcf"]
+      and _spec132["native_params"].get("sample_id") == "PAT-B1"
+      and "expression_tsv" not in _spec132["native_params"]
+      and len(_spec132["native_params"].get("tumor_dna_fastq", [])) == 2
+      and _mstat132 == "linked",
+      f"{_s132a}/{_s132b}/{_s132} profile={_spec132.get('native_profile')}")
+_s133a, _p133a = _post("/api/jobs/native/preview",
+                       {"manifest_id": "man-does-not-exist"})
+_s133b, _p133b = _post("/api/jobs", {"engine": "native",
+                                     "synthetic_demo": True})
+_c133 = _s3.connect(str(_db))
+_spec133 = json.loads(_c133.execute(
+    "SELECT spec_json FROM jobs WHERE id=?",
+    (_p133b.get("job_id", ""),)).fetchone()[0])
+_c133.close()
+check("133 M6 D honesty edges: a preview with a nonexistent manifest is "
+      "a 400 (no invented plan), and the bundled synthetic demo is an "
+      "EXPLICIT data choice that still lands in the same formal job "
+      "pipeline (blocked until approval, native demo profile)",
+      _s133a == 400 and "manifest" in str(_p133a)
+      and _s133b == 202
+      and _spec133.get("native_profile") == "demo",
+      f"{_s133a}/{_s133b}")
+
+# ---- M6 PART E: structured science controls + server-side validation --
+_s134, _p134 = call("/api/params")
+_sci134 = _p134.get("science") or []
+_info134 = _p134.get("science_info") or []
+_ids134 = {c["id"] for c in _sci134}
+_good134 = (_s134 == 200 and len(_sci134) >= 5
+    and all(c["control"] in ("radio", "number", "checkbox")
+            for c in _sci134)
+    and all(c.get("options") for c in _sci134 if c["control"] == "radio")
+    and all(isinstance(c.get("min"), int) and isinstance(c.get("max"), int)
+            and c["min"] < c["max"]
+            for c in _sci134 if c["control"] == "number")
+    and all(c.get("evidence") and c.get("affects") and "native_default" in c
+            for c in _sci134)
+    and {"event_top_n", "candidate_top_n", "genome_build",
+         "rna_quant_method", "automatic_tool_policy",
+         "skip_dna_sv", "skip_bam_matcher"} <= _ids134
+    and _info134 and all("py:" in i["evidence"] for i in _info134)
+    # no control is a free-text field: every one is a fixed choice, a
+    # bounded number or a checkbox (brief E: no unvalidated free text)
+    and not any(c["control"] not in ("radio", "number", "checkbox")
+                for c in _sci134))
+check("134 M6 E the science panel is a curated STRUCTURED set: every "
+      "control is a fixed-choice radio, a bounded number or a checkbox "
+      "(never free text), each cites the deployed code and its native "
+      "default, the code-decided list carries real file:line citations, "
+      "and the set matches the keys the Web layer forwards", _good134,
+      f"{_s134} ids={sorted(_ids134)} info={len(_info134)}")
+_s135a, _p135a = _post("/api/jobs", {"engine": "native",
+                                     "synthetic_demo": True,
+                                     "native_params":
+                                         {"assay_type": "banana"}})
+_s135b, _p135b = _post("/api/jobs", {"engine": "native",
+                                     "synthetic_demo": True,
+                                     "native_params":
+                                         {"candidate_top_n": "abc"}})
+_s135c, _p135c = _post("/api/jobs", {"engine": "native",
+                                     "synthetic_demo": True,
+                                     "native_params":
+                                         {"event_top_n": 99999}})
+_s135d, _p135d = _post("/api/jobs/native/preview",
+                       {"native_params": {"sample_id": "X",
+                                          "genome_build": "GRCh99"}})
+_s135, _p135 = _post("/api/jobs", {"engine": "native",
+                                   "synthetic_demo": True,
+                                   "native_params":
+                                       {"rna_quant_method": "salmon",
+                                        "candidate_top_n": 50,
+                                        "skip_dna_sv": True}})
+_spec135 = {}
+if _p135.get("job_id"):
+    _c135 = _s3.connect(str(_db))
+    _spec135 = json.loads(_c135.execute(
+        "SELECT spec_json FROM jobs WHERE id=?",
+        (_p135["job_id"],)).fetchone()[0])
+    _c135.close()
+check("135 M6 E the BACKEND (not the form) validates every scientific "
+      "override: a fake choice, a non-integer and an out-of-range top-N "
+      "are all refused with the offending key named, the preview path "
+      "validates too, and a fully valid override set is accepted and "
+      "reaches the run spec",
+      _s135a == 400 and "assay_type" in str(_p135a)
+      and _s135b == 400 and "candidate_top_n" in str(_p135b)
+      and _s135c == 400 and "event_top_n" in str(_p135c)
+      and _s135d == 400 and "genome_build" in str(_p135d)
+      and _s135 == 202
+      and _spec135.get("native_params", {}).get("rna_quant_method")
+      == "salmon"
+      and int(_spec135.get("native_params", {}).get("candidate_top_n",
+                                                    0)) == 50
+      and _spec135.get("native_params", {}).get("skip_dna_sv") is True,
+      f"{_s135a}/{_s135b}/{_s135c}/{_s135d}/{_s135}")
+
+# ---- M6 PART F: conversation menu + protected mode switch -------------
+_s136, _p136 = call("/api/conversations", {"title": "MENU-TEST"})
+_cid136 = _p136["conversation"]["id"]
+_s136a, _p136a = call(f"/api/conversations/{_cid136}/flag",
+                      {"pinned": True})
+_s136b, _p136b = call("/api/conversations")
+_order136 = [c["id"] for c in _p136b["conversations"]]
+_s136c, _p136c = call(f"/api/conversations/{_cid136}/flag",
+                      {"archived": True})
+_s136d, _p136d = call("/api/conversations")
+_arched136 = [c for c in _p136d["conversations"]
+              if c["id"] == _cid136]
+try:
+    _s136e, _p136e = call(f"/api/conversations/{_cid136}/flag",
+                          {"pinned": "yes"})
+except urllib.error.HTTPError as _e136:
+    _s136e = _e136.code
+    try:
+        _p136e = json.loads(_e136.read().decode() or "{}")
+    except Exception:
+        _p136e = {}
+try:
+    _s136f, _p136f = call(f"/api/conversations/{_cid136}/flag", {})
+except urllib.error.HTTPError as _e136f:
+    _s136f = _e136f.code
+    try:
+        _p136f = json.loads(_e136f.read().decode() or "{}")
+    except Exception:
+        _p136f = {}
+check("136 M6 F the conversation menu backend: flag endpoint pins a chat "
+      "to the TOP of the list, archiving keeps the row RETURNED with its "
+      "archived marker (so Unarchive stays possible), a non-boolean flag "
+      "and an empty flag request are both refused",
+      _s136 == 201
+      and _s136a == 200 and _p136a["conversation"]["pinned"] == 1
+      and _order136 and _order136[0] == _cid136
+      and _s136c == 200 and _s136d == 200
+      and _arched136 and _arched136[0]["archived"] == 1
+      and _s136e == 400 and _s136f == 400,
+      f"{_s136a}/{_order136[:1]}/{_s136c}/{_s136e}/{_s136f}")
+_s137a, _p137a = call("/api/agent/mode", {"mode": "real"})  # idle: allowed
+_c137 = _s3.connect(str(_db))
+_c137.execute("UPDATE jobs SET state='running' WHERE id="
+              "(SELECT id FROM jobs ORDER BY rowid DESC LIMIT 1)")
+_c137.commit()
+_c137.close()
+try:
+    _s137b, _p137b = call("/api/agent/mode", {"mode": "mock"})
+except urllib.error.HTTPError as _e137b:
+    _s137b = _e137b.code
+    try:
+        _p137b = json.loads(_e137b.read().decode() or "{}")
+    except Exception:
+        _p137b = {}
+_mode_during137 = call("/api/bootstrap")[1].get("agent_mode")
+_s137c, _p137c = call("/api/agent/mode", {"mode": "real"})  # same = no-op
+_c137 = _s3.connect(str(_db))
+_c137.execute("UPDATE jobs SET state='cancelled' WHERE state='running'")
+_c137.commit()
+_c137.close()
+_s137d, _p137d = call("/api/agent/mode", {"mode": "mock"})
+check("137 M6 F switching agent mode is PROTECTED AT THE BACKEND: a "
+      "switch away from the current mode is refused (409, reason names "
+      "the in-flight work) while any job runs, a no-op switch stays "
+      "allowed, and after the run ends the switch goes through; the "
+      "battery keeps finishing in mock mode",
+      _s137a == 200 and _s137b == 409 and "flight" in str(_p137b)
+      and _mode_during137 == "real"
+      and _s137c == 200 and _s137d == 200,
+      f"{_s137a}/{_s137b}/{_s137c}/{_s137d}")
+
+# ---- M6 A1/A2 candidate-identity contract (offline units) ----
+# Negative fixture, 2026-11-17 LIVE study: an abstract that introduced
+# the tool "PepGen" also yielded the allele string "DQA101" and the
+# virus "CoV-2" through the shape path; both inherited the
+# introduced-as-software privilege and biology-flavoured wording then
+# promoted them to 'direct alternative'. The fixes under test: (1) the
+# intro cue is attributed to the ONE name it introduces, (2)
+# gene/allele-shaped names cannot be minted as tools at extraction,
+# (3) the screen promotes on a SOFTWARE CLAIM only, not on domain +
+# operation + biology vocabulary alone.
+from backend import science as _sci138        # noqa: E402
+_prof138 = _sci138.profile_for("presentation", "presentation")
+_rec138 = {
+    "title": "PepGen: conditional generation of peptides for MHC binding",
+    "abstract": ("Here we present PepGen, a tool for prioritizing "
+                 "candidate peptides. We evaluated binding to "
+                 "HLA-DQA1*01 alleles and validated SARS-CoV-2 "
+                 "specific epitopes with peptide binding assays."),
+    "source": "europepmc"}
+_m138 = {x["name"]: x for x in _sci138.extract_tool_mentions([_rec138],
+                                                             _prof138)}
+_shape_junk = [k for k in _m138
+               if _sci138.GENE_SHAPE.match(k)
+               or _sci138.ALLELE_SHAPE.match(
+                   k.replace("-", "").split("*")[0]) and "*" in k]
+_cov138 = _sci138.screen_candidate(
+    "CoV-2", "PepGen: conditional generation of peptides for MHC "
+    "binding", profile=_prof138, has_naming_source=False)
+_mm138 = _sci138.screen_candidate(
+    "MultiMHC", "MultiMHC is a deep learning model for peptide-MHC "
+    "binding prediction", profile=_prof138)
+_nm138 = _sci138.screen_candidate(
+    "PepGen", "conditional generation of peptides for MHC binding",
+    profile=_prof138, has_naming_source=True)
+check("138 M6 A1/A2 candidate identity (regression: allele/virus names "
+      "from a foreign intro cue): gene/allele-shaped names are never "
+      "minted as tools; the intro-cue privilege belongs to the ONE "
+      "name introduced (PepGen), co-occurring mentions get none; a "
+      "domain+operation description WITHOUT a software claim is 'not a "
+      "direct alternative', while a method signal or a genuine naming "
+      "publication still promotes (no over-rejection)",
+      "PepGen" in _m138 and _m138["PepGen"]["method_context"]
+      and not _shape_junk
+      and not any(_sci138.GENE_SHAPE.match(k) for k in _m138)
+      and all(not v["method_context"] for k, v in _m138.items()
+              if k != "PepGen")
+      and _cov138["eligibility"] == "insufficient information to classify"
+      and _cov138["comparable_for_replacement"] is False
+      and _mm138["eligibility"] == "direct alternative"
+      and _nm138["eligibility"] == "direct alternative",
+      f"mentions={list(_m138)} cov={_cov138['eligibility']} "
+      f"mm={_mm138['eligibility']} nm={_nm138['eligibility']}")
 
 _s127, _p127 = call("/api/settings", {"top_n": 7,
                                       "task_token": "evil-token",

@@ -156,29 +156,49 @@ def tsv_rows(rows, cols=None) -> str:
 # ---------------------------------------------------------------------------
 
 _CSS = """
-body{font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,
-sans-serif;margin:0;background:#0f1419;color:#d7dee8}
-main{max-width:1100px;margin:0 auto;padding:24px 28px 80px}
-h1{font-size:22px;margin:.2em 0}h2{font-size:17px;margin:1.6em 0 .5em;
-border-bottom:1px solid #2a3442;padding-bottom:4px}
-h3{font-size:14px;margin:1.1em 0 .4em;color:#9fb3c8}
-.disclaimer{background:#2b2010;border:1px solid #7a5b16;color:#f2d488;
-padding:10px 12px;border-radius:6px;white-space:pre-wrap}
-.hint{color:#8a97a8;font-size:12px}
-.card{background:#161d26;border:1px solid #26313f;border-radius:8px;
-padding:12px 14px;margin:10px 0}
-.pill{display:inline-block;background:#1d3a5f;color:#8ec5ff;border-radius:
-10px;padding:1px 9px;font-size:12px;margin-right:6px}
-.warn{background:#3a2416;border:1px solid #7a4a1a;border-radius:6px;
-padding:8px 10px;color:#f0b483}
+:root{--bg:#0f1419;--fg:#d7dee8;--mut:#9fb3c8;--hint:#8a97a8;--line:#2a3442;
+--card:#161d26;--thead:#1a2330;--pill-bg:#1d3a5f;--pill-fg:#8ec5ff;
+--ok-bg:#15301f;--ok-fg:#8fe0a6;--warn-bg:#3a2416;--warn-fg:#f0b483;
+--amber-bg:#332b12;--amber-fg:#e8cf7a;--pre-bg:#10161d;--disc-bg:#2b2010;
+--disc-line:#7a5b16;--disc-fg:#f2d488}
+@media (prefers-color-scheme: light){:root{--bg:#f6f8fa;--fg:#1f2630;
+--mut:#4d5c6d;--hint:#63707f;--line:#d5dbe2;--card:#ffffff;
+--thead:#eef2f6;--pill-bg:#dbeafe;--pill-fg:#1e4e8c;--ok-bg:#dcf3e3;
+--ok-fg:#14532d;--warn-bg:#fceadd;--warn-fg:#7c3a10;--amber-bg:#faf0cd;
+--amber-fg:#6b5305;--pre-bg:#f0f3f6;--disc-bg:#fff8dd;--disc-line:#c8a94a;
+--disc-fg:#6b5305}}
+body{font:14px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+margin:0;background:var(--bg);color:var(--fg)}
+main{max-width:1060px;margin:0 auto;padding:24px 28px 90px}
+h1{font-size:22px;margin:.2em 0}
+h2{font-size:17px;margin:1.7em 0 .5em;border-bottom:1px solid var(--line);
+padding-bottom:4px}
+h3{font-size:14.5px;margin:1.1em 0 .4em;color:var(--mut)}
+.headline{font-size:15.5px;font-weight:600;margin:.3em 0 .6em}
+.disclaimer{background:var(--disc-bg);border:1px solid var(--disc-line);
+color:var(--disc-fg);padding:10px 12px;border-radius:6px;
+white-space:pre-wrap;font-size:12.5px}
+.hint{color:var(--hint);font-size:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;
+padding:12px 15px;margin:10px 0}
+.pill{display:inline-block;background:var(--pill-bg);color:var(--pill-fg);
+border-radius:10px;padding:1px 9px;font-size:12px;margin-right:6px}
+.pill.ok{background:var(--ok-bg);color:var(--ok-fg)}
+.pill.warn{background:var(--warn-bg);color:var(--warn-fg)}
+.pill.amber{background:var(--amber-bg);color:var(--amber-fg)}
+.warn{background:var(--warn-bg);border:1px solid var(--warn-fg);
+border-radius:6px;padding:8px 10px;color:var(--warn-fg)}
 table{border-collapse:collapse;width:100%;font-size:12.5px;margin:.4em 0}
-th,td{border:1px solid #2a3442;padding:4px 7px;text-align:left;
-vertical-align:top}th{background:#1a2330;color:#9fb3c8}
+th,td{border:1px solid var(--line);padding:5px 8px;text-align:left;
+vertical-align:top}th{background:var(--thead);color:var(--mut)}
 ul{margin:.3em 0 .6em 1.2em;padding:0}li{margin:.25em 0}
-pre{background:#10161d;border:1px solid #26313f;border-radius:6px;
+pre{background:var(--pre-bg);border:1px solid var(--line);border-radius:6px;
 padding:10px;overflow:auto;font-size:12px;white-space:pre-wrap}
-details{margin:.6em 0}summary{cursor:pointer;color:#8ec5ff}
-.mnote{color:#9fb3c8;font-size:12.5px}
+details{margin:.7em 0}summary{cursor:pointer;color:var(--pill-fg);
+font-weight:500}
+.mnote{color:var(--mut);font-size:12.5px}
+.q{font-size:13px;color:var(--fg)}
+a{color:inherit;text-decoration:underline}
 """
 
 
@@ -191,26 +211,16 @@ def _list(items, tag="li") -> str:
                             for i in (items or [])) + "</ul>"
 
 
-def _five_part(ev: dict) -> str:
-    labels = [
-        ("what_evidence_supports_it", "What evidence supports it"),
-        ("expected_advantage", "Expected advantage"),
-        ("directly_comparable", "Directly comparable?"),
-        ("directly_comparable_note", "Comparability note"),
-        ("usable_in_current_deployment", "Usable in the current deployment"),
-        ("remains_to_verify", "Remains to verify"),
-    ]
-    lis = []
-    for k, lab in labels:
-        if k in ev:
-            lis.append(f"<li><b>{_e(lab)}:</b> {_cell(ev[k])}</li>")
-    return f"<ul class='five'>{''.join(lis)}</ul>" if lis else ""
+def _pill(text, kind="") -> str:
+    return (f"<span class='pill {kind}'>{_e(text)}</span>")
 
 
 def research_html(rid: str, rep: dict) -> bytes:
-    """Standalone single-file HTML of a stored research report (either
-    engine). Every section renders only if the stored report carries it -
-    the export can never claim more than what was retrieved."""
+    """Standalone single-file HTML of a STORED research report.
+    M6 B2 layout: conclusion first (executive assessment -> module
+    recommendations -> scientific comparison -> actions); every
+    technical detail lives in collapsed <details> appendices. Renders
+    only what the stored report carries - it never re-runs retrieval."""
     consumed = set()
 
     def use(*keys):
@@ -218,118 +228,209 @@ def research_html(rid: str, rep: dict) -> bytes:
 
     parts: list[str] = []
     eng = str(rep.get("engine") or "?")
+    a = rep.get("assessment") or {}
+    use("engine", "engine_version", "status", "decision_ready",
+        "review_class", "targets", "scope", "target")
+    ready = bool(rep.get("decision_ready"))
+    example = eng == "example"
     parts.append(
-        f"<h1>NeoAG tool-research report</h1><p><span class=pill>"
-        f"engine: {_e(eng)} {_e(rep.get('engine_version') or '')}</span>"
-        f"<span class=pill>report {_e(rid)}</span>"
-        f"<span class=pill>status: {_e(rep.get('status') or 'completed')}"
-        f"</span> <span class=hint>exported {_e(_now())} - this file is "
-        "standalone and immutable: the server serves these exact bytes on "
-        "every re-download</span></p>")
+        f"<h1>{'Example (mock) research digest' if example else 'NeoAG scientific tool review'}</h1>"
+        f"<p>{_pill('PRELIMINARY RESEARCH' if (not ready and not example) else ('MOCK EXAMPLE' if example else 'DECISION-READY REVIEW'), 'warn' if not ready and not example else ('' if example else 'ok'))}"
+        f"{_pill('report ' + rid)}{_pill('engine ' + eng + ' ' + str(rep.get('engine_version') or ''))}"
+        f"{_pill('status ' + str(rep.get('status') or ''))}</p>")
+
+    # ---- 1. Executive assessment -------------------------------------
+    if a:
+        use("assessment")
+        parts.append(_h2("1. Executive assessment"))
+        parts.append(f"<p class=headline>{_e(a.get('headline'))}</p>")
+        parts.append(f"<p class=mnote>{_e(a.get('scope'))}</p>")
+        if a.get("top_findings"):
+            parts.append("<b>Most important findings</b>")
+            parts.append(_list(a["top_findings"]))
+        if a.get("evidence_gaps"):
+            parts.append("<b>Evidence gaps that affect decisions</b>")
+            parts.append(_list(a["evidence_gaps"]))
+        if a.get("next_action"):
+            parts.append("<p><b>Next recommended action:</b> "
+                         + _e(a["next_action"]) + "</p>")
     if rep.get("disclaimer"):
-        parts.append(f'<div class=disclaimer>{_e(rep["disclaimer"])}</div>')
-        use("disclaimer")
-    use("engine", "engine_version", "status")
-    if rep.get("executive_summary"):
-        parts.append(_h2("Executive recommendations"))
-        parts.append(_list(rep["executive_summary"]))
-        use("executive_summary")
-    mc = rep.get("module_conclusions") or {}
-    if mc:
-        parts.append(_h2("Per-module conclusions (decision first)"))
-        for tid, c in mc.items():
-            ex = c.get("explanation") or {}
-            parts.append(
-                "<div class=card><h3>" + _e(c.get("target") or tid) +
-                f" <span class=hint>[{_e(tid)}]</span></h3>"
-                f"<p><span class=pill>{_e(c.get('conclusion'))}</span>"
-                f"<span class=mnote>{_e(c.get('why'))}</span></p>"
-                + _five_part(ex)
-                + ("<p class=mnote><b>Recommended evaluation:</b> "
-                   + _e(c.get("recommended_evaluation")) + "</p>"
-                   if c.get("recommended_evaluation") else "")
-                + "</div>")
-        use("module_conclusions", "conclusion_vocabulary")
-    if rep.get("recommendation"):
-        rec = rep["recommendation"]
-        parts.append(_h2("Recommendation"))
         parts.append(
-            "<div class=card>"
-            + (f"<p>{_e(rec['verdict'])}</p>" if isinstance(rec, dict)
-               and rec.get("verdict") else _cell(rec))
-            + (_list(rec.get("experiments_before_adoption"))
-               if isinstance(rec, dict) else "")
-            + "</div>")
-        use("recommendation")
-    tcs = rep.get("task_comparisons") or []
-    if tcs:
-        parts.append(_h2("Evidence-based comparison by scientific task"))
-        for tc in tcs:
-            cur = tc.get("current_tools") or []
-            cur_line = "; ".join(
-                f"{c.get('name')} [{c.get('version')}] installed: "
-                f"{c.get('installed')}" for c in cur)
-            groups = tc.get("alternatives_by_kind") or {}
-            gline = "; ".join(f"{k}: {', '.join(v)}"
-                              for k, v in groups.items()) or "none"
-            parts.append(
-                f"<div class=card><h3>{_e(tc.get('target'))}</h3>"
-                f"<p class=mnote><b>Current NeoAG tool(s):</b> "
-                f"{_e(cur_line)}</p>"
-                f"<p class=mnote><b>Alternatives by kind:</b> {_e(gline)}"
-                "</p>"
-                + _html_table(tc.get("rows"))
-                + f"<p class=hint>{_e(tc.get('note'))}</p></div>")
-        use("task_comparisons")
-    vlf = rep.get("version_license_findings") or []
-    if vlf:
-        parts.append(_h2("Version, license and compatibility findings"))
-        parts.append(_html_table(vlf))
-        use("version_license_findings")
+            "<details class=disc><summary>What this report is "
+            "(and is not)</summary><div class=disclaimer>"
+            + _e(rep["disclaimer"]) + "</div></details>")
+        use("disclaimer")
+
+    # ---- 2. Module-level recommendations ------------------------------
+    mt = rep.get("module_table") or []
+    if mt:
+        use("module_table")
+        parts.append(_h2("2. Module-level recommendations"))
+        parts.append(_html_table(mt))
+
+    # ---- 3. Scientific comparison -------------------------------------
+    sc = rep.get("scientific_comparison") or rep.get(
+        "task_comparisons") or []
+    cands = rep.get("candidates") or []
+    if sc:
+        use("scientific_comparison", "task_comparisons")
+        parts.append(_h2("3. Scientific comparison"))
+        for tc in sc:
+            dec = tc.get("decision") or {}
+            bl = tc.get("baseline") or {}
+            cur = ("; ".join(
+                f"{t['name']} ({t['role']})"
+                for t in bl.get("tools") or [])
+                or bl.get("note") or "NOT identified")
+            block = [f"<h3>{_e(tc.get('target'))}</h3>"]
+            if tc.get("question"):
+                block.append(f"<p class=q><b>Question this comparison "
+                             f"answers:</b> {_e(tc['question'])}</p>")
+            block.append("<p class=mnote><b>Current NeoAG method:</b> "
+                         + _e(cur)
+                         + (" " + _pill("multi-tool consensus", "ok")
+                            if bl.get("consensus") else "") + "</p>")
+            rows = tc.get("rows") or []
+            block.append(_html_table(rows) if rows else
+                         "<p class=mnote>No retrieved candidate passed "
+                         "the scientific relevance screen as a direct "
+                         "alternative for this module.</p>")
+            for label, key in (
+                    ("Complementary methods (adjacent help, not "
+                     "replacements)", "complementary"),
+                    ("Wrappers / integrations", "wrappers_integrations"),
+                    ("Related but not comparable",
+                     "related_not_comparable")):
+                names = tc.get(key) or []
+                if names:
+                    block.append(
+                        f"<p class=mnote><b>{_e(label)}:</b> "
+                        f"{_e(', '.join(names[:8]))}</p>")
+            if tc.get("excluded_irrelevant"):
+                block.append(
+                    "<p class=mnote><b>Screened out as irrelevant:</b> "
+                    + _e(", ".join(tc["excluded_irrelevant"][:6]))
+                    + " - reasons recorded in the appendix</p>")
+            if dec.get("recommendation"):
+                kind = ("ok" if dec["recommendation"]
+                        == "Retain current tool"
+                        else "warn" if dec["recommendation"]
+                        in ("Research incomplete", "Insufficient evidence")
+                        else "amber")
+                block.append("<p>" + _pill(dec["recommendation"], kind)
+                             + f"<span class=mnote> {_e(dec.get('rationale') or '')}</span></p>")
+                if dec.get("action"):
+                    block.append("<p class=mnote><b>Action:</b> "
+                                 + _e(dec["action"]) + "</p>")
+            links = []
+            for c in cands:
+                if (c.get("task") == tc.get("target")
+                        and c.get("eligibility") == "direct alternative"):
+                    ev = c.get("published_benchmark_evidence")
+                    for e in (ev if isinstance(ev, list) else [])[:1]:
+                        u = ((e or {}).get("citation") or {}).get("url")
+                        if u:
+                            links.append((c["name"], u))
+            if links:
+                block.append(
+                    "<p class=mnote><b>Key sources:</b> "
+                    + "; ".join(f"{_e(n)}: <a href='{_e(u)}'>{_e(u)}</a>"
+                                for n, u in links[:4]) + "</p>")
+            block.append(f"<p class=hint>{_e(tc.get('note'))}</p>")
+            parts.append("<div class=card>" + "".join(block) + "</div>")
+
+    # ---- 4. Recommended actions ---------------------------------------
     na = rep.get("recommended_next_actions") or []
     if na:
-        parts.append(_h2("Recommended next actions"))
+        use("recommended_next_actions", "action_plan")
+        parts.append(_h2("4. Recommended actions (scientific priority)"))
         parts.append(_list(na))
-        use("recommended_next_actions")
-    rb = rep.get("recommended_benchmarks") or []
+
+    # ---- 5. Technical appendix (collapsed) ------------------------------
+    app: list[str] = []
+
+    def a_sec(title, *keys):
+        use(*keys)
+        return app.append(_h2(title))
+
+    ex = rep.get("excluded_candidates") or []
+    if ex:
+        a_sec("Excluded candidates and reasons", "excluded_candidates")
+        app.append(
+            "<p class=hint>every retrieved candidate that did not pass "
+            "the scientific eligibility screen, with the rule that "
+            "excluded it - kept for auditability, never shown as a "
+            "comparison row</p>")
+        app.append(_html_table(
+            [{"name": c["name"], "module": c.get("module"),
+              "class": c.get("eligibility"),
+              "why": "; ".join(c.get("reasons") or []),
+              "where it came from": (c.get("origin") or "")[:90]}
+             for c in ex]))
+    if cands:
+        a_sec("Full candidate inventory", "candidates")
+        app.append(_html_table(
+            [{"tool": c.get("name"), "module": c.get("task"),
+              "eligibility": c.get("eligibility"),
+              "kind": c.get("artifact_class"),
+              "version": c.get("verified_version"),
+              "license": c.get("license"),
+              "maintenance": c.get("maintenance"),
+              "availability": c.get("availability")} for c in cands]))
+        chains = [c for c in cands if c.get("version_chain")]
+        if chains:
+            app.append(
+                "<p class=hint><b>Version verification chains:</b> every "
+                "step records WHERE it looked, WHAT it found and WHEN; "
+                "\"Not verified\" only after every step ran and produced "
+                "nothing; budget-skipped steps keep their reason</p>")
+            for c in chains:
+                ch = c["version_chain"]["chain"]
+                app.append(
+                    "<details><summary>" + _e(c.get("name")) + " - "
+                    + _e(c["version_chain"].get("display"))
+                    + "</summary>" + _html_table(ch) + "</details>")
+        perf_rows = []
+        for c in cands:
+            ev = c.get("published_benchmark_evidence")
+            for e in (ev if isinstance(ev, list) else []):
+                if isinstance(e, dict) and (e.get("metric")
+                                            or e.get("quote")):
+                    perf_rows.append({
+                        "tool": c["name"], "metric": e.get("metric"),
+                        "value": e.get("value"),
+                        "dataset": e.get("dataset"),
+                        "ground truth": e.get("ground_truth"),
+                        "tested version": e.get("tested_version"),
+                        "evidence level": e.get("evidence_level"),
+                        "comparable?": e.get("context_established"),
+                        "version caveat": (e.get("version_caveat") or "")[:90],
+                        "quote": (e.get("quote") or "")[:200],
+                        "source": ((e.get("citation") or {}).get("url")
+                                   or "")})
+        if perf_rows:
+            app.append(_h2("Performance evidence records (full)"))
+            app.append("<p class=hint>rows with comparable?=False are "
+                       "mentions without established experimental "
+                       "context - visible for audit, excluded from "
+                       "comparisons by construction</p>")
+            app.append(_html_table(perf_rows))
+    vlf = rep.get("version_license_findings") or []
+    if vlf:
+        a_sec("Version and license findings", "version_license_findings")
+        app.append(_html_table(vlf))
+    rb = rep.get("recommended_benchmarks") or {}
     if rb:
-        parts.append(_h2("Recommended benchmarks"))
-        parts.append(_html_table(rb))
-        use("recommended_benchmarks")
-    comp = rep.get("comparison") or []
-    if comp:
-        parts.append(_h2("Candidate comparison (full retrieved table)"))
-        parts.append(_html_table(comp))
-        use("comparison")
-    cands = rep.get("candidates") or []
-    chains = [c for c in cands if c.get("version_chain")]
-    if chains:
-        parts.append(_h2("Version verification chains"))
-        parts.append(
-            '<p class=hint>every step records WHERE it looked, WHAT it '
-            'found and WHEN; "Not verified" only after every step ran and '
-            'produced nothing</p>')
-        for c in chains:
-            ch = c["version_chain"]["chain"]
-            parts.append(
-                "<details><summary>" + _e(c.get("name")) + " — "
-                + _e(c["version_chain"].get("display")) + "</summary>"
-                + _html_table(ch)
-                + ("<p class=mnote><b>benchmark-version mentions:</b> "
-                   + _cell(c["version_chain"].get("benchmark_versions"))
-                   + "</p>" if c["version_chain"].get(
-                       "benchmark_versions") else "")
-                + "</details>")
-        use("candidates")
-    cits = rep.get("literature_citations") or []
-    if cits:
-        parts.append(_h2("Sources and citations"))
-        parts.append(_html_table(cits))
-        use("literature_citations")
+        a_sec("Benchmark definitions for proposed evaluations",
+              "recommended_benchmarks")
+        app.append(_html_table(
+            [{"module": k, "metrics": v.get("metrics"),
+              "datasets note": v.get("datasets_note"),
+              "warning": v.get("warning")} for k, v in rb.items()]))
     cov = rep.get("coverage_accounting")
     if cov:
-        parts.append(_h2("Coverage accounting"))
-        parts.append(
+        a_sec("Coverage accounting", "coverage_accounting")
+        app.append(
             "<p>" + " / ".join(
                 f"<b>{_e(k)}</b>: {_cell(cov.get(k))}"
                 for k in ("completeness", "identified_modules",
@@ -337,62 +438,87 @@ def research_html(rid: str, rep: dict) -> bytes:
                           "insufficient_evidence")) + "</p>"
             + _html_table(cov.get("not_researched"))
             + f"<p class=hint>{_e(cov.get('note'))}</p>")
-        use("coverage_accounting")
+    gts = rep.get("quality_gates") or []
+    if gts:
+        a_sec("Research quality gates", "quality_gates")
+        app.append(_html_table(gts))
     inv = rep.get("inventory")
     if inv and inv.get("stages"):
-        parts.append(_h2("Code-grounded pipeline inventory"))
-        parts.append(
+        a_sec("Code-grounded pipeline inventory + baselines", "inventory")
+        app.append(
             f"<p class=mnote>repo {_e(inv.get('repo'))} @ commit "
             f"{_e(inv.get('git_commit'))}, captured "
             f"{_e(inv.get('captured_at'))}</p>")
-        st = [{"id": s.get("id"), "label": s.get("label"),
-               "current_tools": s.get("current_tools"),
-               "provenance": s.get("provenance")}
-              for s in inv["stages"]]
-        parts.append(_html_table(st))
-        use("inventory")
+        for s in inv["stages"]:
+            b = s.get("baseline") or {}
+            tools = "; ".join(
+                f"{t['name']} [{t['role']}] ({'; '.join(t['evidence'])[:120]})"
+                for t in b.get("tools") or []) or "not identified"
+            app.append(
+                f"<p class=mnote><b>{_e(s.get('id'))}</b> "
+                f"{'(consensus) ' if b.get('consensus') else ''}: "
+                f"{_e(tools)}</p>")
+    cits = rep.get("literature_citations") or []
+    if cits:
+        a_sec("Sources and citations", "literature_citations")
+        app.append(_html_table(cits))
+    comp = rep.get("comparison") or []
+    if comp:
+        a_sec("Full candidate comparison table", "comparison")
+        app.append(_html_table(comp))
     if rep.get("methodology"):
-        parts.append(_h2("Methodology"))
-        parts.append(f"<p>{_e(rep['methodology'])}</p>")
-        use("methodology")
+        a_sec("Methodology", "methodology")
+        app.append(f"<p>{_e(rep['methodology'])}</p>")
     lim = rep.get("limitations") or []
     if lim:
-        parts.append(_h2("Limitations and incomplete evidence"))
-        parts.append(_list(lim))
-        use("limitations")
+        a_sec("Limitations and incomplete evidence", "limitations")
+        app.append(_list(lim))
     if rep.get("availability_classes_legend"):
-        parts.append(_h2("Availability classes legend"))
-        legend = rep["availability_classes_legend"]
-        if isinstance(legend, list):
-            parts.append(_html_table(legend))
-        elif isinstance(legend, dict):
-            parts.append(_html_table([{"class": k, "meaning": v}
-                                      for k, v in legend.items()]))
-        else:
-            parts.append(f"<p>{_e(legend)}</p>")
+        app.append(_h2("Availability classes legend"))
+        app.append(f"<p class=mnote>{_e(rep['availability_classes_legend'])}</p>")
         use("availability_classes_legend")
     lic = rep.get("license_constraints") or []
     if lic:
-        parts.append(_h2("Licenses seen"))
-        parts.append(_list(lic))
-        use("license_constraints")
+        a_sec("Licenses seen", "license_constraints")
+        app.append(_list(lic))
     if rep.get("provenance"):
-        parts.append(_h2("Provenance"))
-        parts.append("<pre>" + _e(json.dumps(
-            rep["provenance"], indent=1, ensure_ascii=False)) + "</pre>")
-        use("provenance")
+        a_sec("Provenance (queries, counts, failures)", "provenance")
+        app.append("<details><summary>full query log + failures "
+                   "(JSON)</summary><pre>" + _e(json.dumps(
+                       rep["provenance"], indent=1,
+                       ensure_ascii=False)) + "</pre></details>")
     if rep.get("timestamps"):
-        parts.append(_h2("Timestamps"))
-        parts.append(_html_table([rep["timestamps"]]))
-        use("timestamps")
-    use("targets", "scope", "target")
-    # honesty fallback: anything not rendered above is still included,
-    # verbatim, so the export never silently drops stored content
+        a_sec("Timestamps", "timestamps")
+        app.append(_html_table([rep["timestamps"]]))
+    if rep.get("module_conclusions"):
+        a_sec("Per-module decision records", "module_conclusions",
+              "conclusion_vocabulary", "eligibility_vocabulary")
+        for tid, mc in rep["module_conclusions"].items():
+            app.append(
+                "<div class=card><h3>" + _e(tid) + "</h3>"
+                f"<p>{_e(mc.get('recommendation') or mc.get('conclusion'))}"
+                f" - {_e(mc.get('rationale'))}</p>"
+                + _html_table([mc.get("evidence_facts") or {}])
+                + "</div>")
+    if rep.get("recommendation"):
+        rec = rep["recommendation"]
+        use("recommendation")
+        app.append(_h2("Recommendation (example engine)"))
+        app.append(_cell(rec))
+    if app:
+        parts.append(_h2("5. Technical appendix"))
+        parts.append("<details class=appx><summary>open the full "
+                     "technical appendix (candidate inventory, exclusions, "
+                     "version chains, evidence records, queries, "
+                     "provenance)</summary>" + "".join(app) + "</details>")
+    # honesty fallback: anything not rendered above is still included
     rest = {k: v for k, v in rep.items() if k not in consumed}
     if rest:
         parts.append(_h2("Other stored report content"))
-        parts.append("<pre>" + _e(json.dumps(rest, indent=1,
-                                             ensure_ascii=False)) + "</pre>")
+        parts.append("<details><summary>unrendered stored keys</summary>"
+                     "<pre>" + _e(json.dumps(rest, indent=1,
+                                             ensure_ascii=False))
+                     + "</pre></details>")
     body = "".join(parts)
     doc = ("<!doctype html><html><head><meta charset=utf-8>"
            "<meta name=viewport content='width=device-width,"
@@ -400,9 +526,10 @@ def research_html(rid: str, rep: dict) -> bytes:
            f"<title>NeoAG research report {_e(rid)}</title>"
            f"<style>{_CSS}</style></head><body><main>{body}"
            "<p class=hint>Generated by the NeoAG web demo export builder "
-           f"({_e(EXPORT_BUILDER)}). Report id {_e(rid)}. This file is "
-           "self-contained - no network access is needed to read it."
-           "</p></main></body></html>")
+           f"({_e(EXPORT_BUILDER)}) for report {_e(rid)}. This file is "
+           "self-contained and immutable - a re-download serves these "
+           "exact bytes and never re-runs retrieval.</p></main>"
+           "</body></html>")
     return doc.encode("utf-8")
 
 
@@ -443,22 +570,59 @@ def research_tsv(rid: str, rep: dict) -> bytes:
             out.append(f"\n# ===== section: {title} =====")
             out.append(t.rstrip("\n"))
 
+    a = rep.get("assessment") or {}
+    if a:
+        section("assessment", [{
+            "headline": a.get("headline"), "scope": a.get("scope"),
+            "review_class": a.get("review_class"),
+            "decision_ready": a.get("decision_ready"),
+            "top_findings": a.get("top_findings"),
+            "evidence_gaps": a.get("evidence_gaps"),
+            "next_action": a.get("next_action")}])
+    section("module_table", rep.get("module_table"))
     mc = rep.get("module_conclusions") or {}
     if mc:
         rows = []
         for tid, c in mc.items():
-            ex = c.get("explanation") or {}
-            rows.append({"target_id": tid, "target": c.get("target"),
-                         "conclusion": c.get("conclusion"),
-                         "why": c.get("why"),
-                         "evidence_basis": c.get("evidence_basis"),
-                         "directly_comparable": ex.get(
-                             "directly_comparable"),
-                         "usable_in_current_deployment": ex.get(
-                             "usable_in_current_deployment"),
-                         "recommended_evaluation": c.get(
-                             "recommended_evaluation")})
+            rows.append({"target_id": tid,
+                         "recommendation": c.get("recommendation")
+                         or c.get("conclusion"),
+                         "rationale": c.get("rationale"),
+                         "action": c.get("action"),
+                         **(c.get("evidence_facts") or {})})
         section("module_conclusions", rows)
+    section("excluded_candidates", [
+        {"name": c.get("name"), "module": c.get("module"),
+         "eligibility": c.get("eligibility"),
+         "reasons": "; ".join(c.get("reasons") or []),
+         "origin": c.get("origin")}
+        for c in rep.get("excluded_candidates") or []])
+    section("quality_gates", rep.get("quality_gates"))
+    sc = rep.get("scientific_comparison") or []
+    if sc:
+        rows = []
+        for c in sc:
+            b = c.get("baseline") or {}
+            d = c.get("decision") or {}
+            rows.append({
+                "target": c.get("target"), "question": c.get("question"),
+                "baseline_identified": b.get("identified"),
+                "baseline_consensus": b.get("consensus"),
+                "baseline_tools": ", ".join(
+                    t.get("name", "") for t in b.get("tools") or []),
+                "direct_alternatives": len(c.get("rows") or []),
+                "complementary": ", ".join(
+                    c.get("complementary") or []),
+                "wrappers_integrations": ", ".join(
+                    c.get("wrappers_integrations") or []),
+                "related_not_comparable": ", ".join(
+                    c.get("related_not_comparable") or []),
+                "insufficient": ", ".join(c.get("insufficient") or []),
+                "recommendation": d.get("recommendation"),
+                "action": d.get("action")})
+        section("scientific_comparison", rows)
+    if rep.get("action_plan"):
+        section("action_plan", rep["action_plan"])
     for tc in rep.get("task_comparisons") or []:
         rows = [dict(r, target=tc.get("target"))
                 for r in tc.get("rows") or []]
@@ -494,11 +658,17 @@ def research_tsv(rid: str, rep: dict) -> bytes:
                                 for a in rep["limitations"]])
     # nothing stored is silently dropped: leftover keys are appended
     handled = {"engine", "engine_version", "status", "scope", "target",
-               "targets", "disclaimer", "module_conclusions",
+               "targets", "disclaimer", "assessment", "module_table",
+               "decision_ready", "review_class", "quality_gates",
+               "scientific_comparison", "excluded_candidates", "action_plan",
+               "module_conclusions", "conclusion_vocabulary",
+               "eligibility_vocabulary", "inventory",
                "task_comparisons", "version_license_findings", "comparison",
-               "candidates", "literature_citations", "coverage_accounting",
-               "recommended_benchmarks", "recommended_next_actions",
-               "executive_summary", "limitations"}
+               "candidates", "literature_citations", "license_constraints",
+               "coverage_accounting", "recommended_benchmarks",
+               "recommended_next_actions", "executive_summary",
+               "availability_classes_legend", "provenance", "methodology",
+               "timestamps", "limitations"}
     rest = {k: v for k, v in rep.items() if k not in handled}
     for k, v in rest.items():
         if isinstance(v, list) and v and all(isinstance(x, dict)
@@ -605,10 +775,11 @@ def pdf_bytes(title: str, paragraphs: list[tuple[str, str]]) -> bytes:
 
 
 def report_text_paras(rid: str, rep: dict) -> list[tuple[str, str]]:
-    """Narrative flattening of the report for the PDF - decisions first,
-    always pointing to the JSON/HTML export for the complete detail."""
+    """Narrative flattening for the PDF (M6 B8): the concise main
+    sections first, the technical detail grouped into later pages,
+    always pointing to the JSON/HTML export for the complete record."""
     p: list[tuple[str, str]] = [
-        ("h", "NeoAG tool-research report"),
+        ("h", "NeoAG scientific tool review"),
         ("p", f"report {rid} - engine {rep.get('engine')} "
               f"{rep.get('engine_version') or ''} - exported {_now()}"),
         ("p", "PDF note: machine-generated text-only rendering (stdlib "
@@ -617,41 +788,74 @@ def report_text_paras(rid: str, rep: dict) -> list[tuple[str, str]]:
               "tabular detail; science content was not re-generated for "
               "this file."),
     ]
+    a = rep.get("assessment") or {}
+    if a:
+        p.append(("h", "1. Executive assessment"))
+        p.append(("p", str(a.get("headline"))))
+        p.append(("p", f"Scope: {a.get('scope')}"))
+        for x in a.get("top_findings") or []:
+            p.append(("p", f"- finding: {x}"))
+        for x in a.get("evidence_gaps") or []:
+            p.append(("p", f"- gap: {x}"))
+        if a.get("next_action"):
+            p.append(("p", f"Next recommended action: {a['next_action']}"))
+        p.append(("p", f"Review class: {a.get('review_class')}"))
     if rep.get("disclaimer"):
         p.append(("b", str(rep["disclaimer"])))
-    for s in rep.get("executive_summary") or []:
-        p.append(("p", s))
-    for tid, c in (rep.get("module_conclusions") or {}).items():
-        p.append(("h", f"{c.get('target') or tid}: {c.get('conclusion')}"))
-        p.append(("p", f"Why: {c.get('why')}"))
-        ex = c.get("explanation") or {}
-        if ex.get("expected_advantage"):
-            p.append(("p", f"Expected advantage: {ex['expected_advantage']}"))
-        if ex.get("remains_to_verify"):
-            p.append(("p", f"Remains to verify: {ex['remains_to_verify']}"))
-        if c.get("recommended_evaluation"):
-            p.append(("p", f"Recommended evaluation: "
-                           f"{c['recommended_evaluation']}"))
-    if rep.get("recommendation"):
-        rec = rep["recommendation"]
-        if isinstance(rec, dict) and rec.get("verdict"):
-            p.append(("h", "Recommendation"))
-            p.append(("p", str(rec["verdict"])))
-            for e in rec.get("experiments_before_adoption") or []:
-                p.append(("p", f"- {e}"))
+    mt = rep.get("module_table") or []
+    if mt:
+        p.append(("h", "2. Module-level recommendations"))
+        for m in mt:
+            p.append(("p", f"- {m.get('module')}: current="
+                           f"{m.get('current NeoAG method')}; best="
+                           f"{m.get('best relevant alternative')}; "
+                           f"{m.get('recommendation')}"))
+    sc = rep.get("scientific_comparison") or []
+    if sc:
+        p.append(("h", "3. Scientific comparison"))
+        for tc in sc:
+            bl = tc.get("baseline") or {}
+            cur = ", ".join(t["name"] for t in bl.get("tools") or []) \
+                or bl.get("note") or "not identified"
+            p.append(("h", str(tc.get("target"))))
+            p.append(("p", f"Current NeoAG method: {cur}"
+                           + (" (multi-tool consensus)"
+                              if bl.get("consensus") else "")))
+            for r in tc.get("rows") or []:
+                p.append(("p", f"- alternative {r.get('tool')} "
+                               f"[{r.get('version')}]: {r.get('evidence')}"))
+            dec = tc.get("decision") or {}
+            if dec.get("recommendation"):
+                p.append(("p", f"Recommendation: {dec['recommendation']}"
+                               f" - {dec.get('rationale')}"))
+                if dec.get("action"):
+                    p.append(("p", f"Action: {dec['action']}"))
     if rep.get("recommended_next_actions"):
-        p.append(("h", "Recommended next actions"))
-        for a in rep["recommended_next_actions"]:
-            p.append(("p", f"- {a}"))
+        p.append(("h", "4. Recommended actions (scientific priority)"))
+        for x in rep["recommended_next_actions"]:
+            p.append(("p", f"- {x}"))
+    # ---- technical appendix (later pages) ----
+    p.append(("h", "5. Technical appendix"))
+    ex = rep.get("excluded_candidates") or []
+    if ex:
+        p.append(("p", f"Excluded candidates ({len(ex)}):"))
+        for c in ex[:12]:
+            p.append(("p", f"- {c.get('name')} ({c.get('module')}): "
+                           f"{'; '.join(c.get('reasons') or [])[:160]}"))
     cov = rep.get("coverage_accounting") or {}
     if cov:
-        p.append(("h", "Coverage accounting"))
-        p.append(("p", f"completeness {cov.get('completeness')}; "
-                       f"identified {cov.get('identified_modules')}; "
-                       f"researched {cov.get('researched_modules')}; "
-                       f"sufficient {len(cov.get('sufficient_evidence') or [])}; "
-                       f"insufficient {len(cov.get('insufficient_evidence') or [])}; "
-                       f"not researched {len(cov.get('not_researched') or [])}"))
+        p.append(("p", f"Coverage accounting: completeness "
+                       f"{cov.get('completeness')}; identified "
+                       f"{cov.get('identified_modules')}; researched "
+                       f"{cov.get('researched_modules')}; sufficient "
+                       f"{len(cov.get('sufficient_evidence') or [])}; "
+                       f"insufficient "
+                       f"{len(cov.get('insufficient_evidence') or [])}; "
+                       f"not researched "
+                       f"{len(cov.get('not_researched') or [])}"))
+    for g in rep.get("quality_gates") or []:
+        p.append(("p", f"gate [{'PASS' if g.get('passed') else 'FAIL'}] "
+                       f"{g.get('check')} - {g.get('detail')}"))
     if rep.get("limitations"):
         p.append(("h", "Limitations"))
         for l in rep["limitations"]:
@@ -659,6 +863,11 @@ def report_text_paras(rid: str, rep: dict) -> list[tuple[str, str]]:
     if rep.get("methodology"):
         p.append(("h", "Methodology"))
         p.append(("p", str(rep["methodology"])))
+    if rep.get("recommendation"):
+        rec = rep["recommendation"]
+        if isinstance(rec, dict) and rec.get("verdict"):
+            p.append(("h", "Recommendation (example engine)"))
+            p.append(("p", str(rec["verdict"])))
     return p
 
 

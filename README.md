@@ -309,6 +309,75 @@ export is text-only by construction (12-page cap, truncation
 disclosed); browser acceptance stays with the operator (no browser
 tooling on this host).
 
+## Scientific research quality & unified entry (milestone 6)
+
+Driven by the 2026-11-17 research report as a NEGATIVE test fixture:
+what that report got wrong is what this milestone changed.
+
+- **Relevance is decided by generalizable scientific rules, never by
+  name lists** (A1/A2). A candidate enters a comparison only if its own
+  retrieved text describes performing the module's task (per-module
+  TASK_PROFILES + domain anchors); baselines are labelled
+  `current baseline (not an alternative)`, wrappers/complementary/
+  unrelated/insufficient each get an explicit six-class eligibility
+  verdict WITH a reason recorded in provenance; the intro-cue
+  privilege belongs to the one name a publication introduces, and
+  allele/virus-shaped names cannot be minted as tools (battery 138,
+  discovery checks 28-32).
+- **Baselines are identified from the deployed code** (A3): the
+  code-grounded inventory names, per module, the tools the workflow
+  TOML + planner wiring + conda pins actually run, with file:line
+  evidence - a baseline candidate can never be scored as an external
+  alternative.
+- **Literature-first, evidence-record-per-number** (A4/A6): tool names
+  are EXTRACTED from retrieved titles/abstracts under shape guards and
+  closed-class stop-rules (institutions and connectives cannot mint
+  candidates), deduplicated by DOI/PMID/PMCID, and a performance
+  number counts only with metric + dataset + tool version
+  (A6/A8: rate-limit waits and definite registry-absence answers are
+  recorded outcomes of the version chain - tagged in provenance and
+  never silently demoting a module; discovery check 34).
+- **Recommendations can never outrun evidence** (A9/A10): a pure
+  `recommend()` over the stored rows, superiority only from same-
+  metric same-dataset paired comparisons, quality gates decide
+  `decision_ready`, and a targeted run is "complete for its scope"
+  instead of faking full-pipeline verdicts.
+- **Conclusion-first reports** (B): 1. Executive assessment (readable
+  in about a minute) / 2. Module-level recommendations / 3. Per-module
+  scientific comparison / 4. Priority actions / 5. collapsed technical
+  appendix - identical structure in HTML, PDF and in-browser, light +
+  dark via CSS variables, full provenance in JSON/TSV, exports pinned
+  by content hash.
+- **Benchmark consent is a complete, backend-enforced experiment
+  proposal** (C): nine mandatory fields (dataset+source, question,
+  comparison tools, download size, storage destination, compute,
+  metrics, installation, NeoAG-modification flag - the last must be
+  false), and the user answers APPROVE / REJECT / LIMIT SCOPE (re-
+  scope on a fresh card) / LITERATURE ONLY; every non-approve answer
+  cancels the formal job with its own recorded reason (battery
+  128-130).
+- **One native entry** (D): a data directory is the whole request - a
+  read-only scan maps files to real `open-neo run` flags (contents
+  never opened, ambiguity surfaced not guessed), the CONFIRMED
+  manifest is authoritative input, the native planner decides branches,
+  and Chat/Tasks submissions land in the same unified job backend
+  (battery 131-133).
+- **Scientific configuration is a small verified structured set** (E):
+  fixed-choice radios, bounded numbers and checkboxes only - every
+  control cites the deployed code, is re-validated server-side
+  (choices/ranges/booleans), forwards to real execution, and stays at
+  the native default until touched; decisions the deployed code makes
+  on its own (presentation consensus, LOH/CCF scoring, fusion caps)
+  are documented with file:line citations instead of fake knobs
+  (battery 134-135).
+- **Chat/UI reliability** (F): conversation ellipsis menu (rename /
+  pin / archive / unarchive / delete), the header rename and native
+  confirms are gone, the agent-mode switch is an explanatory dropdown
+  that the BACKEND refuses while a chat turn or job is in flight
+  (battery 136-137), the prep text lives in Help, and known-cause
+  errors get concise answers per the workspace rules instead of
+  minutes of tool churn.
+
 ## Architecture
 
 ```

@@ -31,8 +31,7 @@
 
   <section id="agent-pane" aria-label="Agent conversation">
     <div id="chat-head">
-      <div id="chat-title" title="Double-click to rename">New chat</div>
-      <button id="chat-rename" class="icon-btn" title="Rename chat">rename</button>
+      <div id="chat-title">New chat</div>
       <span id="chat-state" class="pill muted hidden"></span>
     </div>
     <div id="chat-log" class="chat-log"></div>
@@ -67,17 +66,6 @@
 
         <div class="card">
           <div class="card-head">
-            <h2>Before you start</h2>
-            <span class="pill muted">1 - 2 minutes</span>
-          </div>
-          <ul class="journey">
-            <li><b>Know where your data are.</b> You only describe the folder; the agent proposes an input manifest and you confirm or correct it - no per-file hunting.</li>
-            <li><b>Pick a mode.</b> <b>Controlled</b> pauses at each decision point and asks you. <b>Autonomous</b> applies the validated defaults on its own; every choice is recorded for review. Both need one human approval before any execute-class run starts.</li>
-          </ul>
-        </div>
-
-        <div class="card">
-          <div class="card-head">
             <h2>Prepare an analysis</h2>
             <span class="pill muted">demo engine</span>
           </div>
@@ -108,32 +96,24 @@
               </div>
               <div id="native-box" class="hidden">
                 <div id="native-cap" class="mnote">checking native capability&hellip;</div>
-                <label class="lbl">Native profile</label>
-                <div class="mode-row">
-                  <label class="mode-opt">
-                    <input type="radio" name="njnative" value="demo" checked>
-                    <div><b>Demo dataset</b><span>real pipeline code (neoag.cli run-demo) on the repo's bundled fixtures, predictors stubbed - safe, completes, real artifacts</span></div>
-                  </label>
-                  <label class="mode-opt">
-                    <input type="radio" name="njnative" value="gateway">
-                    <div><b>My inputs via native gateway</b><span>real planner, then execution through NeoAG's controlled gateway (requires working toolchain)</span></div>
-                  </label>
+                <label class="lbl">Data directory (absolute path)</label>
+                <p class="hint">One path is enough: NeoAG's own planner inspects what is there and decides which branches run. You will not be asked for VCF, BAM or HLA values twice.</p>
+                <input type="text" id="nj-n-dir" placeholder="/data/projects/case-042">
+                <label class="lbl">Sample / case id (optional)</label>
+                <input type="text" id="nj-n-case" placeholder="leave empty to take the name found by the scan">
+                <div class="btnrow">
+                  <button id="nj-n-scan" class="btn ghost">Scan directory (read-only)</button>
+                  <span class="hint">reads file names only; contents are never opened, nothing is copied</span>
                 </div>
-                <label class="lbl">Case / sample id</label>
-                <input type="text" id="nj-n-case" placeholder="e.g. NATIVE-1" value="NATIVE-1">
-                <div id="native-gw-box" class="hidden">
-                  <label class="lbl">Somatic VCF (absolute path)</label>
-                  <input type="text" id="nj-n-vcf" placeholder="/path/to/somatic.vcf">
-                  <label class="lbl">HLA alleles (comma-separated)</label>
-                  <input type="text" id="nj-n-hla" placeholder="A*02:01, B*07:02">
-                  <label class="chk" id="nj-stub-wrap" style="display:none"><input type="checkbox" id="nj-n-stub"> stub predictor outputs (developer control - testing only, flagged in every record)</label>
-                  <div class="btnrow">
-                    <button id="nj-native-preview" class="btn ghost">Preview native plan (read-only)</button>
-                    <span class="hint">runs the REAL NeoAG planner; executes nothing</span>
-                  </div>
-                  <div id="native-preview"></div>
+                <div id="native-discover"></div>
+                <label class="chk"><input type="checkbox" id="nj-n-demo"> Use the bundled synthetic demo instead - real pipeline code on the repo's own fixtures, predictors stubbed (no patient data, cancels cleanly)</label>
+                <label class="chk" id="nj-stub-wrap" style="display:none"><input type="checkbox" id="nj-n-stub"> stub predictor outputs (developer control - testing only, flagged in every record)</label>
+                <div class="btnrow">
+                  <button id="nj-native-preview" class="btn ghost">Preview native plan (read-only)</button>
+                  <span class="hint">runs the REAL NeoAG planner on your confirmed manifest; executes nothing</span>
                 </div>
-                <p class="hint">Native runs execute outside the browser: the native gateway offers NO cancel (verified); the demo profile is our supervised subprocess and CAN be cancelled. Both are recorded honestly in the job.</p>
+                <div id="native-preview"></div>
+                <p class="hint">One entry, one flow: data directory &rarr; input discovery &rarr; confirm the manifest &rarr; the native planner plans the stages &rarr; a background job after your approval. Native gateway jobs run outside this browser and cannot be cancelled once submitted (verified limitation) - the demo run can be cancelled.</p>
               </div>
               <div id="mock-box">
               <label class="lbl">Sample</label>
@@ -164,7 +144,7 @@
               <div id="cfg-exec"></div>
             </details>
             <div id="cfg-managed" class="hint"></div>
-            <p class="hint">Every option shown exists in the configured NeoAG code (each row cites its file) and maps to a real <code>open-neo run</code> flag. The demo engine records them in the run snapshot without consuming them; native gateway jobs forward the subset the gateway accepts. Nothing here is a decorative placeholder.</p>
+            <p class="hint">Scientific controls are structured (fixed choices, bounded numbers, checkboxes), each cites the deployed code, is re-validated on the server and is forwarded to native execution; untouched controls forward nothing and the native defaults apply. The demo engine records requested values in the run snapshot without consuming them. Expert input overrides and execution/environment rows exist in the configured NeoAG code (each cites its file) but stay off by default - nothing here is a decorative placeholder.</p>
           </details>
 
           <details class="adv" id="dev-block">

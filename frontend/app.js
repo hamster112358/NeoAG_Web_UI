@@ -152,12 +152,19 @@ function connectSSE() {
 }
 
 /* ---------------- conversation sidebar ---------------- */
+/* M6 PART F4: one ellipsis menu per conversation (Rename / Pin /
+   Archive / Delete) - the cluttered inline ren/del buttons and the
+   header rename are gone. Archived chats move to a collapsed group so
+   the action stays reversible. */
 function renderSidebar() {
   const host = $("conv-list");
-  host.innerHTML = (state.convs || []).map((c) => `
+  const convs = state.convs || [];
+  const live = convs.filter((c) => !c.archived);
+  const arch = convs.filter((c) => c.archived);
+  const row = (c) => `
     <div class="conv-item ${c.id === state.activeCid ? "active" : ""}"
          data-conv="${esc(c.id)}">
-      <div class="ct">${esc(c.title || "New chat")}</div>
+      <div class="ct">${c.pinned ? '<span class="cpin" title="pinned">&#9733;</span>' : ""}${esc(c.title || "New chat")}</div>
       <div class="cm">
         ${(c.job_state === "working" || c.job_state === "blocked")
           ? '<span class="live" title="agent session live"></span>' : ""}
@@ -165,30 +172,83 @@ function renderSidebar() {
         <span>${c.n_messages || 0} msg</span>
       </div>
       <div class="cops">
-        <button class="icon-btn" data-ren="${esc(c.id)}" title="Rename">ren</button>
-        <button class="icon-btn danger" data-del="${esc(c.id)}" title="Delete (kept on server)">del</button>
+        <button class="icon-btn" data-menu="${esc(c.id)}"
+          title="Rename / pin / archive / delete">&#8943;</button>
       </div>
-    </div>`).join("") || '<div class="empty">No chats yet.</div>';
+    </div>`;
+  host.innerHTML =
+    (live.map(row).join("") || '<div class="empty">No chats yet.</div>')
+    + (arch.length
+       ? `<details class="conv-arch"><summary>Archived (${arch.length})</summary>`
+         + arch.map(row).join("") + "</details>" : "");
   host.querySelectorAll("[data-conv]").forEach((el) =>
     el.addEventListener("click", (ev) => {
-      if (ev.target.closest("[data-ren],[data-del]")) return;
+      if (ev.target.closest("[data-menu]")) return;
       openConv(el.dataset.conv);
     }));
-  host.querySelectorAll("[data-ren]").forEach((el) =>
-    el.addEventListener("click", () => startRename(el.dataset.ren)));
-  host.querySelectorAll("[data-del]").forEach((el) =>
-    el.addEventListener("click", async () => {
-      const c = state.convs.find((x) => x.id === el.dataset.del);
-      if (!confirm(`Delete chat "${(c && c.title) || "New chat"}"?\n\nIt disappears from this list; the saved messages stay on the server for audit.`)) return;
-      try {
-        await api("POST", `/api/conversations/${el.dataset.del}/delete`, {});
-        if (state.activeCid === el.dataset.del) {
-          state.activeCid = null;
-          await refreshSidebar();
-          await openNextConv();
-        } else await refreshSidebar();
-      } catch (e) { toast("delete failed: " + e.message, true); }
+  host.querySelectorAll("[data-menu]").forEach((el) =>
+    el.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      showConvMenu(el.dataset.menu, el);
     }));
+}
+
+let convMenuCloser = null;
+function closeConvMenu() {
+  document.querySelectorAll(".conv-menu").forEach((x) => x.remove());
+  if (convMenuCloser) {
+    document.removeEventListener("click", convMenuCloser);
+    convMenuCloser = null;
+  }
+}
+function showConvMenu(cid, anchor) {
+  closeConvMenu();
+  const c = (state.convs || []).find((x) => x.id === cid) || {};
+  const items = c.archived
+    ? [["unarchive", "Unarchive"], ["delete", "Delete"]]
+    : [["rename", "Rename"],
+       [c.pinned ? "unpin" : "pin", c.pinned ? "Unpin" : "Pin to top"],
+       ["archive", "Archive"], ["delete", "Delete"]];
+  const m = document.createElement("div");
+  m.className = "conv-menu";
+  m.innerHTML = items.map(([k, label]) =>
+    `<button data-act="${k}"${k === "delete" ? ' class="danger"' : ""}>` +
+    `${label}</button>`).join("");
+  document.body.appendChild(m);
+  const r = anchor.getBoundingClientRect();
+  m.style.top = (r.bottom + 4) + "px";
+  m.style.left = Math.max(6, Math.min(r.left, window.innerWidth - 160)) + "px";
+  m.addEventListener("click", async (ev) => {
+    const act = (ev.target.closest("[data-act]") || {}).dataset
+      && ev.target.closest("[data-act]").dataset.act;
+    closeConvMenu();
+    if (!act) return;
+    try {
+      if (act === "rename") { startRename(cid); return; }
+      if (act === "pin" || act === "unpin") {
+        await api("POST", `/api/conversations/${cid}/flag`,
+                  { pinned: act === "pin" });
+      } else if (act === "archive" || act === "unarchive") {
+        await api("POST", `/api/conversations/${cid}/flag`,
+                  { archived: act === "archive" });
+      } else if (act === "delete") {
+        if (!confirm(`Delete chat "${c.title || "New chat"}"?\n\n` +
+          "It disappears from this list; the saved messages stay on " +
+          "the server for audit.")) return;
+        await api("POST", `/api/conversations/${cid}/delete`, {});
+      }
+      if (state.activeCid === cid && ["archive", "delete"].includes(act)) {
+        state.activeCid = null;
+        await refreshSidebar();
+        await openNextConv();
+      } else await refreshSidebar();
+    } catch (e) { toast("chat action failed: " + e.message, true); }
+  });
+  convMenuCloser = (ev2) => {
+    if (!ev2.target.closest(".conv-menu")
+        && !ev2.target.closest("[data-menu]")) closeConvMenu();
+  };
+  setTimeout(() => document.addEventListener("click", convMenuCloser), 0);
 }
 
 async function refreshSidebar() {
@@ -275,12 +335,9 @@ function startRename(cid) {
   inp.addEventListener("blur", commit);
 }
 
-$("chat-rename").addEventListener("click", () => {
-  if (state.activeCid) startRename(state.activeCid);
-});
-$("chat-title").addEventListener("dblclick", () => {
-  if (state.activeCid) startRename(state.activeCid);
-});
+/* M6 PART F4: renaming now lives ONLY in the conversation's ⋯ menu -
+   the header rename button and the double-click shortcut are removed
+   (the header just displays the title). */
 
 /* ---------------- chat pane ---------------- */
 function fmtTime(ts) {
@@ -549,7 +606,9 @@ function renderTasks() {
       <span class="dep">${esc(dep)}</span></label>`;
   }).join("");
   $("adv-count").textContent = state.params
-    ? `${state.params.groups.flatMap((g) => g.items).length} options, all cited to the real pipeline code`
+    ? `${(state.params.science || []).length} verified science controls, ` +
+      `${state.params.groups.flatMap((g) => g.items).length} inventory rows, ` +
+      `all cited to the real pipeline code`
     : "inventory unavailable";
   renderAdvanced();
 }
@@ -574,18 +633,14 @@ function renderAdvanced() {
     wrong - every override is recorded in the run snapshot.</p>
     ${itemsOf("inputs").map((p) => pitemHtml(p)).join("")}`;
   const modules = state.params.groups.filter((g) => g.concern === "science");
-  $("cfg-science").innerHTML = `
-    <h3>Scientific configuration - per NeoAG module</h3>
-    ${modules.map((g) => `
-      <div class="pgroup">
-        <h3>${esc((g.module && g.module.label) || g.group)}</h3>
-        ${g.module ? `<p class="hint">${esc(g.module.purpose || "")}
-          <br>Tools (from the configured repo's workflow TOML):
-          <b>${esc((g.module.tools || []).join(", "))}</b>
-          <br><span class="psrc">${esc((g.module.tools_provenance || []).join("; "))}</span></p>` : ""}
-        ${g.items.map((p) => pitemHtml(p)).join("")}
-      </div>`).join("")}`;
-  $("cfg-exec").innerHTML = itemsOf("execution").map((p) => pitemHtml(p)).join("");
+  $("cfg-science").innerHTML = sciencePanelHtml(modules);
+  // M6 PART E: ids that live in the structured science panel must not
+  // also appear as free-text rows in the execution foldout (one control,
+  // one meaning).
+  const sciIds = new Set((state.params.science || []).map((c) => c.id));
+  $("cfg-exec").innerHTML = itemsOf("execution")
+    .filter((p) => !sciIds.has(p.id))
+    .map((p) => pitemHtml(p)).join("");
   const managed = itemsOf("managed");
   $("cfg-managed").innerHTML = managed.length
     ? "Managed automatically, never a form field: " +
@@ -620,12 +675,84 @@ function collectAdvanced() {
   document.querySelectorAll("[data-param]").forEach((el) => {
     if (el.type === "checkbox") {
       if (el.checked) cfg[el.dataset.param] = true;
+    } else if (el.type === "radio") {
+      // M6 PART E: the default radio carries value "" = "change nothing,
+      // native default stays"; only a ticked non-default option is sent.
+      if (el.checked && el.value !== "") cfg[el.dataset.param] = el.value;
     } else if (el.value !== "") {
       cfg[el.dataset.param] = el.value;
     }
   });
   state.requestedConfig = cfg;
   return cfg;
+}
+
+/* M6 PART E: the science panel renders ONLY the curated structured set
+   served by /api/params (radio / bounded number / checkbox - never free
+   text). Each row cites the deployed code and states what it changes;
+   leaving it untouched forwards nothing, so native defaults apply. */
+function sciencePanelHtml(modules) {
+  const sc = state.params || {};
+  const secs = sc.science_sections || {};
+  const ctrl = sc.science || [];
+  const mods = {};
+  (modules || []).forEach((g) => { if (g.module) mods[g.module.id] = g.module; });
+  if (!ctrl.length) {
+    return "<h3>Scientific configuration</h3><p class='hint'>science control " +
+      "inventory unavailable - showing nothing rather than guessing options</p>";
+  }
+  let html = `<h3>Scientific configuration</h3>
+    <p class="hint">Every control below was verified against the deployed NeoAG
+    code (cited per row) and is forwarded to native execution - the value
+    is also re-validated on the server, so nothing unparseable can reach a
+    run. Leaving a control at its default sends nothing: the native default
+    shown applies. Scientific decisions the code makes on its own are listed
+    below the controls instead of given fake knobs.</p>`;
+  Object.keys(secs).forEach((sid) => {
+    const items = ctrl.filter((c) => c.section === sid);
+    if (!items.length) return;
+    const mod = mods[sid];
+    html += `<div class="pgroup"><h3>${esc(secs[sid])}</h3>`;
+    if (mod) html += `<p class="hint">${esc(mod.purpose || "")}
+      <br>Tools (from the configured repo's workflow TOML):
+      <b>${esc((mod.tools || []).join(", "))}</b>
+      <br><span class="psrc">${esc((mod.tools_provenance || []).join("; "))}</span></p>`;
+    html += items.map((c) => scCtrlHtml(c)).join("") + "</div>";
+  });
+  const info = sc.science_info || [];
+  if (info.length) {
+    html += `<div class="pgroup"><h3>Decided by the deployed code - no knob offered</h3>
+      ${info.map((i) => `<div class="pitem">
+        <div><div class="pname">${esc(i.title)}</div></div><div></div>
+        <div class="pdesc">${esc(i.decided)}</div>
+        <div class="psrc">${esc(i.evidence)}</div></div>`).join("")}</div>`;
+  }
+  return html;
+}
+
+function scCtrlHtml(c) {
+  const id = esc(c.id);
+  let ctrl;
+  if (c.control === "radio") {
+    ctrl = `<div class="radios">
+      <label class="radio"><input type="radio" name="sci-${id}" data-param="${id}"
+        value="" checked><span>native default (${esc(String(c.native_default))})</span></label>
+      ${(c.options || []).map((o) => `<label class="radio">
+        <input type="radio" name="sci-${id}" data-param="${id}" value="${esc(o)}">
+        <span>${esc(o)}</span></label>`).join("")}</div>`;
+  } else if (c.control === "number") {
+    ctrl = `<input type="number" data-param="${id}" min="${c.min}" max="${c.max}"
+      step="${c.step || 1}" placeholder="native default: ${esc(String(c.native_default))}">`;
+  } else {
+    ctrl = `<label class="chk"><input type="checkbox" data-param="${id}">
+      enabled for this run</label>`;
+  }
+  return `<div class="pitem">
+    <div><div class="pname">${esc(c.label)} <code>--${esc(c.id.replace(/_/g, "-"))}</code></div>
+    <div class="pdef">native default: ${esc(String(c.native_default))}</div></div>
+    <div>${ctrl}</div>
+    <div class="pdesc">${esc(c.affects || "")}</div>
+    <div class="psrc">${esc(c.evidence || "")}</div></div>`;
 }
 
 /* manifest */
@@ -643,30 +770,47 @@ function renderManifest() {
   const m = state.manifest;
   const host = $("manifest-view");
   if (!m) { host.innerHTML = ""; return; }
+  const native = m.proposal.kind === "native";
   const rows = (m.proposal.inputs || []).map((i) => `
-    <tr><td><b>${esc(i.role)}</b></td><td><code>${esc(i.path)}</code></td>
+    <tr>${native ? `<td><input type="checkbox" class="man-use" data-path="${esc(i.path)}" checked
+      title="use this input in the run"></td>` : ""}
+    <td><b>${esc(i.role)}</b></td><td><code>${esc(i.path)}</code></td>
     <td>${esc(i.confidence)}</td><td>${esc(i.basis)}</td></tr>`).join("");
-  const amb = (m.proposal.ambiguous || []).map((x) => `<li>${esc(x)}</li>`).join("");
+  const amb = (m.proposal.ambiguous || []).map((x) =>
+    `<li><code>${esc(typeof x === "string" ? x : x.file)}</code>${typeof x === "object" ? " - " + esc(x.reason) : ""}</li>`).join("");
+  const inf = (m.proposal.informational || []).map((x) =>
+    `<li><code>${esc(x.file)}</code> - ${esc(x.role)}</li>`).join("");
   const mis = (m.proposal.missing || []).map((x) => `<li>${esc(x)}</li>`).join("");
+  const notes = (m.proposal.notes || []).map((x) => `<li>${esc(x)}</li>`).join("");
   host.innerHTML = `<div class="manifest-card">
-    <div class="mnote">${esc(m.proposal.note)}</div>
+    <div class="mnote">${esc(m.proposal.note)}${native ? ' &middot; <span class="pill accent">from a real directory scan</span>' : ""}</div>
     <div class="tablewrap"><table class="data">
-      <thead><tr><th>Role</th><th>Path</th><th>Confidence</th><th>Basis</th></tr></thead>
+      <thead><tr>${native ? "<th>Use</th>" : ""}<th>Role</th><th>Path</th><th>Confidence</th><th>Basis</th></tr></thead>
       <tbody>${rows}</tbody></table></div>
-    ${mis ? `<p class="hint">Missing: <ul>${mis}</ul></p>` : ""}
-    ${amb ? `<p class="hint">Ambiguous: <ul>${amb}</ul></p>` : ""}
+    ${native && m.status === "proposed" ? `<label class="lbl">Sample / case id for this run</label>
+      <input type="text" id="man-sample" value="${esc(m.proposal.sample_id || "")}">` : ""}
+    ${mis ? `<p class="hint">Blocking: <ul>${mis}</ul></p>` : ""}
+    ${amb ? `<p class="hint">Ambiguous (untick above or state in chat which one): <ul>${amb}</ul></p>` : ""}
+    ${inf ? `<p class="hint">Recorded, not forwarded: <ul>${inf}</ul></p>` : ""}
+    ${notes ? `<p class="hint">${notes}</p>` : ""}
     ${m.status === "proposed"
       ? `<div class="btnrow">
            <button class="btn primary sm" id="man-confirm">Confirm manifest</button>
-           <span class="hint">or correct it in chat before confirming</span>
+           <span class="hint">the confirmed manifest is the run's authoritative input - nothing will be asked again${native ? "; untick any input it should not use" : " (or correct it in chat first)"}</span>
          </div>`
-      : `<span class="pill ok">confirmed</span>`}
+      : `<span class="pill ${m.status === "linked" ? "accent" : "ok"}">${esc(m.status)}</span>`}
   </div>`;
   const cb = $("man-confirm");
   if (cb) cb.addEventListener("click", async () => {
+    const edits = native ? {
+      removed: [...document.querySelectorAll(".man-use:not(:checked)")]
+        .map((c) => c.dataset.path),
+      sample_id: ($("man-sample") || {}).value || m.proposal.sample_id || ""
+    } : {};
     try {
-      const m2 = await api("POST", `/api/manifests/${m.id}/confirm`, { edits: {} });
+      const m2 = await api("POST", `/api/manifests/${m.id}/confirm`, { edits });
       state.manifest = m2; renderManifest();
+      toast("manifest confirmed - it is now the authoritative input list");
     } catch (e) { toast("confirm failed: " + e.message, true); }
   });
 }
@@ -679,30 +823,40 @@ async function refreshManifests() {
 /* submit */
 $("nj-submit").addEventListener("click", async () => {
   if (nativeEngineSel() === "native") {
-    /* M5 PART 1: GUI path of the unified task system. Chat path posts to
-       the SAME endpoint - one Job ID either way. */
-    const profile = (document.querySelector(
-      'input[name="njnative"]:checked') || {}).value || "demo";
-    const native_params = { sample_id: $("nj-n-case").value || "NATIVE-1" };
-    if (profile === "gateway") {
-      if ($("nj-n-vcf").value.trim())
-        native_params.somatic_vcf = $("nj-n-vcf").value.trim();
-      const hla = $("nj-n-hla").value.split(",")
-        .map((x) => x.trim()).filter(Boolean);
-      if (hla.length) native_params.hla_alleles = hla;
-      /* Scientific overrides FORWARD to the native gateway only for the
-         keys its verified allowlist accepts (native.py _SCIENTIFIC_KEYS
-         mirrors the deployed gateway route spec) - no silently dropped
-         or invented options. */
+    /* M6 PART D1/D4: the GUI posts to the SAME unified /api/jobs
+       endpoint as the chat path - one Job ID either way. There is no
+       profile choice: a confirmed data-directory manifest IS the
+       request (backend derives every input from it), or the user
+       explicitly asks for the bundled synthetic demo. */
+    const body = { engine: "native" };
+    if ($("nj-n-demo").checked) {
+      body.synthetic_demo = true;
+      const sid = $("nj-n-case").value.trim();
+      if (sid) body.sample_id = sid;
+    } else {
+      const m = state.manifest;
+      if (!(m && m.status === "confirmed" && m.proposal
+            && m.proposal.kind === "native")) {
+        toast("first scan a data directory and confirm its manifest - " +
+              "the confirmed manifest is the run's input list (or tick " +
+              "the bundled synthetic demo)", true);
+        return;
+      }
+      body.manifest_id = m.id;
       const sci = collectAdvanced();
-      ["event_top_n", "candidate_top_n", "genome_build"].forEach((k) => {
-        if (sci[k] !== undefined && sci[k] !== "") native_params[k] = sci[k];
+      const fwd = {};
+      // M6 PART E: exactly the verified science controls (and the three
+      // long-standing rows); each is re-validated server-side.
+      ["event_top_n", "candidate_top_n", "genome_build",
+       "rna_quant_method", "automatic_tool_policy",
+       "skip_dna_sv", "skip_bam_matcher"].forEach((k) => {
+        if (sci[k] !== undefined && sci[k] !== "") fwd[k] = sci[k];
       });
+      if (Object.keys(fwd).length) body.native_params = fwd;
     }
+    body.stub = $("nj-n-stub").checked;
     try {
-      const res = await api("POST", "/api/jobs", { engine: "native",
-        native_profile: profile, sample_id: native_params.sample_id,
-        native_params, stub: $("nj-n-stub").checked });
+      const res = await api("POST", "/api/jobs", body);
       toast(`native job ${res.job_id} waiting for your approval ` +
         "(Tasks panel above)");
       await refreshJobs();
@@ -763,13 +917,7 @@ document.querySelectorAll('input[name="njengine"]').forEach((r) =>
     if (nat) loadNativeCap();
     applyDevMode();
   }));
-document.querySelectorAll('input[name="njnative"]').forEach((r) =>
-  r.addEventListener("change", () => {
-    $("native-gw-box").classList.toggle("hidden",
-      (document.querySelector(
-        'input[name="njnative"]:checked') || {}).value !== "gateway");
-    applyDevMode();
-  }));
+$("nj-n-demo").addEventListener("change", () => applyDevMode());
 /* Demo/Developer mode gate (Milestone 5 PART 2 concern D): demo-only
    controls are hidden until explicitly enabled, and stay off by
    default in every fresh session (choice persisted per browser). */
@@ -784,11 +932,9 @@ function applyDevMode() {
   $("dev-controls").classList.toggle("hidden", !on);
   if (!on) $("nj-fail").checked = false;
   const stubWrap = $("nj-stub-wrap");
-  const gw = (document.querySelector(
-    'input[name="njnative"]:checked') || {}).value === "gateway";
   const engNat = (document.querySelector(
     'input[name="njengine"]:checked') || {}).value === "native";
-  const showStub = on && gw && engNat;
+  const showStub = on && engNat && !$("nj-n-demo").checked;
   stubWrap.style.display = showStub ? "" : "none";
   if (!showStub) $("nj-n-stub").checked = false;
 }
@@ -820,18 +966,84 @@ function renderNativePlan(plan) {
 }
 $("nj-native-preview").addEventListener("click", async () => {
   const host = $("native-preview");
+  const m = state.manifest;
+  if (!($("nj-n-demo").checked) &&
+      !(m && m.status === "confirmed" && m.proposal
+        && m.proposal.kind === "native")) {
+    host.innerHTML = '<div class="mnote">scan a data directory and ' +
+      'confirm its manifest first - the preview plans exactly the ' +
+      'inputs you confirmed, nothing invented.</div>';
+    return;
+  }
   host.innerHTML = '<div class="hint">running the REAL NeoAG planner (read-only, executes nothing)... this can take a minute</div>';
-  const hla = $("nj-n-hla").value.split(",").map((x) => x.trim()).filter(Boolean);
-  const native_params = { sample_id: $("nj-n-case").value || "NATIVE-1" };
-  if ($("nj-n-vcf").value.trim()) native_params.somatic_vcf = $("nj-n-vcf").value.trim();
-  if (hla.length) native_params.hla_alleles = hla;
+  const body = { native_params: {} };
+  if (m && m.status === "confirmed" && m.proposal
+      && m.proposal.kind === "native") body.manifest_id = m.id;
   try {
-    const plan = await api("POST", "/api/jobs/native/preview", { native_params });
+    const plan = await api("POST", "/api/jobs/native/preview", body);
     renderNativePlan(plan);
   } catch (e) {
     host.innerHTML = `<div class="mnote warn">preview failed: ${esc(e.message)}</div>`;
   }
 });
+/* M6 D2: real input discovery -> manifest proposal (the user confirms;
+   the confirmed manifest is then the run's authoritative input) */
+$("nj-n-scan").addEventListener("click", async () => {
+  const data_dir = $("nj-n-dir").value.trim();
+  if (!data_dir.startsWith("/")) {
+    toast("give the absolute path of the data directory", true); return;
+  }
+  const host = $("native-discover");
+  host.innerHTML = '<div class="hint">scanning (file names only, read-only)...</div>';
+  try {
+    const d = await api("POST", "/api/native/discover", { data_dir });
+    state.discovery = d;
+    renderDiscovery(d);
+  } catch (e) {
+    host.innerHTML = `<div class="mnote warn">scan failed: ${esc(e.message)}</div>`;
+  }
+});
+function renderDiscovery(d) {
+  const host = $("native-discover");
+  if (!d || !d.exists) {
+    host.innerHTML = `<div class="mnote warn">${esc((d && d.error) || "directory not readable")}</div>`;
+    return;
+  }
+  const row = (i) => `<tr><td><b>${esc(i.role)}</b></td>` +
+    `<td><code>${esc(i.path)}</code></td><td>${esc(String(i.confidence))}</td></tr>`;
+  const amb = (d.ambiguous || []).map((a) =>
+    `<li><code>${esc(typeof a === "string" ? a : a.file)}</code>${typeof a === "object" ? " - " + esc(a.reason) : ""}</li>`).join("");
+  const inf = (d.informational || []).map((a) =>
+    `<li><code>${esc(a.file)}</code> - ${esc(a.role)} (kept for the record, not forwarded)</li>`).join("");
+  const mis = (d.missing || []).map((x) => `<li>${esc(x)}</li>`).join("");
+  const notes = (d.notes || []).map((x) => `<li>${esc(x)}</li>`).join("");
+  host.innerHTML = `<div class="manifest-card">
+    <div class="mnote">found ${(d.inputs || []).length} input(s) among
+      ${esc(String(d.n_files_seen))} file(s)${d.capped ? " (scan capped)" : ""}${d.sample_guess ? " &middot; sample guess: <b>" + esc(d.sample_guess) + "</b>" : ""}</div>
+    ${(d.inputs || []).length ? `<div class="tablewrap"><table class="data">
+      <thead><tr><th>Role</th><th>Path</th><th>Conf.</th></tr></thead>
+      <tbody>${d.inputs.map(row).join("")}</tbody></table></div>`
+      : '<p class="hint">no recognised inputs in this directory</p>'}
+    ${mis ? `<p class="hint">Blocking: <ul>${mis}</ul></p>` : ""}
+    ${amb ? `<p class="hint">Ambiguous names (confirm or move them): <ul>${amb}</ul></p>` : ""}
+    ${inf ? `<p class="hint">Recorded, not forwarded: <ul>${inf}</ul></p>` : ""}
+    ${notes ? `<p class="hint">${notes}</p>` : ""}
+    ${d.unclassified && d.unclassified.length ? `<p class="hint">${d.unclassified.length} other file(s) not recognised (listed in the record)</p>` : ""}
+    <div class="btnrow">
+      <button id="nj-n-topropose" class="btn primary sm">Propose manifest from scan</button>
+      <span class="hint">you confirm the manifest - then it is the run's input list</span>
+    </div></div>`;
+  const btn = $("nj-n-topropose");
+  if (btn) btn.addEventListener("click", async () => {
+    try {
+      const m = await api("POST", "/api/native/manifest", {
+        data_dir: d.data_dir,
+        sample_id: $("nj-n-case").value.trim() || d.sample_guess || "" });
+      state.manifest = m; renderManifest();
+      toast("manifest proposed from the real scan - review and confirm it");
+    } catch (e) { toast("manifest proposal failed: " + e.message, true); }
+  });
+}
 
 /* attention strip: anything blocked on a human click */
 function renderAttention() {
@@ -839,6 +1051,28 @@ function renderAttention() {
   const rows = [];
   for (const a of (state.boot.approvals || [])) {
     if (a.state !== "pending" || a.action === "gate_op") continue;
+    let info = {};
+    try { info = JSON.parse(a.detail || "{}"); } catch { /* plain note */ }
+    if (info.kind === "benchmark_consent") {
+      // M6 C: the consent card states the whole experiment - dataset
+      // and source, question, tools, download size, destination,
+      // compute, metrics, installation, production impact - and offers
+      // the four answers the user is entitled to give.
+      const fields = (info.fields || [])
+        .map((f) => `<b>${esc(f.label)}</b><span>${esc(f.value)}</span>`)
+        .join("");
+      rows.push(`<div class="at-col">
+        <span><b>Benchmark consent</b> - job ${esc(a.job_id)} (${esc(a.risk)} risk)</span>
+        <div class="at-fields">${fields}</div>
+        <span class="hint">${esc(info.note || "")}</span>
+        <span class="btnrow" style="margin:0">
+          <button class="btn primary sm" data-appr="${esc(a.id)}" data-dec="approve">Approve</button>
+          <button class="btn sm" data-appr="${esc(a.id)}" data-dec="limit_scope">Limit scope…</button>
+          <button class="btn sm" data-appr="${esc(a.id)}" data-dec="literature_only">Literature only</button>
+          <button class="btn danger sm" data-appr="${esc(a.id)}" data-dec="reject">Reject</button>
+        </span></div>`);
+      continue;
+    }
     rows.push(`<div class="at-row">
       <span><b>Execute approval</b> - job ${esc(a.job_id)} (${esc(a.risk)} risk)</span>
       <span class="btnrow" style="margin:0">
@@ -1269,25 +1503,31 @@ async function discoveryAction(btn) {
 }
 
 function reportHtmlLive(rep, rid) {
+  // M6 B: conclusion-first view mirroring the HTML export - assessment,
+  // module table, scientific comparison, actions; all technical detail
+  // behind collapsed <details>.
   const kv = (o) => `<div class="kv">${Object.entries(o || {}).map(([k, v]) =>
     `<div class="k">${esc(k)}</div><div>${esc(
       typeof v === "object" ? JSON.stringify(v) : v)}</div>`).join("")}</div>`;
   const ul = (xs) => `<ul>${(xs || []).map((x) =>
     `<li>${esc(typeof x === "object" ? JSON.stringify(x) : x)}</li>`).join("")}</ul>`;
-  const rows = (rep.comparison || []).map((c) => `
-    <tr><td><b>${esc(c.tool)}</b></td><td>${esc(c.target || "")}</td>
-    <td>${esc(c.artifact_class || "unclassified")}</td>
-    <td>${esc(c.verified_version || "Not verified")}</td>
-    <td>${esc(c.license || "Not verified")}</td>
-    <td>${esc(c.maintenance || "Not verified")}</td>
-    <td>${esc(c.benchmark_evidence || "")}</td>
-    <td class="hint">${esc(c.performance_summary || "")}</td>
-    <td>${esc(c.independently_validated || "")}</td>
-    <td class="hint">${esc(c.evidence_gaps || "")}</td></tr>`).join("");
-  const concl = Object.entries(rep.module_conclusions || {});
-  const tcards = (rep.task_comparisons || []).map((t) => {
+  const pill = (t, kind) => `<span class="pill ${kind || ""}">${esc(t)}</span>`;
+  const a = rep.assessment || {};
+  const ready = !!rep.decision_ready;
+  const mtRows = (rep.module_table || []).map((m) => `<tr>
+    <td><b>${esc(m.module)}</b></td>
+    <td>${esc(m["current NeoAG method"])}</td>
+    <td>${esc(m["best relevant alternative"])}</td>
+    <td class="hint">${esc(m.evidence)}</td>
+    <td>${esc(m.recommendation)}</td></tr>`).join("");
+  const scards = (rep.scientific_comparison || []).map((t) => {
     const firstAlt = (t.rows || [])[0];
-    const curName = ((t.current_tools || [])[0] || {}).name || "";
+    const bl = t.baseline || {};
+    const curName = (bl.tools || []).map((x) => x.name).join(", ") ||
+      bl.note || "NOT identified";
+    const dec = t.decision || {};
+    const dKind = dec.recommendation === "Retain current tool" ? "ok"
+      : ["Research incomplete", "Insufficient evidence"].includes(dec.recommendation) ? "danger" : "warn";
     const actions = firstAlt ? `
       <div class="btnrow">
         <button class="btn sm" data-dact="compat" data-rid="${esc(rid || "")}"
@@ -1295,136 +1535,115 @@ function reportHtmlLive(rep, rid) {
         <button class="btn sm" data-dact="plan" data-rid="${esc(rid || "")}"
           data-tid="${esc(t.target_id)}" data-tool="${esc(firstAlt.tool)}">Adoption plan</button>
         <button class="btn sm" data-dact="bench" data-tid="${esc(t.target_id)}"
-          data-tool="${esc(firstAlt.tool)}" data-base="${esc(curName)}">Propose benchmark</button>
-        <span class="hint">first alternative: ${esc(firstAlt.tool)} - checks
-        are read-only; a proposed benchmark is a FORMAL job that waits for
-        your approval before anything runs</span></div>
+          data-tool="${esc(firstAlt.tool)}" data-base="${esc((bl.tools || [])[0]?.name || "")}">Propose benchmark</button>
+        <span class="hint">read-only checks; a proposed benchmark is a
+        FORMAL job that waits for your approval before anything runs</span></div>
       <div id="dact-${esc(t.target_id)}"></div>` : "";
+    const groupLine = (label, names) => (names || []).length
+      ? `<div class="hint"><b>${esc(label)}:</b> ${esc((names || []).join(", "))}</div>` : "";
     return `
     <div class="card"><b>${esc(t.target)}</b>
-    <div class="hint">current: ${esc((t.current_tools || [])
-      .map((c) => `${c.name}${c.version && c.version !== "n/a" ? " [" + c.version + "]" : ""}`).join(", "))}</div>
-    ${(Object.entries(t.alternatives_by_kind || {}).map(([k, names]) =>
-      `<div class="hint">${esc(k)}: ${esc(names.join(", "))}</div>`)).join("")
-      || '<div class="hint">no registry-verified alternatives</div>'}
-    <div class="tablewrap"><table class="data">
-      <thead><tr><th>Alternative</th><th>Version</th><th>Published
-      performance (context-established only)</th><th>Licensing /
-      maintenance</th><th>Evidence quality</th></tr></thead>
+    ${t.question ? `<div class="mnote"><b>Question:</b> ${esc(t.question)}</div>` : ""}
+    <div class="hint"><b>Current NeoAG method:</b> ${esc(curName)}
+      ${bl.consensus ? pill("multi-tool consensus", "ok") : ""}</div>
+    ${(t.rows || []).length ? `<div class="tablewrap"><table class="data">
+      <thead><tr><th>Alternative (direct)</th><th>Version</th>
+      <th>Published performance (context-established)</th>
+      <th>License · maintenance</th></tr></thead>
       <tbody>${(t.rows || []).map((r) => `<tr>
-        <td>${esc(r.tool)} <span class="hint">(${esc(r.artifact_class)})</span></td>
+        <td><b>${esc(r.tool)}</b><div class="hint">${esc(r.why_comparable || "")}</div></td>
         <td>${esc(r.version)}</td>
-        <td>${esc(r.published_performance)}</td>
-        <td>${esc(r.license)} · ${esc(r.maintenance)}</td>
-        <td class="hint">${esc(r.evidence_quality)}</td></tr>`).join("")}</tbody>
-    </table></div>
+        <td>${esc(r.evidence)}</td>
+        <td>${esc(r.license)} · ${esc(r.maintenance)}</td></tr>`).join("")}</tbody>
+    </table></div>` : `<div class="hint">No retrieved candidate passed the
+      scientific relevance screen as a direct alternative for this
+      module.</div>`}
+    ${groupLine("Complementary methods", t.complementary)}
+    ${groupLine("Wrappers / integrations", t.wrappers_integrations)}
+    ${groupLine("Related but not comparable", t.related_not_comparable)}
+    ${(t.excluded_irrelevant || []).length ? `<div class="hint"><b>Screened out as irrelevant:</b> ${esc((t.excluded_irrelevant || []).slice(0, 6).join(", "))} - reasons in the appendix</div>` : ""}
+    ${dec.recommendation ? `<div>${pill(dec.recommendation, dKind)}
+      <span class="hint">${esc(dec.rationale || "")}</span></div>` : ""}
+    ${dec.action ? `<div class="mnote"><b>Action:</b> ${esc(dec.action)}</div>` : ""}
     <div class="hint">${esc(t.note || "")}</div>${actions}</div>`;
   }).join("");
-  const cits = (rep.literature_citations || []).slice(0, 30).map((c) => `
-    <li><b>${esc(c.title || "")}</b> ${esc(c.year || "")} - ${esc(c.source || "")}
-    ${c.url ? esc(c.url) : esc(c.id || "")}</li>`).join("");
-  const prov = rep.provenance || {};
   const cov = rep.coverage_accounting || {};
-  // 1. executive recommendations: conclusions FIRST, with the
-  //    critical evidence limitation (coverage + comparability) inline
-  const conclCards = concl.map(([tid, c]) => `
-    <div class="card"><b>${esc(tid)}</b> - ${esc(c.conclusion)}
-      <div class="hint">${esc(c.why)}</div>
-      ${c.explanation ? `<ul class="hint">
-        <li>evidence: ${esc(c.explanation.what_evidence_supports_it)}</li>
-        <li>expected advantage: ${esc(c.explanation.expected_advantage)}</li>
-        <li>directly comparable: ${esc(String(c.explanation.directly_comparable))} - ${esc(c.explanation.directly_comparable_note)}</li>
-        <li>usable here: ${esc(c.explanation.usable_in_current_deployment)}</li>
-        <li>remains to verify: ${(c.explanation.remains_to_verify || []).map(esc).join(" | ")}</li>
-      </ul>` : ""}
-      ${c.recommended_evaluation ? `<div class="mnote">evaluation to run:
-        ${esc(c.recommended_evaluation)}</div>` : ""}
-    </div>`).join("");
-  const covLine = Object.keys(cov).length ? `
-    <div class="hint">evidence coverage: ${esc(cov.researched_modules)}/${esc(cov.identified_modules)}
-      modules researched · ${esc((cov.sufficient_evidence || []).length)} with sufficient
-      evidence · ${esc((cov.insufficient_evidence || []).length)} thin ·
-      ${esc((cov.not_researched || []).length)} not researched ·
-      <b>${esc(cov.completeness || "?")}</b> - ${esc(cov.note || "")}
-      ${(cov.not_researched || []).length ? "<br>missing: " + esc((cov.not_researched || []).map((m) => m.id + " (" + m.reason + ")").join(", ")) : ""}
-    </div>` : "";
-  // 2. current tools and potential replacements
-  const toolsMap = (rep.task_comparisons || []).map((t) => `
-    <tr><td>${esc(t.target)}</td>
-    <td>${esc((t.current_tools || []).map((c) => `${c.name}${c.installed && c.installed !== "n/a" ? " · installed " + c.installed : ""}`).join(", "))}</td>
-    <td>${esc((Object.entries(t.alternatives_by_kind || {}).map(([k, n]) => `${k}: ${n.join(", ")}`).join(" · ")) || "none registry-verified")}</td></tr>`).join("");
-  const vfind = (rep.version_license_findings || []).map((v) => `
-    <tr><td>${esc(v.tool)}</td><td>${esc(v.target)}</td>
-    <td>${esc(v.version_verdict)}${v.is_development ? " <span class='hint pill warn'>DEVELOPMENT</span>" : ""}${v.unresolved_version ? " <span class='hint'>no chain step produced a version</span>" : ""}</td>
-    <td>${esc(v.license)}</td><td class="hint">${esc(v.compatibility)}</td></tr>`).join("");
+  const prov = rep.provenance || {};
+  const rows = (rep.comparison || []).map((c) => `
+    <tr><td><b>${esc(c.tool)}</b></td><td>${esc(c.target || "")}</td>
+    <td>${esc(c.eligibility || "")}</td>
+    <td>${esc(c.artifact_class || "unclassified")}</td>
+    <td>${esc(c.verified_version || "Not verified")}</td>
+    <td>${esc(c.license || "Not verified")}</td>
+    <td>${esc(c.maintenance || "Not verified")}</td>
+    <td class="hint">${esc(c.performance_summary || "")}</td></tr>`).join("");
+  const exRows = (rep.excluded_candidates || []).map((c) => `<tr>
+    <td><b>${esc(c.name)}</b></td><td>${esc(c.module || "")}</td>
+    <td>${esc(c.eligibility || "")}</td>
+    <td class="hint">${esc((c.reasons || []).join("; "))}</td>
+    <td class="hint">${esc((c.origin || "").slice(0, 90))}</td></tr>`).join("");
   return `<div class="card">
-    <div class="mnote">${esc(rep.disclaimer)}</div>
-    <h3 class="sec">Executive recommendations</h3>${ul(rep.executive_summary)}
-    ${conclCards}${covLine}
-    <h3 class="sec">Current NeoAG tools and potential replacements</h3>
-    <div class="tablewrap"><table class="data">
-      <thead><tr><th>Module</th><th>Current tool (installed)</th>
-      <th>Potential replacements (by kind)</th></tr></thead>
-      <tbody>${toolsMap}</tbody></table></div>
-    ${(rep.task_comparisons || []).length ? `<h3 class="sec">Evidence-based
-      comparison by scientific task (grouped by artifact kind; no
-      cross-task rows)</h3>${tcards}` : ""}
-    <h3 class="sec">Version, license and compatibility findings</h3>
-    <div class="tablewrap"><table class="data">
-      <thead><tr><th>Tool</th><th>Module</th><th>Version verdict
-      (chain)</th><th>License</th><th>Compatibility</th></tr></thead>
-      <tbody>${vfind}</tbody></table></div>
-    <h3 class="sec">Recommended Next Actions</h3>${ul(rep.recommended_next_actions)}
-    <h3 class="sec">Recommended benchmarks (never rank across
-      incomparable metrics)</h3>
-    ${ul((Object.entries(rep.recommended_benchmarks || {})
-      .map(([t, b]) => `${t}: ${(b.metrics || []).join("; ")}${
-        b.warning ? " - WARNING: " + b.warning : ""}`)))}
-    <h3 class="sec">Sources and citations (${(rep.literature_citations || []).length}, retrieved)</h3>
-    <ul>${cits || "<li>none retrieved</li>"}</ul>
-    <h3 class="sec">Detailed methodology</h3><p class="hint">${esc(rep.methodology || "")}</p>
-    <h3 class="sec">Limitations and incomplete evidence</h3>${ul(rep.limitations)}
-    <details class="adv"><summary>Full candidate comparison table
-      ("Not verified" = could not be confirmed - never guessed)</summary>
-      <div class="tablewrap"><table class="data">
-      <thead><tr><th>Tool</th><th>Target</th><th>Kind</th><th>Version
-      (chain verdict)</th><th>License</th>
-      <th>Maintenance</th><th>Benchmark evidence</th>
-      <th>Performance (context gate)</th>
-      <th>Independent validation</th><th>Evidence gaps</th></tr></thead>
-      <tbody>${rows}</tbody></table></div>
-    </details>
-    <details class="adv"><summary>Version verification chains (every
-      step: source, date, result - skipped steps keep their reason)</summary>
+    <div>${pill(ready ? "decision-ready review" : "PRELIMINARY RESEARCH",
+                ready ? "ok" : "warn")}</div>
+    <h3 class="sec">1. Executive assessment</h3>
+    <p class="mnote"><b>${esc(a.headline || "")}</b></p>
+    <div class="hint">${esc(a.scope || "")}</div>
+    ${(a.top_findings || []).length ? `<b>Most important findings</b>${ul(a.top_findings)}` : ""}
+    ${(a.evidence_gaps || []).length ? `<b>Evidence gaps</b>${ul(a.evidence_gaps)}` : ""}
+    ${a.next_action ? `<div class="mnote"><b>Next recommended action:</b> ${esc(a.next_action)}</div>` : ""}
+    <details class="adv"><summary>What this report is (and is not)</summary>
+      <div class="mnote">${esc(rep.disclaimer)}</div></details>
+    ${(rep.module_table || []).length ? `<h3 class="sec">2. Module-level
+      recommendations</h3><div class="tablewrap"><table class="data">
+      <thead><tr><th>Module</th><th>Current NeoAG method</th>
+      <th>Best relevant alternative</th><th>Evidence</th>
+      <th>Recommendation</th></tr></thead>
+      <tbody>${mtRows}</tbody></table></div>` : ""}
+    ${(rep.scientific_comparison || []).length ? `<h3 class="sec">3.
+      Scientific comparison</h3>${scards}` : ""}
+    ${(rep.recommended_next_actions || []).length ? `<h3 class="sec">4.
+      Recommended actions (scientific priority)</h3>${ul(rep.recommended_next_actions)}` : ""}
+    <details class="adv"><summary>5. Technical appendix (exclusions,
+      full candidates, version chains, evidence records, coverage,
+      gates, citations, provenance)</summary>
+      <b class="hint">Excluded candidates - every retrieval that failed
+      the scientific eligibility screen, with its reason</b>
+      <div class="tablewrap"><table class="data"><thead><tr><th>Name</th>
+      <th>Module</th><th>Class</th><th>Why excluded</th>
+      <th>Origin</th></tr></thead><tbody>${exRows ||
+        '<tr><td colspan="5" class="hint">none</td></tr>'}</tbody></table></div>
+      <b class="hint">Full candidate comparison table</b>
+      <div class="tablewrap"><table class="data"><thead><tr><th>Tool</th>
+      <th>Module</th><th>Eligibility</th><th>Kind</th><th>Version</th>
+      <th>License</th><th>Maintenance</th><th>Performance (context gate)</th>
+      </tr></thead><tbody>${rows}</tbody></table></div>
+      <b class="hint">Version verification chains</b>
       ${(rep.candidates || []).map((c) => `<div class="hint"><b>${esc(c.name)}</b>
         → ${esc(c.verified_version)} · installed: ${esc(c.installed_version || "n/a")}
         <ul>${((c.version_chain || {}).chain || []).map((s) =>
           `<li>${esc(s.step)}: ${esc(s.outcome)}${s.value ? " = " + esc(JSON.stringify(s.value)) : ""}${s.reason ? " (" + esc(s.reason) + ")" : ""} [${esc(String(s.checked_at || "").slice(0, 10))}]</li>`).join("")}</ul>
-        ${((c.version_chain || {}).values || {}).benchmark_versions ? `<div>versions cited by benchmarks: ${esc(((c.version_chain || {}).values || {}).benchmark_versions.map((b) => b.version).join(", "))}</div>` : ""}
       </div>`).join("")}
-    </details>
-    <details class="adv"><summary>Code-grounded inventory</summary>
-      ${kv({ repo: rep.inventory?.repo, git_commit: rep.inventory?.git_commit,
-        code_verified: rep.inventory?.code_verified,
-        stages: rep.inventory?.n_stages, captured_at: rep.inventory?.captured_at })}
-    </details>
-    <details class="adv"><summary>Licenses seen / full coverage
-      accounting / provenance (query log, counts, exclusions,
-      failures)</summary>
-      ${ul(rep.license_constraints)}
-      ${kv({ identified_modules: cov.identified_modules,
+      <b class="hint">Coverage accounting</b>
+      ${kv({ completeness: cov.completeness,
+        identified_modules: cov.identified_modules,
         researched_modules: cov.researched_modules,
         sufficient_evidence: cov.sufficient_evidence,
         insufficient_evidence: cov.insufficient_evidence,
-        not_researched: cov.not_researched, completeness: cov.completeness,
-        sources_consulted: prov.sources_consulted,
+        not_researched: cov.not_researched, note: cov.note })}
+      <b class="hint">Research quality gates</b>
+      <ul>${(rep.quality_gates || []).map((g) => `<li>${g.passed ? "PASS" : "FAIL"} ${esc(g.check)} - ${esc(g.detail)}</li>`).join("")}</ul>
+      <b class="hint">Sources and citations</b>
+      <ul>${(rep.literature_citations || []).slice(0, 40).map((c) => `
+        <li><b>${esc(c.title || "")}</b> ${esc(c.year || "")} -
+        ${esc(c.source || "")} ${esc(c.url || c.id || "")}</li>`).join("")}</ul>
+      <b class="hint">Methodology / limitations / provenance</b>
+      <p class="hint">${esc(rep.methodology || "")}</p>
+      ${ul(rep.limitations)}
+      ${kv({ sources_consulted: prov.sources_consulted,
         query_counts: prov.query_counts, dedup_removed: prov.dedup_removed,
-        exclusions: prov.exclusions, selection_criteria: prov.selection_criteria,
         github_budget: prov.github_budget_at_start,
         failures: prov.failures })}
       <p class="hint">queries persisted: ${(prov.queries || []).length}</p>
-      <ul>${(prov.queries || []).slice(0, 40).map((q) =>
-        `<li class="hint">${esc(JSON.stringify(q))}</li>`).join("")}</ul>
     </details>
   </div>`;
 }
@@ -1728,21 +1947,53 @@ function renderAgentBadge() {
     ? "Connected to the real server-side CodeBuddy agent: ordinary work executes directly; destructive or out-of-workspace operations are blocked until you approve a confirmation card. Click to switch back to the scripted demo agent."
     : "Scripted demo agent - no LLM. Click to connect the real server-side CodeBuddy agent.";
 }
-$("agent-mode").addEventListener("click", async () => {
-  const real = state.agentMode === "real";
-  const next = real ? "mock" : "real";
-  const ok = confirm(next === "real"
-    ? "Switch to the REAL CodeBuddy agent?\n\nYour chat messages go to the server-side CodeBuddy gateway. Ordinary reads, diagnostics and workspace work execute directly (logged, not prompted); destructive or out-of-workspace operations are blocked by the execution gate until you approve a confirmation card."
-    : "Switch back to the scripted demo agent?");
-  if (!ok) return;
-  try {
-    await api("POST", "/api/agent/mode", { mode: next });
-    state.agentMode = next;
-    renderAgentBadge();
-    toast(next === "real"
-      ? "real CodeBuddy agent connected - gated execution, card-based confirmations"
-      : "switched to the scripted demo agent");
-  } catch (e) { toast("mode switch failed: " + e.message, true); }
+/* M6 PART F5: a small in-page dropdown replaces the native confirm().
+   It states what each mode means BEFORE choosing, marks the current
+   one, and refuses (server-enforced, not just advisory) while a chat
+   turn or a job is in flight. */
+$("agent-mode").addEventListener("click", (ev) => {
+  ev.stopPropagation();
+  const open = document.querySelector(".mode-menu");
+  if (open) { open.remove(); return; }
+  const m = document.createElement("div");
+  m.className = "conv-menu mode-menu";
+  const cur = state.agentMode;
+  m.innerHTML = `
+    <button data-mode="mock"${cur === "mock" ? ' class="cur"' : ""}>
+      Demo agent (scripted)</button>
+    <button data-mode="real"${cur === "real" ? ' class="cur"' : ""}>
+      Real CodeBuddy agent</button>
+    <div class="mm-note">Real mode sends your chat to the server-side
+      CodeBuddy gateway: ordinary reads and workspace work execute
+      directly (logged); destructive or out-of-workspace operations
+      pause until you approve a confirmation card.</div>
+    <div class="mm-note">Switching is blocked while a chat turn or a
+      job is in flight.</div>`;
+  document.body.appendChild(m);
+  const r = $("agent-mode").getBoundingClientRect();
+  m.style.top = (r.bottom + 4) + "px";
+  m.style.left = Math.max(6, Math.min(r.left, window.innerWidth - 280)) + "px";
+  m.addEventListener("click", async (ev2) => {
+    const mode = (ev2.target.closest("[data-mode]") || {}).dataset
+      && ev2.target.closest("[data-mode]").dataset.mode;
+    if (!mode || mode === cur) { m.remove(); return; }
+    try {
+      await api("POST", "/api/agent/mode", { mode });
+      m.remove();
+      state.agentMode = mode;
+      renderAgentBadge();
+      toast(mode === "real"
+        ? "real CodeBuddy agent connected - gated execution, card-based confirmations"
+        : "switched to the scripted demo agent");
+    } catch (e) { m.remove(); toast("mode switch failed: " + e.message, true); }
+  });
+  setTimeout(() => document.addEventListener("click", function h(ev3) {
+    if (!ev3.target.closest(".mode-menu")
+        && !ev3.target.closest("#agent-mode")) {
+      m.remove();
+      document.removeEventListener("click", h);
+    }
+  }), 0);
 });
 
 /* ---------------- approvals + decisions ---------------- */
@@ -1750,8 +2001,18 @@ document.addEventListener("click", async (ev) => {
   const appr = ev.target.closest("[data-appr]");
   if (appr) {
     try {
-      await api("POST", `/api/approvals/${appr.dataset.appr}`,
-        { approve: appr.dataset.ok === "1" });
+      const dec = appr.dataset.dec;
+      const body = dec
+        ? { decision: dec }
+        : { approve: appr.dataset.ok === "1" };
+      if (dec === "limit_scope") {
+        const s = window.prompt(
+          "What scope will you allow? (e.g. 'subsample 5 of 200 " +
+          "samples; CPU only; no GPU')");
+        if (!s) return;           // user backed out - card stays pending
+        body.scope = s;
+      }
+      await api("POST", `/api/approvals/${appr.dataset.appr}`, body);
       await refreshJobs(); refreshConv();
     } catch (e) { toast("approval failed: " + e.message, true); }
     return;

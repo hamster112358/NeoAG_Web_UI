@@ -164,12 +164,25 @@ class Store:
                 "ALTER TABLE research ADD COLUMN cancel_requested "
                 "INTEGER DEFAULT 0",
                 "ALTER TABLE research ADD COLUMN progress_json TEXT",
+                # Milestone 6 PART F: conversation organisation (the
+                # sidebar menu offers Rename / Pin / Archive / Delete)
+                "ALTER TABLE conversations ADD COLUMN pinned "
+                "INTEGER DEFAULT 0",
+                "ALTER TABLE conversations ADD COLUMN archived "
+                "INTEGER DEFAULT 0",
             ):
                 try:
                     self.db.execute(stmt)
                 except sqlite3.OperationalError:
                     pass  # column already present
             self.db.commit()
+
+    def n_jobs_in_states(self, states: tuple) -> int:
+        q = ("SELECT COUNT(*) AS n FROM jobs WHERE state IN ("
+             + ",".join("?" * len(states)) + ")")
+        with self.lock:
+            row = self.db.execute(q, tuple(states)).fetchone()
+        return row["n"] if row else 0
 
     # ---------- audit ----------
     def audit(self, actor: str, action: str, obj: str, detail: dict | None = None) -> None:
@@ -312,9 +325,33 @@ class Store:
                 "SELECT c.*, (SELECT COUNT(*) FROM messages m "
                 " WHERE m.conv_id=c.id) AS n_messages "
                 "FROM conversations c WHERE c.deleted=0 "
-                "ORDER BY c.updated_at DESC, c.rowid DESC LIMIT ?",
+                "ORDER BY c.pinned DESC, c.updated_at DESC, c.rowid DESC "
+                "LIMIT ?",
                 (limit,)).fetchall()
+        # archived rows stay in the result (flagged) so the sidebar can
+        # offer an honest Unarchive instead of hiding them unrecoverably
         return [dict(r) for r in rows]
+
+    def conv_set_flags(self, cid: str, pinned: int | None = None,
+                       archived: int | None = None) -> dict | None:
+        fields, args = {}, []
+        if pinned is not None:
+            fields["pinned"] = 1 if pinned else 0
+            args.append(1 if pinned else 0)
+        if archived is not None:
+            fields["archived"] = 1 if archived else 0
+            args.append(1 if archived else 0)
+        if not fields:
+            return self.conv_get(cid)
+        args += [now(), cid]
+        with self.lock:
+            self.db.execute(
+                "UPDATE conversations SET "
+                + ", ".join(f"{k}=?" for k in fields)
+                + ", updated_at=? WHERE id=?",
+                args)
+            self.db.commit()
+        return self.conv_get(cid)
 
     def conv_touch(self, cid: str, job_state: str | None = None) -> None:
         with self.lock:

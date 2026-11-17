@@ -177,8 +177,11 @@ workspace to resize.
 ## Chats
 
 - **New chat** starts an empty conversation; its title is generated
-  from your first message and you can rename it any time (pencil /
-  double-click the title).
+  from your first message. The **⋯ menu** on each chat in the list
+  offers Rename, Pin to top, Archive and Delete.
+- **Archive** collapses a chat out of the main list into an
+  "Archived" group (undo it from the same menu). Deleting hides a
+  chat everywhere.
 - Chats are saved on the server and survive restarts. Reopening a chat
   restores the full transcript; if its live agent session is still
   alive the conversation continues in it, and if not, a fresh agent
@@ -214,6 +217,16 @@ is the SOTA Discovery live engine (real public-source retrieval, see
 its section) and, when switched on in Settings, the real CodeBuddy
 chat agent. The badge in the header (Demo mode) is the single
 indicator - it is never repeated inside the conversation.
+
+## Before you start (1-2 minutes)
+
+- **Know where your data are.** You only describe the folder; the
+  agent (or the read-only directory scan in Tasks) proposes an input
+  manifest and you confirm or correct it - no per-file hunting.
+- **Pick an execution mode.** **Controlled** pauses at each decision
+  point and asks you. **Autonomous** applies the validated defaults on
+  its own; every choice is recorded for review. Both need one human
+  approval before any execute-class run starts.
 
 ## Starting an analysis
 

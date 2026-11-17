@@ -128,15 +128,23 @@ if not _lit_ok:
           "live retrieval cannot be verified (not a code failure)")
     sys.exit(2)
 
-# ---------- 1 targeted Presentation Prediction run, LIVE ----------
+# ---------- 1 targeted run (presentation + hla_typing), LIVE --------
 st, sub = call("/api/research", {
-    "scope": "targeted", "engine": "live", "targets": ["presentation"]})
+    "scope": "targeted", "engine": "live",
+    "targets": ["presentation", "hla_typing"]})
 check("1 live targeted submission accepted", st == 202, str(sub)[:160])
 rid = sub.get("research_id", "")
 t0 = time.time()
 rep = {}
 status = ""
-while time.time() - t0 < 420:
+# Budget is generous BY DESIGN: the engine honours each endpoint's
+# rate-limit advice (M6 A8) instead of hammering it. Measured 2026-11-17:
+# with the host's shared unauthenticated GitHub budget saturated, each
+# GitHub search costs ~2 min of recorded retry waits and a 2-module
+# run finishes in 44 min; with a fresh budget the same run takes ~5.
+# A slow-but-honest run must PASS, so the poll waits for the terminal
+# status rather than pre-empting it.
+while time.time() - t0 < 3000:
     st, rr = call("/api/research/" + rid, timeout=20)
     status = rr.get("status", "")
     prog = rr.get("progress") or {}
@@ -209,10 +217,15 @@ check("12 code-grounded inventory from the configured repo (13 stages, commit)",
       (rep.get("inventory") or {}).get("n_stages") == 13 and
       str((rep.get("inventory") or {}).get("git_commit", "")).startswith("1cc4585"),
       str(rep.get("inventory", {}).get("git_commit")))
-check("13 task-specific metrics present, with not-rankable warnings kept",
-      bool(rep.get("recommended_benchmarks")) and
-      any("comparable" in json.dumps(v).lower() or "not" in json.dumps(v).lower()
-          for v in rep["recommended_benchmarks"].values()),
+_bench_mods = {tid for tid, m in (rep.get("module_conclusions") or {}).items()
+               if m.get("recommendation") == "Recommend independent benchmark"}
+check("13 B6: benchmark definitions exist ONLY for modules whose "
+      "decision proposes one (never for every module, never for "
+      "irrelevant tools), and carry not-rankable warnings",
+      set(rep.get("recommended_benchmarks") or {}) <= _bench_mods
+      and all(("comparable" in json.dumps(v).lower()
+               or "not " in json.dumps(v).lower())
+              for v in (rep.get("recommended_benchmarks") or {}).values()),
       str(rep.get("recommended_benchmarks"))[:160])
 cov = (prov.get("query_counts") or {})
 fails = prov.get("failures") or []
@@ -282,56 +295,136 @@ check("22 every chain step records outcome+date, the papers step always "
       "version)", _steps_ok and _papers_ok and _bv_ok)
 mc = rep.get("module_conclusions") or {}
 vocab = rep.get("conclusion_vocabulary") or []
-check("23 fixed-vocabulary conclusions exist for every researched target "
-      "and the winner phrase is not invented",
+check("23 six-category recommendation vocabulary; every researched "
+      "target gets a recommendation whose rationale is present, and no "
+      "'supported by comparative evidence' is claimed without "
+      "superiority rows",
       set(mc) == {t["id"] for t in (rep.get("targets") or [])}
       and len(vocab) == 6
-      and all(m["conclusion"] in vocab and m["why"] for m in mc.values())
-      and all(m["conclusion"] != "Candidate appears superior under "
-              "specified conditions" for m in mc.values()),
-      str({k: v["conclusion"] for k, v in mc.items()})[:200])
+      and all(m["recommendation"] in vocab and m.get("rationale")
+              and m.get("action") and m.get("evidence_facts")
+              for m in mc.values())
+      and all(not (m["recommendation"]
+                   == "Candidate supported by comparative evidence"
+                   and not m["evidence_facts"].get("superiority_rows"))
+              for m in mc.values()),
+      str({k: v["recommendation"] for k, v in mc.items()})[:200])
 tcs = rep.get("task_comparisons") or []
 _bad24 = [r["tool"] for t in tcs for r in t["rows"]
-          for e in [r] if not (r["published_performance"]
-                               and r["artifact_class"])]
-check("24 within-task comparison tables exist, group alternatives by "
-      "artifact kind, and every row states performance ONLY through the "
-      "context gate (never a bare uncontextualized number)",
+          if not (r.get("tool") and r.get("version") and r.get("evidence")
+                  and r.get("why_comparable"))]
+check("24 within-task blocks: baseline stated with real tools or an "
+      "explicit not-identified note; ONLY direct alternatives appear as "
+      "comparison rows; complementary/wrapper/related groups named "
+      "separately; excluded irrelevants never reach a row",
       len(tcs) == len(rep.get("targets") or []) and not _bad24
-      and all(("no value with established" in r["published_performance"])
-              or any(ch.isdigit() for ch in r["published_performance"])
-              for t in tcs for r in t["rows"])
-      and all(t["current_tools"] for t in tcs),
-      str([(t["target_id"], list(t["alternatives_by_kind"]))
-           for t in tcs])[:180])
+      and all(t.get("baseline") is not None
+              and ("identified" in t["baseline"]) for t in tcs)
+      and all(r["tool"] not in t.get("excluded_irrelevant", [])
+              for t in tcs for r in t["rows"]),
+      str([(t["target_id"], t["baseline"]["identified"],
+            [x["name"] for x in t["baseline"]["tools"]][:3],
+            len(t["rows"])) for t in tcs])[:220])
 check("25 provenance records the MEASURED GitHub budget (never assumed)",
       "github_budget_at_start" in (rep.get("provenance") or {}),
       str((rep.get("provenance") or {}).get("github_budget_at_start")))
 cov = rep.get("coverage_accounting") or {}
 mcv = list((rep.get("module_conclusions") or {}).values())
 check("26 coverage accounting enumerates EVERY inventory module with "
-      "reasons (targeted runs are honestly 'partial')",
+      "reasons; out-of-scope modules are labelled 'not part of this "
+      "run's scope' (a targeted run is complete FOR ITS SCOPE, never "
+      "'stopped early')",
       cov.get("identified_modules") == 13 and
-      cov.get("completeness") == "partial" and
+      cov.get("completeness") == "complete" and
       len(cov.get("not_researched") or []) ==
       13 - cov.get("researched_modules", 0) and
-      all(m.get("reason") for m in cov.get("not_researched") or []),
+      all("scope" in (m.get("reason") or "")
+          for m in cov.get("not_researched") or []),
       str({k: cov.get(k) for k in
            ("identified_modules", "researched_modules",
             "completeness")})[:160])
-check("27 every live conclusion carries the five-part explanation; the "
-      "report leads with decisions and carries Recommended Next Actions "
-      "instead of generic Open Questions",
-      mcv and all(set(m.get("explanation") or {}) == {
-          "what_evidence_supports_it", "expected_advantage",
-          "directly_comparable", "directly_comparable_note",
-          "usable_in_current_deployment", "remains_to_verify"}
-          for m in mcv)
-      and "open_questions" not in rep
+_a = rep.get("assessment") or {}
+check("27 M6 B1: report leads with a conclusion-first assessment "
+      "(headline/scope/findings/next_action), quality gates decide "
+      "preliminary vs decision-ready, actions are concrete",
+      _a.get("headline") and _a.get("scope") and "decision_ready" in _a
+      and isinstance(rep.get("quality_gates"), list)
+      and len(rep.get("quality_gates") or []) >= 8
       and isinstance(rep.get("recommended_next_actions"), list)
-      and bool(rep["recommended_next_actions"])
-      and str(rep["executive_summary"][0]).startswith("decisions:"),
-      str(rep["executive_summary"][0])[:120])
+      and "open_questions" not in rep,
+      str(_a.get("headline"))[:120])
+# ---- G1 negative fixture: the 2026-11-17 report as a regression ----
+_JUNK = ("clip-as-service", "Github-Ranking", "Historical-ranking",
+         "public-pentesting-reports", "hackerone-reports", "HttpReports")
+_in_rows = [n for t in tcs for r in t["rows"] for n in _JUNK
+            if n.lower() in (r.get("tool") or "").lower()]
+_in_best = [n for m in (rep.get("module_table") or []) for n in _JUNK
+            if n.lower() in str(m.get("best relevant alternative", "")).lower()]
+check("28 G1: none of the 2026-11-17 irrelevant repositories appear in "
+      "comparison rows or as a 'best relevant alternative' (they may "
+      "only appear in the appendix exclusions, with a reason)",
+      not _in_rows and not _in_best,
+      f"rows={_in_rows} best={_in_best}")
+check("29 G1: exclusions are provenanced - every excluded candidate "
+      "carries eligibility class + reason + origin",
+      all(c.get("eligibility") and c.get("reasons") and c.get("origin")
+          for c in rep.get("excluded_candidates") or []),
+      f"{len(rep.get('excluded_candidates') or [])} excluded rows")
+check("30 G1: the baseline is stated from real implementation evidence "
+      "(file-level provenance), never 'no tool name in the TOML'",
+      all(t["baseline"]["identified"] for t in tcs)
+      and all(any("/" in ev or ev.endswith(".toml") or "[stages" in ev
+                  or "[run]" in ev or ":" in ev
+                  for x in t["baseline"]["tools"]
+                  for ev in [x["evidence"]])
+              for t in tcs if t["baseline"]["tools"]),
+      str([[x["evidence"][:60] for x in t["baseline"]["tools"]][:1]
+           for t in tcs])[:220])
+# offline, deterministic screening regression (no network):
+_sys_path = sys.path.insert(0, str(ROOT))
+from backend import science as _sci  # noqa: E402
+_NEG = [
+    ("jina-ai/clip-as-service", "ranking",
+     "multimodal AI embedding service contrastive language-image"),
+    ("EvanLi/Github-Ranking", "ranking",
+     "list of the Github repositories with the most stars"),
+    ("juliocesarfort/public-pentesting-reports", "reports",
+     "list of public penetration testing reports consulting firms"),
+    ("reddelexc/hackerone-reports", "reports",
+     "top disclosed vulnerability reports HackerOne bug bounty"),
+    ("dotnetcore/HttpReports", "custom:x",
+     "netcore distributed tracking monitoring logging for http requests"),
+    ("Jannchie/Historical-ranking-data-visualization", "ranking",
+     "historical ranking data visualization based on d3.js"),
+]
+_BAD_SCI = [(n, _sci.screen_candidate(
+    n, d, profile=_sci.profile_for(m, m))["eligibility"])
+    for n, m, d in _NEG
+    if _sci.screen_candidate(
+        n, d, profile=_sci.profile_for(m, m))["eligibility"]
+    != "irrelevant"]
+check("31 G1: the general eligibility screen classifies every "
+      "2026-11-17 irrelevant repository as irrelevant (no name "
+      "blacklists - domain/vocabulary rules only)", not _BAD_SCI,
+      str(_BAD_SCI)[:200])
+# Blurbs as real registries actually state them (a method claim is
+# part of a registry summary): the screen promotes on a positive
+# software/method signal, not on biology-flavoured wording alone.
+_POS_SCI = [
+    ("arcasHLA", "hla_typing",
+     "arcasHLA: high resolution quantification and genotyping of HLA "
+     "genes from RNA-seq data"),
+    ("NetMHCpan-4.1", "presentation",
+     "peptide-MHC class I binding prediction trained on eluted ligand "
+     "and mass spectrometry data"),
+]
+_BAD_POS = [n for n, m, d in _POS_SCI
+            if _sci.screen_candidate(
+                n, d, profile=_sci.profile_for(m, m))["eligibility"]
+            != "direct alternative"]
+check("32 G1 boundary: genuine HLA typing / presentation methods pass "
+      "as direct alternatives (the screen is not an over-rejection)",
+      not _BAD_POS, str(_BAD_POS)[:150])
 
 # ---------- 28 persisted downloadable exports for the LIVE report -------
 def _get_bytes(path):
@@ -350,19 +443,48 @@ _sj2, _, _bj2 = _get_bytes(f"/api/research/{rid}/export/json")
 _sx2, _, _bx2 = _get_bytes(f"/api/research/{rid}/export/tsv")
 _sp2, _, _bp2 = _get_bytes(f"/api/research/{rid}/export/pdf")
 _livej = json.loads(_bj2 or b"{}")
-check("28 the live report exports (standalone HTML/JSON/TSV/PDF) persist "
+check("33 the live report exports (standalone HTML/JSON/TSV/PDF) persist "
       "pinned bytes: re-download is byte-identical with no retrieval "
-      "re-run, and carries the decision-first sections + provenance",
+      "re-run; the HTML is the conclusion-first layout with a collapsed "
+      "technical appendix",
       _se1 == 200 and _se1b == 200 and _be1 == _be1b
       and _he1.get("X-Export-Sha256") == _he1b.get("X-Export-Sha256")
-      and b"Per-module conclusions" in _be1
+      and b"1. Executive assessment" in _be1
+      and b"2. Module-level recommendations" in _be1
+      and b"5. Technical appendix" in _be1
+      and b"<details" in _be1 and b"prefers-color-scheme" in _be1
       and _sj2 == 200 and _livej.get("module_conclusions")
       and (_livej.get("provenance") or {}).get("sources_consulted")
       and _livej["export"]["report_id"] == rid
-      and _sx2 == 200 and b"# ===== section: module_conclusions" in _bx2
+      and _sx2 == 200 and b"# ===== section: assessment" in _bx2
+      and b"# ===== section: excluded_candidates" in _bx2
       and _sp2 == 200 and _bp2.startswith(b"%PDF-1.")
       and _bp2.rstrip().endswith(b"%%EOF"),
       f"h{_se1} j{_sj2} x{_sx2} p{_sp2}")
+
+# ---------- 34 recorded outcomes never demote (M6 A8) ----------
+# A definite "not on PyPI/bioconda" answer is a recorded outcome of the
+# version check, not a failed retrieval: it must carry the provenance
+# tag and must never demote a completed module to 'Research
+# incomplete' (2026-11-17 live run mislabelled two fully-gated modules
+# over 32 such answers).
+_absent = [q for q in qs if q.get("error")
+           and "not-on-" in str(q.get("error"))]
+_hard_t = {q.get("target") for q in qs
+           if q.get("error") and q.get("target")
+           and not q.get("recorded_outcome")
+           and "not-on-" not in str(q.get("error"))
+           and "rate limit" not in str(q.get("error")).lower()}
+_bad34 = [t for t, m in (rep.get("module_conclusions") or {}).items()
+          if m.get("recommendation") == "Research incomplete"
+          and t not in _hard_t]
+check("34 M6 A8: definite registry-absence answers are tagged recorded "
+      "outcomes in provenance, and no module is demoted to 'Research "
+      "incomplete' without a GENUINE hard retrieval failure on its "
+      "target",
+      all(q.get("recorded_outcome") for q in _absent) and not _bad34,
+      f"{len(_absent)} recorded-absence rows; unjustified demotions="
+      f"{_bad34}")
 
 print()
 print(f"DISCOVERY E2E: {len(PASS)} passed, {len(FAIL)} failed")

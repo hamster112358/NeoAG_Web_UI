@@ -29,7 +29,9 @@ from .inventory import load_inventory, targets_for_ui
 from .jobs import JobManager, DECISION_POINTS as RUN_DECISION_POINTS
 from .mock_data import SAMPLES, STAGES, DEMO_DATASET_VERSION
 from .neoag_params import (PARAM_GROUPS, STAGE_GRAPH, DECISION_POINTS,
-                           HUMAN_REQUIRED, params_view)
+                           HUMAN_REQUIRED, params_view,
+                           SCIENCE_CONTROLS, SCIENCE_INFO,
+                           SCIENCE_SECTIONS)
 from .policies import POLICIES, POLICY_VERSION
 from .research import (TARGETS as EXAMPLE_TARGETS, submit_research,
                        resume_research, sweep_interrupted_research,
@@ -451,6 +453,13 @@ class Handler(BaseHTTPRequestHandler):
                                    "stage_graph": STAGE_GRAPH,
                                    "decision_points": DECISION_POINTS,
                                    "human_required": HUMAN_REQUIRED,
+                                   # M6 PART E: the curated structured
+                                   # science panel (every control verified
+                                   # to change native execution) + the
+                                   # code-decided list with citations.
+                                   "science": SCIENCE_CONTROLS,
+                                   "science_info": SCIENCE_INFO,
+                                   "science_sections": SCIENCE_SECTIONS,
                                    "inventory_captured_at":
                                        inv["captured_at"]})
         if path == "/api/audit":
@@ -616,6 +625,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, r)
         if path.startswith("/api/jobs/"):
             jid = path.strip("/").split("/")[2]  # api/jobs/<id>[/events]
+            if not store.job_get(jid):
+                # unknown job id -> honest 404, never an empty 200 list
+                # (this masked GET route misses in earlier smoke tests)
+                return self._json(404, {"error": "no such job"})
             after = int((q.get("after") or ["0"])[0])
             return self._json(200, store.event_list(jid, after, 1000))
         if path.startswith("/api/results/"):
@@ -739,6 +752,23 @@ class Handler(BaseHTTPRequestHandler):
                     store.audit("user", "conv.delete", cid, {"soft": True})
                     publish({"type": "conversations"})
                     return self._json(200, {"ok": ok, "deleted": cid})
+                if act == "flag":
+                    # M6 PART F4: sidebar menu Rename/Pin/Archive. Only
+                    # these two booleans move here; title changes keep
+                    # their own audited rename endpoint.
+                    body2 = {}
+                    for k in ("pinned", "archived"):
+                        if k in body:
+                            if body[k] not in (True, False, 0, 1):
+                                return self._json(400, {
+                                    "error": f"{k} must be a boolean"})
+                            body2[k] = 1 if body[k] else 0
+                    if not body2:
+                        return self._json(400, {"error": "no flags given"})
+                    conv2 = store.conv_set_flags(cid, **body2)
+                    store.audit("user", "conv.flag", cid, body2)
+                    publish({"type": "conversations"})
+                    return self._json(200, {"conversation": conv2})
                 if act == "example":
                     msgs = agent.load_example(cid)
                     if not (conv.get("title") or "").strip():
@@ -753,6 +783,19 @@ class Handler(BaseHTTPRequestHandler):
                 mode = str(body.get("mode", ""))
                 if mode not in ("mock", "real"):
                     return self._json(400, {"error": "mode must be mock|real"})
+                # M6 PART F5: active operations are protected at the
+                # BACKEND (a dropdown is UX; this is the guarantee): no
+                # mode switch while a chat turn or an analysis job is
+                # in flight, whatever UI asked for it.
+                if mode != store.setting("agent_mode", "mock"):
+                    act = agent.active_work()
+                    if act["busy_chats"] or act["running_jobs"]:
+                        return self._json(409, {
+                            "error": "an operation is in flight ("
+                                     + f"{act['busy_chats']} chat turn(s), "
+                                     + f"{act['running_jobs']} running "
+                                       "job(s)) - wait for it to finish "
+                                     + "or cancel it, then switch"})
                 store.setting_set("agent_mode", mode)
                 store.audit("user", "agent.mode.set", mode, {})
                 publish({"type": "agent_mode", "mode": mode})
@@ -784,17 +827,56 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, m2)
             if path == "/api/jobs":
                 if str(body.get("engine", "mock")) == "native":
-                    profile = str(body.get("native_profile", "demo"))
+                    # M6 PART D1/D2: the ordinary entry is ONE flow -
+                    # data directory -> discovery -> confirmed manifest
+                    # -> this call with manifest_id. The CONFIRMED
+                    # manifest is authoritative: hand-typed params
+                    # cannot override it. `native_profile` remains only
+                    # as the agent/taskquery compatibility path; the UI
+                    # never sends it, and `synthetic_demo: true` is the
+                    # explicit bundled-fixture request.
+                    profile = str(body.get("native_profile", "") or "")
                     nparams = body.get("native_params") or {}
                     if not isinstance(nparams, dict):
                         return self._json(400, {"error": "native_params must "
                                                          "be an object"})
+                    mid = str(body.get("manifest_id") or "")
+                    if mid:
+                        man = store.manifest_get(mid)
+                        if not man:
+                            return self._json(400, {"error":
+                                                    "no such manifest"})
+                        if man.get("status") != "confirmed":
+                            return self._json(409, {
+                                "error": "the manifest is the "
+                                         "authoritative input - confirm "
+                                         "it before submitting"})
+                        nparams = {**nparams,
+                                   **native_mod.params_from_manifest(man)}
+                    if body.get("synthetic_demo"):
+                        profile = "demo"
+                    if not profile:
+                        profile = "gateway" if nparams else "demo"
                     sid = str(nparams.get("sample_id")
-                              or body.get("sample_id") or "")
+                              or body.get("sample_id")
+                              or ("DEMO-NEOAG" if profile == "demo"
+                                  else ""))
                     if not sid:
-                        return self._json(400, {"error": "native jobs need "
-                                                         "sample_id"})
+                        return self._json(400, {
+                            "error": "native jobs need inputs: confirm a "
+                                     "data-directory manifest, pass "
+                                     "native_params, or ask for the "
+                                     "bundled synthetic demo"})
                     nparams.setdefault("sample_id", sid)
+                    # M6 PART E: scientific overrides are validated HERE,
+                    # not by trusting the form - a value outside the
+                    # deployed code's real options/ranges never reaches a
+                    # run, whatever origin (GUI, chat, taskquery) posted it.
+                    bad = native_mod.validate_scientific(nparams)
+                    if bad:
+                        return self._json(400, {
+                            "error": "unvalidated scientific configuration: "
+                                     + "; ".join(bad)})
                     try:
                         res = jobs.submit_native(
                             sid, profile=profile, native_params=nparams,
@@ -804,6 +886,11 @@ class Handler(BaseHTTPRequestHandler):
                             conv_id=str(body.get("conv_id", "") or ""))
                     except ValueError as e:
                         return self._json(400, {"error": str(e)})
+                    if mid:
+                        store.manifest_set(mid, "linked", job_id=res[
+                            "job_id"])
+                        store.audit("user", "manifest.linked", mid,
+                                    {"job": res["job_id"]})
                     if scoped:
                         store.audit("agent", "job.create.scoped_token",
                                     res.get("job_id", ""),
@@ -858,6 +945,55 @@ class Handler(BaseHTTPRequestHandler):
                                 {"engine": "mock", "kind": kind,
                                  "sample_id": body.get("sample_id", "")})
                 return self._json(202, res)
+            if path == "/api/native/discover":
+                # M6 D2: user names ONE data directory; this is the real
+                # read-only input discovery (file names only - contents
+                # are never read). Nothing is written anywhere except
+                # the audit row.
+                ddir = str(body.get("data_dir") or "").strip()
+                if not ddir or not os.path.isabs(ddir):
+                    return self._json(400, {"error": "data_dir must be an "
+                                                     "absolute path"})
+                disc = native_mod.discover_inputs(ddir)
+                store.audit("user", "native.discover", "",
+                            {"data_dir": ddir,
+                             "found": len(disc.get("inputs") or []),
+                             "ambiguous": len(disc.get("ambiguous") or [])})
+                return self._json(200, disc)
+            if path == "/api/native/manifest":
+                # discovery result -> proposed manifest for the human to
+                # confirm; the confirmed manifest becomes the run's
+                # authoritative input list
+                ddir = str(body.get("data_dir") or "").strip()
+                if not ddir or not os.path.isabs(ddir):
+                    return self._json(400, {"error": "data_dir must be an "
+                                                     "absolute path"})
+                disc = native_mod.discover_inputs(ddir)
+                if not disc.get("exists"):
+                    return self._json(400, {"error": disc.get(
+                        "error", "directory not readable")})
+                proposal = {
+                    "kind": "native", "mock": False,
+                    "note": ("derived from a real read-only scan of "
+                             f"{ddir} - file contents were never read"),
+                    "source_description": str(
+                        body.get("description") or f"data directory {ddir}")[:400],
+                    "sample_id": str(body.get("sample_id")
+                                     or disc.get("sample_guess") or ""),
+                    "data_dir": ddir,
+                    "inputs": disc.get("inputs") or [],
+                    "missing": disc.get("missing") or [],
+                    "ambiguous": disc.get("ambiguous") or [],
+                    "informational": disc.get("informational") or [],
+                    "notes": disc.get("notes") or []}
+                mid = new_id("man")
+                m = store.manifest_add(mid, proposal[
+                    "source_description"], proposal)
+                store.audit("user", "manifest.propose.native", mid,
+                            {"data_dir": ddir,
+                             "inputs": len(proposal["inputs"])})
+                publish({"type": "manifest", "id": mid})
+                return self._json(201, m)
             if path == "/api/jobs/native/preview":
                 # Real native planning/preflight WITHOUT executing: the
                 # planner decides routes; we only display them. Read-only
@@ -866,6 +1002,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(nparams, dict):
                     return self._json(400, {"error": "native_params must be "
                                                      "an object"})
+                if body.get("manifest_id"):
+                    man = store.manifest_get(str(body["manifest_id"]))
+                    if not man:
+                        return self._json(400, {"error": "no such manifest"})
+                    nparams = {**nparams,
+                               **native_mod.params_from_manifest(man)}
                 sid = str(nparams.get("sample_id")
                           or nparams.get("case_id") or "")
                 if not sid:
@@ -873,6 +1015,11 @@ class Handler(BaseHTTPRequestHandler):
                                                      "required"})
                 nparams.setdefault("sample_id", sid)
                 nparams.setdefault("case_id", sid)
+                bad = native_mod.validate_scientific(nparams)
+                if bad:
+                    return self._json(400, {
+                        "error": "unvalidated scientific configuration: "
+                                 + "; ".join(bad)})
                 if not native_mod.probe()["available"]:
                     return self._json(200, {
                         "ok": False, "status": "NATIVE_UNAVAILABLE",
@@ -907,21 +1054,43 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, res)
             if path.startswith("/api/approvals/"):
                 aid = path.split("/")[3]
-                approve = bool(body.get("approve"))
+                # M6 PART C: consent cards may be answered four ways -
+                # approve / reject / limit_scope / literature_only.
+                # `decision` is the canonical field; the older
+                # {approve: bool} body stays accepted for compatibility.
+                decision = str(body.get("decision") or "").strip()
+                legacy = body.get("approve")
+                if decision in ("", "true", "false"):
+                    decision = "approve" if legacy else "reject"
+                if decision not in ("approve", "reject", "limit_scope",
+                                    "literature_only"):
+                    return self._json(400, {
+                        "error": "decision must be approve, reject, "
+                                 "limit_scope or literature_only"})
+                if decision == "limit_scope" and not str(
+                        body.get("scope") or "").strip():
+                    return self._json(400, {
+                        "error": "limit_scope requires a 'scope' note "
+                                 "saying what the user will allow"})
+                approve = decision == "approve"
+                scope_note = str(body.get("scope") or "").strip()
                 appr = store.approval_decide(aid, approve, "user")
                 if not appr:
                     return self._json(409, {"error": "approval not pending"})
-                store.audit("user", f"approval.{appr['state']}", aid,
+                store.audit("user", f"approval.{decision}", aid,
                             {"job": appr["job_id"],
-                             "action": appr["action"]})
+                             "action": appr["action"],
+                             "scope": scope_note[:300]})
                 if appr["action"] == "gate_op":
                     # real-agent destructive-op confirmation card: write
                     # the single-use grant and wake the agent session
-                    agent.on_gate_decision(appr, approve)
+                    agent.on_gate_decision(appr, approve, decision,
+                                           scope_note)
                 else:
-                    jobs.on_approval_decided(aid, approve)
+                    jobs.on_approval_decided(aid, approve, decision,
+                                             scope_note)
                 publish({"type": "approval", "id": aid})
-                return self._json(200, appr)
+                return self._json(200, {**appr, "decision": decision})
             if path == "/api/admin/archive":
                 # reversible cleanup of developer/demo records (see store)
                 res = store.archive_and_purge()

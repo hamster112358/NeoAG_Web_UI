@@ -88,7 +88,27 @@ usage:
                                   "native_params": {"sample_id": "...",
                                     "somatic_vcf": "...",
                                     "hla_alleles": ["A*02:01"]}} - real
-                                 native plan + execute via the gateway.
+                                 native plan + execute via the gateway;
+                                 {"kind": "benchmark", "benchmark": {
+                                   "hypothesis": "...",
+                                   "tools": {"candidate": "...",
+                                             "baseline": "..."},
+                                   "metrics": ["..."],
+                                   "compute_estimate": "...",
+                                   "software_installation": "none - ...",
+                                   "modifies_neoag_installation": false,
+                                   "dataset": {"source": "demo_fixture",
+                                     "download_size": "0 B (...)",
+                                     "destination": "..."}
+                                   }} - independent benchmark consent
+                                 request; EVERY field above is mandatory
+                                 (external datasets also need
+                                 dataset.id + consent_approval_id from an
+                                 approved dataset consent card); the
+                                 backend rejects incomplete briefs at
+                                 submit and the job blocks until the
+                                 user answers the card (approve / reject
+                                 / limit scope / literature only).
   taskquery.py job status <id>   state/outcome of one registered job
   taskquery.py job events <id>   the job's event log
 """
@@ -256,6 +276,16 @@ class DemoAgent:
                          {"job": job_id, **out})
         return out
 
+    def active_work(self) -> dict:
+        """M6 PART F5: what is genuinely in flight right now. An
+        agent-mode switch consults this so it can never yank the engine
+        out from under a running turn or a running job."""
+        with self._lock:
+            busy = sum(1 for st in self._conv.values() if st.get("busy"))
+        return {"busy_chats": busy,
+                "running_jobs": self.store.n_jobs_in_states(
+                    ("running", "paused"))}
+
     @staticmethod
     def title_from(text: str) -> str:
         line = re.sub(r"\s+", " ", (text or "").strip())
@@ -281,7 +311,11 @@ class DemoAgent:
         "produced, query the authoritative records via "
         "`python3 .neoag/taskquery.py` (never from chat memory); if "
         "several tasks could match 'the run I just did', ask ONE "
-        "focused clarifying question naming the candidates. The "
+        "focused clarifying question naming the candidates. When "
+        "something fails for an already-clear reason (missing file "
+        "or tool, absent license, recorded gate denial), answer "
+        "briefly with the reason and the next step instead of "
+        "starting open-ended tool exploration. The "
         "user's message follows.\n\n")
 
     def handle_real(self, text: str, conv_id: str) -> list[dict]:
@@ -625,10 +659,16 @@ class DemoAgent:
                          {"op": op, "conv": conv_id})
         publish({"type": "approval", "id": aid})
 
-    def on_gate_decision(self, appr: dict, approve: bool) -> None:
+    def on_gate_decision(self, appr: dict, approve: bool,
+                         decision: str = "", scope_note: str = "") -> None:
         """Human resolved a confirmation card. Approve => write the
         single-use grant (the hook consumes it on an identical retry)
-        and tell the agent; deny => tell it to stand down."""
+        and tell the agent; deny => tell it to stand down.
+        M6 PART C: limit_scope / literature_only arrive as refusals of
+        the request AS PROPOSED - no grant is written; the agent gets
+        the user's actual answer verbatim so it re-asks within the
+        allowed scope or switches to a literature-only assessment."""
+        decision = decision or ("approve" if approve else "reject")
         from .server import publish
         info = json.loads(appr.get("detail") or "{}")
         conv_id, op = info.get("conv_id", ""), info.get("op", "")
@@ -701,9 +741,20 @@ class DemoAgent:
                     "now - the approval unlocks it exactly once - then "
                     "report the outcome."
                     if approve else
-                    "The user DECLINED the operation on the confirmation "
-                    "card. Do not retry it; briefly explain the safest "
-                    "alternative.")
+                    ("The user LIMITS THE SCOPE of this request: "
+                     + (scope_note[:300] or "(no detail given)")
+                     + ". Do NOT retry the original command. Redo the "
+                       "request within the allowed scope only, and ask "
+                       "again on a fresh card."
+                     if decision == "limit_scope" else
+                     "The user requested a LITERATURE-ONLY assessment. "
+                     "Do not download data and do not run any tool for "
+                     "this question; deliver the comparison from the "
+                     "retrieved literature and state its limits."
+                     if decision == "literature_only" else
+                     "The user DECLINED the operation on the confirmation "
+                     "card. Do not retry it; briefly explain the safest "
+                     "alternative."))
                 r = client.reply(job_id, msg)
                 if not r.get("delivered"):
                     raise RuntimeError(str(r)[:160])

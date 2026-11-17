@@ -25,21 +25,18 @@ import threading
 import time
 from collections import Counter
 
-from . import evidence, inventory, mock_data, sources, versions
+from . import evidence, inventory, mock_data, science, sources, versions
 from .store import Store, new_id, now
 from .mock_data import DEMO_DATASET_VERSION
 
-LIVE_ENGINE_VERSION = "live-retrieval-2026.11-r2"
+LIVE_ENGINE_VERSION = "live-retrieval-2026.11-m6-r1"
 
-# 4.5: the ONLY conclusions a module may receive (fixed vocabulary).
-CONCLUSION_VOCABULARY = [
-    "Retain current method",
-    "Consider candidate alternative",
-    "Recommend independent benchmark",
-    "Candidate appears superior under specified conditions",
-    "Evidence insufficient to recommend replacement",
-    "Not applicable to NeoAG's actual workflow",
-]
+# M6 A9: the ONLY recommendations a module may receive (fixed
+# vocabulary, see backend/science.recommend for the evidence rules that
+# license each category). The old M5 vocabulary is retired because it
+# allowed "Consider candidate alternative" to coexist with "NO advantage
+# established" - a contradiction a reader had to reconcile alone.
+CONCLUSION_VOCABULARY = science.RECOMMENDATIONS
 
 AVAILABILITY = ("open-source | freely available with restrictions | "
                 "license-required | commercial | unavailable | unclear")
@@ -241,102 +238,16 @@ def _step(store, publish, rid, text, prog, prog_extra=None):
 # ---------------------------------------------------------------------------
 
 def _literature_plan(target, queries_done):
-    tid, label = target["id"], target["label"]
-    if tid.startswith("custom:"):
-        base = label
-    else:
-        base = {"presentation": "MHC-I neoantigen peptide-HLA presentation "
-                                "prediction",
-                "hla_typing": "HLA typing from sequencing data",
-                "purity_cnv": "tumor purity copy number estimation",
-                "hla_loh": "HLA loss of heterozygosity detection",
-                "rna_expression": "RNA-seq transcript quantification "
-                                  "tumour expression",
-                "snv": "somatic SNV calling neoantigen peptide generation",
-                "fusion_discovery": "RNA-seq fusion gene detection",
-                "fusion_peptides": "fusion neoantigen breakpoint peptides",
-                "splice_discovery": "aberrant alternative splicing detection "
-                                    "tumour",
-                "splice_peptides": "splice junction neoantigen peptides",
-                "safety_escape": "neoantigen safety normal proteome "
-                                 "autoantigen avoidance",
-                "ranking": "neoantigen ranking prioritisation "
-                           "immunogenicity",
-                "reports": "neoantigen report clinical presentation",
-                }.get(tid, tid.replace("_", " "))
-    plan = [
-        {"source": "europepmc",
-         "query": f"{base} AND (benchmark OR comparison)",
-         "purpose": "published benchmarks/comparisons for this task"},
-        {"source": "pubmed",
-         "query": f"{base} prediction tools",
-         "purpose": "method papers naming candidate tools"},
-        {"source": "openalex",
-         "query": f"{base} tool evaluation",
-         "purpose": "broader scholarly evaluation literature"},
-    ]
-    out = [q for q in plan
-           if f"{q['source']}|{q['query']}" not in queries_done]
-    return out
+    """M6 A4: the retrieval starts from the module's SCIENTIFIC QUESTION
+    and its task vocabulary (backend/science.py), not from bare keywords
+    like 'ranking tools'."""
+    prof = science.profile_for(target["id"], target.get("label") or "")
+    plan = science.literature_queries(prof, target.get("label")
+                                      or target["id"])
+    return [q for q in plan
+            if f"{q['source']}|{q['query']}" not in queries_done]
 
 
-# Generic scholarly-title words that regex-extraction from paper titles
-# otherwise mistakes for tool names ("Evaluation", "Personalized", ...).
-# Heuristic and intentionally incomplete - the shape rule below is the
-# primary signal, this list catches the frequent Title-Case offenders.
-_TITLE_STOPWORDS = {w.lower() for w in (
-    "Evaluation", "Computational", "Personalized", "Personalised",
-    "Prioritization", "Prioritisation", "Strategies", "Strategy",
-    "Neoantigen", "Neoantigens", "Prediction", "Predicting", "Tools",
-    "Pipeline", "Pipelines", "Systematic", "Comprehensive", "Novel",
-    "Accurate", "Sensitive", "Ultrafast", "Benchmark", "Benchmarks",
-    "Genome", "Genomic", "Genomes", "Exome", "Cancer", "Tumor", "Tumour",
-    "Immunogenicity", "Presentation", "Patient", "Patients", "Clinical",
-    "Machine", "Learning", "Deep", "Network", "Networks", "Framework",
-    "Approach", "Method", "Methods", "Model", "Models", "Analysis",
-    "Profiling", "Screening", "Discovery", "Identification", "Validation",
-    "Performance", "Comparison", "Comparative", "Immunotherapy",
-    "Vaccine", "Vaccines", "Epitope", "Epitopes", "Peptide", "Peptides",
-    "Binding", "Affinity", "Mass", "Spectrometry", "Transcriptome",
-)}
-
-
-def _tool_names_for(target, lit_records, inv_stage):
-    """Candidate tools from (a) the configured repo's own stage
-    definition when it names tools, (b) tool/repository hits actually
-    retrieved from GitHub for the task, (c) tool-shaped proper names in
-    retrieved titles. Nothing is injected from memory.
-
-    (c) is filtered deliberately: a word from a paper title is treated
-    as a tool ONLY if it looks tool-shaped (lower->U internal capitals
-    or a digit, e.g. NetMHCpan / MHCflurry / 4.1) and is not a common
-    scholarly word from _TITLE_STOPWORDS. Recurrence across several
-    titles is NOT accepted as a name signal - generic words like
-    "Evaluation" or "Using" recur constantly - and without this filter
-    they became "registry-verified" candidates whose same-named repos
-    misattributed licenses. Pure Title-Case tool names that only
-    appear in prose can still enter via (a) the configured workflow or
-    (b) GitHub task search; title-only misses are a documented limit."""
-    names = []
-    if inv_stage:
-        for t in inv_stage.get("current_tools") or []:
-            names.append({"name": t, "origin": "configured NeoAG workflow "
-                          "TOML (current tool)"})
-    src_of, seen = {}, {}
-    for r in lit_records:
-        for m in set(re.findall(r"\b([A-Z][A-Za-z0-9]{3,}(?:-?\d+[\.\dx]*)?"
-                                r")\b", r.get("title") or "")):
-            seen[m] = True
-            src_of.setdefault(m, r["source"])
-    for m in seen:
-        if m.lower() in _TITLE_STOPWORDS:
-            continue
-        if not re.search(r"[a-z][A-Z]|\d", m):
-            continue
-        if m not in [n["name"] for n in names]:
-            names.append({"name": m, "origin": f"named in retrieved "
-                          f"title ({src_of[m]})"})
-    return names[:8]
 
 
 def run_live(rid, scope, targets, store, resume):
@@ -436,16 +347,20 @@ def run_live(rid, scope, targets, store, resume):
         publish({"type": "research", "id": rid})
         return
 
-    # ---- phase 2: dedup + candidate tools ----
-    seen_titles, dedup_removed = set(), 0
+    # ---- phase 2: dedup (by stable identifier, then title) + tools ----
+    seen_keys, dedup_removed = set(), 0
     citations, no_id_excluded = [], 0
     for tid, recs in lit_by_target.items():
         for rec in recs:
-            key = _norm_title(rec["title"])
-            if key and key in seen_titles:
+            # source-native ids differ per source for the same paper -
+            # only stable cross-source identifiers (DOI, PMCID) merge
+            ids = [k for k in ((rec.get("doi") or "").lower(),
+                               (rec.get("pmcid") or "").lower()) if k]
+            key = next(iter(ids), None) or _norm_title(rec["title"])
+            if key and key in seen_keys:
                 dedup_removed += 1
                 continue
-            seen_titles.add(key)
+            seen_keys.add(key)
             if not (rec.get("id") or rec.get("url")):
                 no_id_excluded += 1
                 continue
@@ -455,20 +370,36 @@ def run_live(rid, scope, targets, store, resume):
           f"{len(citations)} unique citations kept "
           f"({no_id_excluded} without resolvable id excluded)", prog)
 
-    tool_hits = []
     candidates = []
     done_targets = set()  # targets whose full candidate work completed
     for target in resolved_targets:
         if cancelled():
             break
         tid = target["id"]
-        inv_stage = stages_by_id.get(tid)
-        names = _tool_names_for(target, lit_by_target.get(tid, []), inv_stage)
-        # retrieve software hits for the TASK (grounded in the query, not
-        # in a remembered tool list)
+        inv_stage = stages_by_id.get(tid) or {}
+        prof = science.profile_for(tid, target.get("label") or "")
+        # M6 A3/A4: candidate names come FIRST from the identified
+        # baseline (current tools, never treated as alternatives) and
+        # from tool identities extracted from the retrieved literature;
+        # GitHub task-search hits are identity SUGGESTIONS only and must
+        # still pass the same eligibility screen. No quotas: a module
+        # may legitimately end up with zero suitable candidates.
+        names = []
+        for bt in (inv_stage.get("baseline") or {}).get("tools") or []:
+            if bt["name"].startswith("NeoAG internal"):
+                continue
+            names.append({"name": bt["name"],
+                          "origin": "current NeoAG baseline ("
+                          + bt["role"] + ")",
+                          "baseline": True,
+                          "baseline_evidence": bt.get("evidence")})
+        names += science.extract_tool_mentions(
+            lit_by_target.get(tid, []), prof)
         gh_query = target["label"].split("(")[0].strip()
+        tool_hits = []
         for q in ([{"source": "github", "query": gh_query,
-                    "purpose": "task-named repositories"}]
+                    "purpose": "task-named repositories (suggestions "
+                               "only - screened like everything else)"}]
                   if f"github|{gh_query}" not in done else []):
             recs, err, _ = sources.github_repo_search(q["query"], 4)
             entry = {"source": "github", "query": q["query"], "target": tid,
@@ -489,8 +420,8 @@ def run_live(rid, scope, targets, store, resume):
                   prog, {"queries": queries_log,
                          "coverage": {"per_source": per_source,
                                       "failures": failures}})
-        names += [{"name": h["id"], "origin": f"GitHub task search hit "
-                   f"({h['url']})"} for h in tool_hits[-4:]]
+        names += [{"name": h["id"], "origin": f"GitHub task-search "
+                   f"suggestion ({h['url']})"} for h in tool_hits[-4:]]
         # de-dup candidate names
         uniq, seenn = [], set()
         for n in names:
@@ -498,12 +429,17 @@ def run_live(rid, scope, targets, store, resume):
             if k not in seenn:
                 seenn.add(k)
                 uniq.append(n)
-        for n in uniq[:6]:
+        for n in uniq[:10]:
             c = _verify_candidate(n, target, citations, per_source,
                                   failures, queries_log, done, store,
                                   publish, rid, vcache=vcache,
-                                  budget=budget, ft=ft_budget)
+                                  budget=budget, ft=ft_budget,
+                                  profile=prof)
             candidates.append(c)
+            _step(store, publish, rid,
+                  f"[{tid}] {c['name']}: eligibility -> "
+                  f"{c['eligibility']} ({'; '.join(c['eligibility_reasons'])[:140]})",
+                  prog, {})
         done_targets.add(tid)
     if cancelled():
         # a cancel after candidate work still publishes what was
@@ -539,7 +475,7 @@ def run_live(rid, scope, targets, store, resume):
 
 def _verify_candidate(n, target, citations, per_source, failures,
                       queries_log, done, store, publish, rid,
-                      vcache=None, budget=None, ft=None):
+                      vcache=None, budget=None, ft=None, profile=None):
     """Standardized candidate schema (D5, extended by M5 PART 4).
     Unverifiable fields say 'Not verified' - they are never filled with
     plausible estimates. New in PART 4: the version verification chain
@@ -667,6 +603,39 @@ def _verify_candidate(n, target, citations, per_source, failures,
          (bt[0].get("summary") if bt else ""),
          (py[0].get("summary") if py else "")],
         archived=bool(gh and gh[0].get("archived")))
+    # M6 A2: scientific eligibility screen (backend/science.py). The
+    # text screened is ONLY what this run retrieved about THIS
+    # candidate: registry blurbs + the titles of naming citations.
+    blurb = " ".join(str(x or "") for x in [
+        (gh[0].get("description") if gh else ""),
+        (bt[0].get("summary") if bt else ""),
+        (py[0].get("summary") if py else ""),
+        " ".join((c.get("title") or "") for c in named_cits[:4])])
+    if n.get("baseline"):
+        elig = {"eligibility": "current baseline (not an alternative)",
+                "reasons": [n["origin"]],
+                "comparable_for_replacement": False,
+                "confidence": "n/a"}
+    else:
+        # A literature-extracted candidate was ITSELF pulled out of
+        # these citations' text, so a substring hit there is
+        # self-reference, not corroboration - "named in retrieved
+        # literature" only counts when the extractor's intro cue
+        # actually introduced this name (method_context). For GitHub-
+        # or registry-derived candidates, any naming citation is
+        # independent evidence. (2026-11-17 negative fixture: "DQA101"
+        # and "CoV-2" were mis-extracted from the same abstract that
+        # introduced the real tool and would otherwise inherit its
+        # naming-publication privilege.)
+        lit_origin = (n.get("origin") or "").startswith(
+            "named in retrieved literature")
+        elig = science.screen_candidate(
+            n["name"], blurb,
+            profile=profile or science.GENERIC_PROFILE,
+            origin=n.get("origin", ""),
+            has_naming_source=bool(named_cits) and (
+                not lit_origin or bool(n.get("method_context"))),
+            artifact_class=cls["class"])
     # installed version: only meaningful for tools THIS deployment runs
     if "configured NeoAG workflow" in (n.get("origin") or ""):
         iv = versions.installed_version(base)
@@ -709,6 +678,12 @@ def _verify_candidate(n, target, citations, per_source, failures,
         gaps.append(ft_note[:120])
     return {
         "name": n["name"],
+        "eligibility": elig["eligibility"],
+        "eligibility_reasons": elig["reasons"],
+        "comparable_for_replacement": elig["comparable_for_replacement"],
+        "screen_confidence": elig["confidence"],
+        "is_baseline": bool(n.get("baseline")),
+        "baseline_evidence": n.get("baseline_evidence"),
         "verified_version": verified_version,
         "version_chain": vchain,
         "installed_version": installed,
@@ -765,6 +740,12 @@ def _record(per_source, failures, queries_log, source, query, count, err,
     entry = {"source": source, "query": query, "target": tid,
              "purpose": "candidate verification", "count": count,
              "error": err, "ts": now()}
+    if err and skip_ok_error and skip_ok_error in str(err):
+        # the registry gave a DEFINITE answer (e.g. "not on PyPI"):
+        # a recorded outcome of the version check, never a failed
+        # retrieval - tagged so report accounting never demotes a
+        # module over it (see _live_report)
+        entry["recorded_outcome"] = skip_ok_error
     queries_log.append(entry)
     if err and not (skip_ok_error and skip_ok_error in str(err)):
         per_source[source]["fail"] += 1
@@ -774,238 +755,165 @@ def _record(per_source, failures, queries_log, source, query, count, err,
 
 
 # ---------------------------------------------------------------------------
-# 4.4 systematic within-task comparison + 4.5 fixed-vocabulary conclusions
+# ---------------------------------------------------------------------------
+# M6 A6/A7: within-task comparison + A9 evidence-derived decisions
 # ---------------------------------------------------------------------------
 
+def _val(x):
+    """Parse a reported metric value (0-1 or percent) for paired
+    comparisons; None when not numeric."""
+    s = str(x or "").strip().rstrip("%")
+    try:
+        v = float(s)
+    except ValueError:
+        return None
+    return v / 100.0 if "%" in str(x) or v > 1.5 else v
+
+
+def _usable_rows(c):
+    ev = c.get("published_benchmark_evidence")
+    return ([r for r in ev if isinstance(r, dict)
+             and r.get("context_established")]
+            if isinstance(ev, list) else [])
+
+
+def _fmt_row(r):
+    return (f"{r.get('metric')}={r.get('value')} on {r.get('dataset')}"
+            f" [{r.get('tested_version') or 'version not stated'}]"
+            + (" (author-reported)"
+               if r.get("author_reported")
+               or "author-reported" in r.get("evidence_level", "")
+               else " (independent)"
+               if r.get("independent")
+               or "independent" in r.get("evidence_level", "") else ""))
+
+
+def _superiority_rows(direct, baseline_cands):
+    """A 'better' claim is licensed ONLY by a same-metric, same-dataset
+    number on both sides - retrieval almost never produces that, which
+    is exactly the point."""
+    base_map = {}
+    for bc in baseline_cands:
+        for r in _usable_rows(bc):
+            ds = (r.get("dataset") or "").lower()
+            if ds in ("", "not stated by source"):
+                continue
+            key = (str(r.get("metric") or "").lower(), ds)
+            v = _val(r.get("value"))
+            if v is not None:
+                base_map.setdefault(key, []).append(v)
+    sup = []
+    for c in direct:
+        for r in _usable_rows(c):
+            ds = (r.get("dataset") or "").lower()
+            key = (str(r.get("metric") or "").lower(), ds)
+            v = _val(r.get("value"))
+            if v is None or key not in base_map:
+                continue
+            if all(v > b for b in base_map[key]):
+                sup.append({"tool": c["name"], "row": r,
+                            "beats": f"current tool {key[0]}="
+                                     f"{max(base_map[key])} on {key[1]}"})
+    return sup
+
+
 def _task_comparisons(resolved_targets, candidates, stages_by_id):
-    """One comparison block PER scientific task. Candidates are compared
-    only against the current tool of their own target - tools that solve
-    different problems never share a table. Alternatives are grouped by
-    what kind of artifact they are (algorithm vs wrapper vs pipeline...),
-    because a wrapper is not a like-for-like replacement for an
-    algorithm."""
+    """One comparison block PER scientific module (M6 B2 section 3).
+    Comparison rows contain ONLY direct alternatives; complementary
+    methods, wrappers and screened-out hits are named WITH their reason
+    but never dressed up as comparison rows."""
     out = []
     for t in resolved_targets:
         tid = t["id"]
         stage = stages_by_id.get(tid) or {}
-        current = [c for c in candidates
-                   if c["task"] == t["label"]
-                   and "configured NeoAG workflow" in c["role_in_neoag"]]
-        alts = [c for c in candidates
-                if c["task"] == t["label"] and c not in current]
-        groups = {}
-        for c in alts:
-            groups.setdefault(c["artifact_class"], []).append(c["name"])
+        base = stage.get("baseline") or {}
+        prof = science.profile_for(tid, t["label"])
+        mine = [c for c in candidates if c["task"] == t["label"]]
+        groups = {"complementary method": [],
+                  "wrapper/integration (not an independent algorithm)": [],
+                  "related but not comparable": [],
+                  "insufficient information to classify": [],
+                  "irrelevant": []}
         rows = []
-        for c in alts:
-            usable = [r for r in c["published_benchmark_evidence"]
-                      if isinstance(r, dict)
-                      and r.get("context_established")]
-            rows.append({
-                "tool": c["name"],
-                "artifact_class": c["artifact_class"],
-                "version": c["verified_version"],
-                "license": c["license"],
-                "maintenance": c["maintenance"],
-                "published_performance": (
-                    "; ".join(
-                        f"{r['metric']}={r['value']} on {r['dataset']}"
-                        f" [{r['tested_version']}]"
-                        + (" (author-reported)"
-                           if r.get("author_reported") or
-                           "author-reported" in r.get("evidence_level", "")
-                           else " (independent)"
-                           if r.get("independent") or "independent" in
-                           r.get("evidence_level", "") else "")
-                        for r in usable)
-                    or "no value with established experimental context "
-                       "(quotes in candidate row, not comparable)"),
-                "runtime_memory": "Not verified (not retrievable from "
-                                  "registry metadata/abstracts)",
-                "neoag_compatibility": "Not verified (integration "
-                                       "surface not assessed)",
-                "integration_cost": "Not verified (depends on the "
-                                    "compatibility check above)",
-                "evidence_quality": (
-                    f"{len([r for r in c['published_benchmark_evidence'] if isinstance(r, dict)])}"
-                    f" retrieved row(s), {len(usable)} comparable, "
-                    f"{len([r for r in c['published_benchmark_evidence'] if isinstance(r, dict) and 'independent' in r.get('evidence_level', '')])} independent"),
-            })
+        for c in mine:
+            e = c["eligibility"]
+            if e == "current baseline (not an alternative)":
+                continue
+            if e == "direct alternative":
+                usable = _usable_rows(c)
+                rows.append({
+                    "tool": c["name"],
+                    "version": c["verified_version"],
+                    "evidence": ("; ".join(_fmt_row(r) for r in usable[:3])
+                                 if usable else
+                                 "relevant method; no performance number "
+                                 "with established experimental context "
+                                 "was retrieved for it"),
+                    "license": c["license"],
+                    "maintenance": c["maintenance"],
+                    "why_comparable": "; ".join(c["eligibility_reasons"])
+                                     [:200]})
+            elif e in groups:
+                groups[e].append(c["name"])
         out.append({
             "target": t["label"], "target_id": tid,
-            "current_tools": current and [
-                {"name": c["name"], "version": c["verified_version"],
-                 "installed": c["installed_version"]} for c in current]
-            or [{"name": "(no tool name configured in the workflow "
-                         "TOML for this stage)", "version": "n/a",
-                 "installed": "n/a"}],
-            "alternatives_by_kind": groups,
+            "question": prof["question"],
+            "baseline": {
+                "identified": base.get("identified", False),
+                "consensus": base.get("consensus", False),
+                "tools": [{"name": b["name"], "role": b["role"],
+                           "evidence": "; ".join(b["evidence"])[:220],
+                           "pinned_version": b.get("pinned_version")}
+                          for b in base.get("tools") or []],
+                "note": base.get("note", "")},
             "rows": rows,
-            "note": ("comparison is WITHIN this scientific task only; "
-                     "kind groups are not interchangeable units - a "
-                     "wrapper/collection wraps tools rather than "
-                     "competing with them"),
-        })
+            "complementary": groups["complementary method"],
+            "wrappers_integrations":
+                groups["wrapper/integration (not an independent "
+                       "algorithm)"],
+            "related_not_comparable": groups["related but not comparable"],
+            "insufficient": groups["insufficient information to classify"],
+            "excluded_irrelevant": groups["irrelevant"],
+            "note": ("only direct alternatives appear as comparison rows; "
+                     "a wrapper integrates tools rather than competing "
+                     "with them, and excluded candidates keep their "
+                     "reason in the appendix")})
     return out
 
 
-def _conclusion_explanation(mine, alts, current, comparable, independent,
-                            metrics, conclusion_text):
-    """The 4.5 five-part explanation that accompanies every conclusion -
-    each part derived from THIS module's retrieved rows, never
-    templated prose. Plus one concrete recommended evaluation whenever
-    the conclusion does not simply retain (recommending a specific
-    evaluation is the brief's mandated alternative to guessing)."""
-    alt_rows = [r for c in alts for r in c["published_benchmark_evidence"]
-                if isinstance(r, dict)]
-    claimed = [f"{c['name']}: {r['metric']} {r['value']} on "
-               f"{r['dataset']} [{r.get('tested_version', 'version not stated')}]"
-               for c in alts for r in c["published_benchmark_evidence"]
-               if isinstance(r, dict) and r.get("context_established")]
-    first_metric = (metrics.get("metrics") or ["the task's published "
-                  "benchmark metric"])[0]
-    cur_names = [c["name"] for c in current]
-    usable = []
-    for c in alts:
-        notes = []
-        if (c.get("availability") or "").startswith("found on"):
-            notes.append(c["availability"])
-        if c["license"] != "Not verified":
-            notes.append(f"license {c['license']}")
-        notes.append(c["maintenance"])
-        usable.append(f"{c['name']}: " + ", ".join(notes))
-    remains = []
-    for c in alts[:3]:
-        for g in c["evidence_gaps"][:3]:
-            remains.append(f"{c['name']}: {g}")
-    ev = {
-        "what_evidence_supports_it":
-            f"{len(mine)} candidate row(s); {len(alts)} registry-verified "
-            f"alternative(s); {len(comparable)} context-established "
-            f"performance row(s) ({len(independent)} independent); "
-            f"details in candidate rows + task comparison",
-        "expected_advantage": "; ".join(claimed) or
-            "NO advantage established by retrieved evidence - all "
-            "retrieved mentions lack experimental context "
-            "(context_established=false)",
-        "directly_comparable": bool(comparable) and bool(current),
-        "directly_comparable_note": (
-            "comparison needs a context-established number for BOTH the "
-            "alternative and the current tool on identical labels - "
-            + ("such paired numbers were NOT retrieved"
-               if not (comparable and current) else
-               "still gated by each row's version caveat")),
-        "usable_in_current_deployment": "; ".join(usable) or
-            "no registry-verified alternative to assess",
-        "remains_to_verify": remains or
-            ["no alternative candidates to verify"],
-    }
-    if conclusion_text in ("Retain current method",
-                           "Not applicable to NeoAG's actual workflow"):
-        return ev, None
-    eval_names = ", ".join(c["name"] for c in alts[:3]) \
-        or "(name a candidate first)"
-    warn = metrics.get("warning") or \
-        "keep metrics within their published definitions"
-    protocol = (
-        f"Controlled comparison on THIS deployment: run {eval_names} "
-        f"against {', '.join(cur_names) or 'the stage function'} on "
-        f"identical inputs from the deployment's own validation fixture; "
-        f"measure {first_metric}; pin every tool's version; compare only "
-        f"identical label sets; {warn}")
-    return ev, protocol
-
-
-def _module_conclusion(target, candidates, metrics=None):
-    """Fixed-vocabulary conclusion per module (4.5). The strictest
-    vocabulary entry that the RETRIEVED evidence actually licenses is
-    chosen; guessing a winner is prohibited by construction, because
-    'Candidate appears superior' requires a context-established,
-    independent, same-metric comparison against the current tool's own
-    context-established number - abstract/registry retrieval cannot
-    produce that."""
-    metrics = metrics or _DEFAULT_METRICS
+def _module_decision(target, candidates, stage, reached_fully=True):
+    """M6 A9: a recommendation from the six-category fixed vocabulary,
+    DERIVED from facts about the retrieved rows - the category cannot
+    contradict the evidence, because it is computed from it."""
     tid = target["id"]
+    prof = science.profile_for(tid, target["label"])
+    base = stage.get("baseline") or {}
     mine = [c for c in candidates if c["task"] == target["label"]]
-    verified = [c for c in mine
-                if c["category"] == "software (registry-verified)"]
-    alts = [c for c in verified
-            if "configured NeoAG workflow" not in c["role_in_neoag"]]
-    current = [c for c in verified
-               if "configured NeoAG workflow" in c["role_in_neoag"]]
-    comparable = [r for c in alts for r in c["published_benchmark_evidence"]
-                  if isinstance(r, dict) and r.get("context_established")]
+    baseline_cands = [c for c in mine if c.get("is_baseline")]
+    direct = [c for c in mine if c["eligibility"] == "direct alternative"]
+    comparable = [r for c in direct for r in _usable_rows(c)]
     independent = [r for r in comparable
                    if "independent" in r.get("evidence_level", "")]
-    current_has_current_tool = current or any(
-        "configured NeoAG workflow" in c["role_in_neoag"] for c in mine)
-
-    def _mk(text, why, basis):
-        assert text in CONCLUSION_VOCABULARY
-        expl, protocol = _conclusion_explanation(
-            mine, alts, current, comparable, independent, metrics, text)
-        out = {"conclusion": text, "why": why, "evidence_basis": basis,
-               "explanation": expl}
-        if protocol:
-            out["recommended_evaluation"] = protocol
-        return out
-
-    if not mine:
-        return _mk(
-            "Not applicable to NeoAG's actual workflow",
-            "the retrieval found nothing verifiable that maps onto this "
-            "stage",
-            {"candidates": 0})
-    if not alts:
-        if not current_has_current_tool:
-            return _mk(
-                "Not applicable to NeoAG's actual workflow",
-                "no configured tool is named for this stage and no "
-                "registry-verified alternative was found",
-                {"candidates": len(mine), "registry_verified":
-                 len(verified)})
-        return _mk(
-            "Evidence insufficient to recommend replacement",
-            "the current tool was found; every retrieved alternative "
-            "remains unverified or is not named after the candidate "
-            "(registry identity checks failed)",
-            {"candidates": len(mine), "registry_verified":
-             len(verified)})
-    if independent and comparable:
-        # still never declares a winner without same-conditions numbers
-        # for the CURRENT tool - which retrieval cannot supply:
-        return _mk(
-            "Recommend independent benchmark",
-            f"{len(independent)} independent context-established "
-            f"performance row(s) exist for alternatives, but no "
-            f"context-established number for the CURRENT tool was "
-            f"retrieved - superiority cannot be concluded from "
-            f"one-sided evidence",
-            {"alternatives": len(alts), "comparable_rows":
-             len(comparable), "independent_rows": len(independent)})
-    if comparable:
-        return _mk(
-            "Recommend independent benchmark",
-            f"{len(comparable)} alternative performance row(s) carry an "
-            f"explicit dataset/ground-truth context but none is "
-            f"independent, and none shares a metric basis with the "
-            f"current tool",
-            {"alternatives": len(alts), "comparable_rows":
-             len(comparable)})
-    active = [c for c in alts
-              if c["maintenance"].startswith("active")]
-    if active:
-        return _mk(
-            "Consider candidate alternative",
-            f"{len(active)} registry-verified alternative(s) are "
-            f"actively maintained, but no performance figure with "
-            f"established experimental context was retrieved",
-            {"alternatives": len(alts), "active": len(active)})
-    return _mk(
-        "Evidence insufficient to recommend replacement",
-        "alternatives exist on registries but show low maintenance "
-        "activity and no usable performance context",
-        {"alternatives": len(alts)})
+    superiority = _superiority_rows(direct, baseline_cands)
+    rec = science.recommend(
+        baseline_identified=bool(base.get("identified")),
+        direct_alts=direct, comparable_rows=comparable,
+        independent_rows=independent, superiority_rows=superiority,
+        profile=prof, coverage_partial=not reached_fully,
+        gates_passed=True)
+    return {"recommendation": rec["recommendation"],
+            "conclusion": rec["recommendation"],  # legacy key
+            "rationale": rec["rationale"],
+            "action": rec["action"],
+            "evidence_facts": {
+                "candidates": len(mine),
+                "direct_alternatives": len(direct),
+                "comparable_rows": len(comparable),
+                "independent_rows": len(independent),
+                "superiority_rows": len(superiority),
+                "baseline_identified": bool(base.get("identified")),
+                "baseline_tools": [b["name"]
+                                   for b in (base.get("tools") or [])]}}
 
 
 def _live_status(per_source) -> str:
@@ -1019,24 +927,31 @@ def _live_status(per_source) -> str:
 
 
 def _coverage_accounting(inv, resolved_targets, module_conclusions,
-                         candidates, status):
-    """4.7: completion is EVIDENCE COVERAGE over the inventory, never
-    'all scheduled queries returned 200'. Every inventory stage is
-    accounted for: researched-with-sufficient-evidence,
-    researched-but-thin, or not-researched WITH its reason. A run that
-    stopped early lists the missing modules and points at resume."""
+                         candidates, status, scope_ids=None):
+    """4.7: completion is EVIDENCE COVERAGE, never 'all scheduled
+    queries returned 200'. Every inventory stage is accounted for:
+    researched-with-sufficient-evidence, researched-but-thin, or
+    not-researched WITH its reason. M6 fix: a TARGETED run is complete
+    for its own scope - modules outside the requested scope are labelled
+    'not part of this run's scope', never 'the run stopped early', and
+    they never poison the module-level decisions."""
     researched = {t["id"]: t.get("label") for t in resolved_targets}
+    scope_ids = scope_ids if scope_ids is not None else set(researched)
     stopped_early = status in ("cancelled", "incomplete", "failed")
     sufficient, insufficient, missing = [], [], []
     for s in inv["stages"]:
         sid = s["id"]
         if sid not in researched:
-            missing.append({
-                "id": sid,
-                "reason": ("run stopped (" + status + ") before this "
-                           "module - resume keeps persisted queries"
-                           if stopped_early else
-                           "not part of this run's scope")})
+            if sid not in scope_ids:
+                missing.append({"id": sid,
+                                "reason": "not part of this run's scope"})
+            else:
+                missing.append({
+                    "id": sid,
+                    "reason": ("run stopped (" + status + ") before this "
+                               "module - resume keeps persisted queries"
+                               if stopped_early else
+                               "scheduled but not reached")})
             continue
         mc = module_conclusions.get(sid) or {}
         mine = [c for c in candidates if c["task"] == researched[sid]]
@@ -1054,7 +969,10 @@ def _coverage_accounting(inv, resolved_targets, module_conclusions,
                            f"{len(ctx_rows)} context-established "
                            f"performance row(s) - conclusion: "
                            f"'{mc.get('conclusion', '?')}'")})
-    complete = not missing
+    # M6: a targeted run is COMPLETE FOR ITS SCOPE - modules outside
+    # the requested scope are recorded but never make the run look
+    # broken; only modules that were scheduled and not reached do.
+    complete = not [m for m in missing if "scope" not in m["reason"]]
     return {
         "identified_modules": len(inv["stages"]),
         "researched_modules": len(researched),
@@ -1069,29 +987,34 @@ def _coverage_accounting(inv, resolved_targets, module_conclusions,
 
 
 def _next_actions(module_conclusions, coverage):
-    """Recommended Next Actions replace the old generic Open Questions:
-    each is tied to one module decision, decision-priority ordered."""
-    prio = {"Candidate appears superior under specified conditions": 0,
+    """M6 B2 section 4: actions in decision-priority order, each tied to
+    ONE module decision. Generic benchmark plans for irrelevant tools or
+    modules without a defined endpoint are not produced (A9/B6):
+    recommend() only emits a benchmark action when the module has
+    relevant direct alternatives AND a published-metric endpoint."""
+    prio = {"Candidate supported by comparative evidence": 0,
             "Recommend independent benchmark": 1,
-            "Consider candidate alternative": 2,
-            "Evidence insufficient to recommend replacement": 3,
-            "Retain current method": 4,
-            "Not applicable to NeoAG's actual workflow": 5}
+            "Promising candidate - evaluate": 2,
+            "Research incomplete": 3,
+            "Insufficient evidence": 4,
+            "Retain current tool": 5}
     acts = []
     for tid, mc in module_conclusions.items():
-        if mc.get("recommended_evaluation"):
-            acts.append((prio.get(mc["conclusion"], 9),
-                         f"[{tid}] {mc['conclusion']} -> "
-                         f"{mc['recommended_evaluation']}"))
-        elif mc["conclusion"] == "Retain current method":
-            acts.append((4, f"[{tid}] Retain current method - no action "
-                            "beyond ordinary maintenance."))
-    if coverage["not_researched"] and coverage["completeness"] == "partial":
-        acts.append((1, "Coverage: resume or re-run to cover "
-                     f"{len(coverage['not_researched'])} unresearched "
-                     "module(s): "
-                     + ", ".join(m["id"] for m in
-                                 coverage["not_researched"][:8])))
+        rec = mc.get("recommendation") or mc.get("conclusion") or ""
+        if rec == "Retain current tool":
+            acts.append((5, f"[{tid}] Keep current tool - "
+                            f"{mc['rationale'][:150]}"))
+            continue
+        if mc.get("action"):
+            acts.append((prio.get(rec, 9),
+                         f"[{tid}] {rec} -> {mc['action']}"))
+    in_run_gaps = [m for m in coverage["not_researched"]
+                   if "scope" not in m["reason"]]
+    if in_run_gaps:
+        acts.append((0, "Coverage: resume or re-run to cover "
+                     f"{len(in_run_gaps)} module(s) this run did not "
+                     "finish: " + ", ".join(m["id"] for m in
+                                            in_run_gaps[:8])))
     acts.sort(key=lambda x: x[0])
     return [a[1] for a in acts]
 
@@ -1117,17 +1040,149 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
     stages_by_id = {s["id"]: s for s in inv["stages"]}
     reached = (resolved_targets if reached_ids is None else
                [t for t in resolved_targets if t["id"] in reached_ids])
+    # A8: a GitHub 403 rate-limit is a RECORDED gap in the version-
+    # verification chain, not a failed retrieval of science - it must
+    # not demote a module's evidence to 'research incomplete'. Only
+    # genuine literature/registry retrieval failures do that. The same
+    # honesty class covers definite registry-ABSENCE answers
+    # ("not-on-pypi"/"not-on-bioconda"): the registry answered the
+    # query, and "this package is not here" is an outcome, not a
+    # failed retrieval (2026-11-17 live run: a completed 2-module run
+    # with 7/7 quality gates was mislabelled 'Research incomplete'
+    # because 32 honest not-on-registry answers counted as hard
+    # failures). _record tags these at the source; the string check
+    # also covers runs persisted before the tag existed.
+    def _rate_only(err) -> bool:
+        return "rate limit" in str(err or "").lower()
+
+    def _recorded_outcome(q) -> bool:
+        if q.get("recorded_outcome"):
+            return True
+        s = str(q.get("error") or "").lower()
+        return _rate_only(s) or "not-on-pypi" in s or "not-on-bioconda" in s
+
+    hard_fail_targets = {q.get("target")
+                         for q in (prog.get("queries") or [])
+                         if q.get("error") and q.get("target")
+                         and not _recorded_outcome(q)}
+    hard_failures = [f for f in failures if not _rate_only(
+        f.get("error"))]
     task_comparisons = _task_comparisons(reached, candidates,
                                          stages_by_id)
     module_conclusions = {
-        t["id"]: _module_conclusion(
-            t, candidates,
-            TASK_METRICS.get(t["id"], _DEFAULT_METRICS))
+        t["id"]: _module_decision(
+            t, candidates, stages_by_id.get(t["id"]) or {},
+            reached_fully=(t["id"] not in hard_fail_targets))
         for t in reached}
-    coverage = _coverage_accounting(inv, reached,
-                                    module_conclusions, candidates,
-                                    status)
+    coverage = _coverage_accounting(
+        inv, reached, module_conclusions, candidates, status,
+        scope_ids={t["id"] for t in resolved_targets})
     next_actions = _next_actions(module_conclusions, coverage)
+    # ---- M6 A2 provenance: what was screened out, and why ----
+    excluded = [
+        {"name": c["name"], "module": c["task"],
+         "eligibility": c["eligibility"],
+         "reasons": c["eligibility_reasons"],
+         "origin": c["role_in_neoag"],
+         "where_it_came_from": c.get("verification_hits")}
+        for c in candidates
+        if c["eligibility"] in ("irrelevant",
+                                "insufficient information to classify")]
+    # ---- M6 A10 quality gates: preliminary vs decision-ready ----
+    gates = science.quality_gates(
+        targets=[t["id"] for t in reached],
+        baselines={tc["target_id"]:
+                   {"identified": tc["baseline"]["identified"]}
+                   for tc in task_comparisons},
+        candidates=candidates, excluded=excluded,
+        citations_count=len(citations), failures=failures,
+        coverage=coverage)
+    in_run_gaps = [m for m in coverage["not_researched"]
+                   if "scope" not in m["reason"]]
+    ready = (science.decision_ready(gates) and not in_run_gaps
+             and not hard_failures)
+    rate_gaps = [f for f in failures if _rate_only(f.get("error"))]
+    # ---- M6 B1: conclusion-first assessment (one minute to read) ----
+    by_rec = Counter(m["recommendation"]
+                     for m in module_conclusions.values())
+    adv = {k: v for k, v in by_rec.items()
+           if k in ("Candidate supported by comparative evidence",
+                    "Promising candidate - evaluate",
+                    "Recommend independent benchmark")}
+    if adv.get("Candidate supported by comparative evidence"):
+        headline = ("Directly comparable published evidence supports at "
+                    "least one alternative - adoption still requires "
+                    "validation on this deployment (see module table).")
+    elif adv:
+        headline = ("NO tool replacement is justified today. "
+                    + ", ".join(f"{v}x {k}" for k, v in adv.items())
+                    + f" - relevant candidates exist for {len(adv)} "
+                      "outcome type(s) but no comparable performance "
+                      "numbers were retrieved. The current tools stay "
+                      "in place.")
+    else:
+        parts = ", ".join(f"{v}x {k}" for k, v in sorted(
+            by_rec.items(), key=lambda kv: -kv[1]))
+        headline = ("NO tool replacement is justified for any researched "
+                    f"module ({parts}). Where zero suitable alternatives "
+                    "were found, that is the finding - not a gap to "
+                    "pad with irrelevant software.")
+    findings = [
+        f"[{tid}] {mc['recommendation']} - {mc['rationale'][:170]}"
+        for tid, mc in module_conclusions.items()
+        if mc["recommendation"] != "Retain current tool"][:6]
+    assessment = {
+        "headline": headline,
+        "scope": (f"{len(reached)} module(s) researched this run "
+                  f"({'targeted scope' if len(reached) < len(inv['stages']) else 'full pipeline'}); "
+                  f"{len(in_run_gaps)} scheduled module(s) not finished"
+                  + (f", {len(coverage['not_researched']) - len(in_run_gaps)} outside the requested scope"
+                     if len(coverage["not_researched"]) > len(in_run_gaps)
+                     else "")
+                  + f" (scope completeness: {coverage['completeness']}); "
+                  f"{len(citations)} unique literature records; "
+                  f"{len(candidates)} candidates screened, "
+                  f"{len(excluded)} excluded as irrelevant or "
+                  "unclassifiable"),
+        "top_findings": findings or [
+            "every researched module retains its current tool"],
+        "evidence_gaps": [
+            tc["baseline"]["note"] for tc in task_comparisons
+            if tc["baseline"]["note"]]
+            + ([f"{len(hard_failures)} literature/registry retrieval "
+                f"failure(s) recorded in provenance"]
+               if hard_failures else [])
+            + ([f"{len(rate_gaps)} GitHub verification query(ies) hit "
+                "the shared rate budget - recorded as version-chain "
+                "gaps, not evidence of absence (a re-run completes "
+                "them)"] if rate_gaps else [])
+            + ([] if not in_run_gaps else
+               [f"run did not finish {len(in_run_gaps)} scheduled "
+                "module(s) - resume keeps persisted queries"]),
+        "next_action": next_actions[0] if next_actions else
+                       "no action - all modules retain current tools",
+        "decision_ready": ready,
+        "review_class": ("decision-ready review" if ready else
+                         "preliminary research - the quality gates "
+                         "below did not all pass")}
+    module_table = []
+    for tc in task_comparisons:
+        mc = module_conclusions.get(tc["target_id"]) or {}
+        cur = ", ".join(t["name"] for t in tc["baseline"]["tools"]) or \
+            "(baseline NOT identified)"
+        best = tc["rows"][0]["tool"] if tc["rows"] else \
+            ("-" if tc["baseline"]["identified"] else "blocked: "
+             "baseline unidentified")
+        ev_line = (tc["rows"][0]["evidence"][:120] if tc["rows"]
+                   else "no candidate passed the scientific relevance "
+                        "screen as a direct alternative")
+        module_table.append({
+            "module": tc["target"], "current NeoAG method": cur,
+            "best relevant alternative": best, "evidence": ev_line,
+            "recommendation": mc.get("recommendation", "not researched")})
+    scientific_comparison = [
+        {**tc, "decision": module_conclusions.get(tc["target_id"])}
+        for tc in task_comparisons]
     version_license_findings = [
         {"tool": c["name"], "target": c["task"],
          "version_verdict": c["verified_version"],
@@ -1154,24 +1209,21 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
                   "targeted"),
         "targets": [{"id": t["id"], "label": t["label"]}
                     for t in resolved_targets],
+        # M6 B1: the FIRST thing a reader sees (also rendered first by
+        # every export) - not citation counts or API bookkeeping.
+        "assessment": assessment,
+        "module_table": module_table,
+        "decision_ready": ready,
+        "review_class": assessment["review_class"],
+        "quality_gates": gates,
         "executive_summary": [
-            "decisions: " + (", ".join(
-                f"{n} x {c}" for c, n in sorted(
-                    Counter(m["conclusion"] for m in
-                            module_conclusions.values()).items(),
-                    key=lambda kv: kv[1], reverse=True)) or "none"),
-            f"{len(candidates)} candidate rows assembled and verified "
-            f"against live registries for {len(resolved_targets)} target(s)",
-            f"{len(citations)} unique literature citations retrieved "
-            f"(abstract/metadata level only)",
-            f"coverage: {total_ok} successful queries, {total_fail} failed "
-            f"queries - {status}",
-            f"per-module conclusions (fixed vocabulary): "
-            + ", ".join(sorted({v["conclusion"] for v in
-                                module_conclusions.values()})) or "none",
-            "no execution or independent benchmarking performed - any "
-            "adoption decision requires runs on the deployment's own "
-            "fixtures (see recommended_benchmarks)"],
+            assessment["headline"],
+            assessment["scope"],
+            "recommendations: " + (", ".join(
+                f"{v}x {k}" for k, v in sorted(
+                    by_rec.items(), key=lambda kv: -kv[1])) or "none"),
+            f"{total_ok} retrieval queries succeeded, {total_fail} "
+            f"failed (recorded in provenance) - run status: {status}"],
         "inventory": {"repo": inv["repo"], "code_verified":
                       inv["code_verified"], "git_commit": inv["git_commit"],
                       "n_stages": len(inv["stages"]),
@@ -1179,10 +1231,19 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
                       "stages": inv["stages"]},
         "candidates": candidates,
         "task_comparisons": task_comparisons,
+        # M6 B2: main-narrative blocks (rendered before the appendix)
+        "scientific_comparison": scientific_comparison,
+        "excluded_candidates": excluded,
+        "action_plan": [
+            {"priority": i + 1, "module": a.split("]")[0].strip("["),
+             "action": a}
+            for i, a in enumerate(next_actions)],
         "module_conclusions": module_conclusions,
         "conclusion_vocabulary": CONCLUSION_VOCABULARY,
+        "eligibility_vocabulary": science.ELIGIBILITY_VOCABULARY,
         "comparison": [
             {"target": c["task"], "tool": c["name"],
+             "eligibility": c["eligibility"],
              "artifact_class": c["artifact_class"],
              "verified_version": c["verified_version"],
              "license": c["license"], "maintenance": c["maintenance"],
@@ -1205,7 +1266,13 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
         "coverage_accounting": coverage,
         "recommended_next_actions": next_actions,
         "version_license_findings": version_license_findings,
-        "recommended_benchmarks": benchmarks,
+        # B6: a benchmark is proposed ONLY for modules whose decision is
+        # "Recommend independent benchmark" - never for every module and
+        # never for irrelevant tools.
+        "recommended_benchmarks": {
+            tid: benchmarks[tid] for tid in benchmarks
+            if (module_conclusions.get(tid) or {}).get("recommendation")
+            == "Recommend independent benchmark"},
         "provenance": {
             "queries": (prog.get("queries") or [])[:400],
             "sources_consulted": sorted(per_source),
@@ -1217,29 +1284,37 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
                  "count": dedup_removed},
                 {"reason": "record without resolvable id",
                  "count": no_id_excluded}],
-            "selection_criteria": "per-target multi-query retrieval; top "
-                                  "results per query (page size 8); dedup "
-                                  "by normalised title; candidate tools "
-                                  "taken ONLY from configured-workflow "
-                                  "tools and retrieved titles/repositories",
+            "selection_criteria": "literature-first: candidate identities "
+                                  "come from the identified baseline and "
+                                  "from tool names extracted from "
+                                  "retrieved papers; GitHub hits are "
+                                  "identity suggestions only; EVERY "
+                                  "candidate passes the fixed eligibility "
+                                  "screen (science.screen_candidate) "
+                                  "before entering any comparison; "
+                                  "citations deduped by DOI/PMCID then "
+                                  "normalised title",
             "failures": failures},
         "methodology": (
-            "Scope -> code-grounded inventory of the configured NeoAG "
-            "repository -> per-target multi-query retrieval across "
-            "literature sources (Europe PMC, PubMed, OpenAlex) and "
-            "software registries (GitHub, PyPI, bio.tools, bioconda) -> "
-            "per-candidate VERSION CHAIN (official releases -> git tags "
-            "-> registries -> repository version file -> papers, each "
-            "step recorded with source + date; commit fallback when no "
-            "formal release; budget-skipped steps keep their reason) -> "
-            "performance evidence extraction with a context gate "
-            "(abstracts plus bounded open-access full texts via NCBI "
-            "efetch; numbers without dataset/ground-truth context are "
-            "quoted but excluded from comparison) -> artifact "
-            "classification (algorithm vs wrapper/pipeline/collection/"
-            "reimplementation/model/archived) -> within-task comparison "
-            "tables + fixed-vocabulary module conclusions. Full query "
-            "log persisted in provenance.queries."),
+            "Scope -> BASELINE identification from the deployed NeoAG "
+            "repo (workflow TOML stage+run-level groups, planner code "
+            "wiring, runner scripts, conda envs, module dirs - each tool "
+            "with file evidence) -> task-question-driven literature "
+            "retrieval (Europe PMC, PubMed, OpenAlex; benchmark/review/"
+            "method/benchmark-dataset query families) -> tool-identity "
+            "extraction from titles/abstracts -> registry verification "
+            "(GitHub, PyPI, bio.tools, bioconda) with a per-candidate "
+            "VERSION CHAIN (official releases -> git tags -> registries "
+            "-> repo version file -> papers; budget-skipped steps keep "
+            "their reason) -> ELIGIBILITY SCREEN (direct alternative / "
+            "complementary / wrapper / related-not-comparable / "
+            "irrelevant / insufficient - from the candidate's own "
+            "retrieved description, reasons persisted) -> performance "
+            "evidence extraction with a context gate (abstracts plus "
+            "bounded open-access full texts via NCBI efetch) -> "
+            "evidence-derived six-category recommendations -> research "
+            "quality gates deciding preliminary vs decision-ready. "
+            "Full query log persisted in provenance.queries."),
         "limitations": [
             "abstracts/metadata are the evidence floor; full texts were "
             "attempted ONLY for open-access PMC deposits via efetch "
