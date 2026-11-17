@@ -218,7 +218,7 @@ check("12 code-grounded inventory from the configured repo (13 stages, commit)",
       str((rep.get("inventory") or {}).get("git_commit", "")).startswith("1cc4585"),
       str(rep.get("inventory", {}).get("git_commit")))
 _bench_mods = {tid for tid, m in (rep.get("module_conclusions") or {}).items()
-               if m.get("recommendation") == "Recommend independent benchmark"}
+               if m.get("recommendation") == "Recommend targeted benchmark"}
 check("13 B6: benchmark definitions exist ONLY for modules whose "
       "decision proposes one (never for every module, never for "
       "irrelevant tools), and carry not-rankable warnings",
@@ -295,18 +295,21 @@ check("22 every chain step records outcome+date, the papers step always "
       "version)", _steps_ok and _papers_ok and _bv_ok)
 mc = rep.get("module_conclusions") or {}
 vocab = rep.get("conclusion_vocabulary") or []
-check("23 six-category recommendation vocabulary; every researched "
-      "target gets a recommendation whose rationale is present, and no "
-      "'supported by comparative evidence' is claimed without "
-      "superiority rows",
+check("23 M8 five-label recommendation vocabulary; every researched "
+      "target gets a recommendation whose rationale is present, and "
+      "'Promising candidate for further evaluation' appears only where "
+      "a DIRECT verified comparison pair actually favours the "
+      "alternative",
       set(mc) == {t["id"] for t in (rep.get("targets") or [])}
-      and len(vocab) == 6
+      and len(vocab) == 5
       and all(m["recommendation"] in vocab and m.get("rationale")
               and m.get("action") and m.get("evidence_facts")
               for m in mc.values())
       and all(not (m["recommendation"]
-                   == "Candidate supported by comparative evidence"
-                   and not m["evidence_facts"].get("superiority_rows"))
+                   == "Promising candidate for further evaluation"
+                   and not any(x.get("class") == "direct"
+                               and x.get("winner") == "alternative"
+                               for x in m.get("comparisons") or []))
               for m in mc.values()),
       str({k: v["recommendation"] for k, v in mc.items()})[:200])
 tcs = rep.get("task_comparisons") or []
