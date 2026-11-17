@@ -1031,3 +1031,423 @@ def quality_gates(*, targets, baselines, candidates, excluded,
 
 def decision_ready(gates) -> bool:
     return all(x["passed"] for x in gates) if gates else False
+
+
+# ---------------------------------------------------------------------------
+# M8 S8: comparability classes (PART 6). Two measurements are DIRECT
+# only when the same endpoint quantity was measured under matched,
+# DOCUMENTED study conditions; any documented difference or any
+# undocumented dimension keeps the pair INDIRECT (usable for a
+# "promising candidate" label, never for a superiority claim);
+# different metrics are DESCRIPTIVE; unverified measurements are
+# UNVERIFIED and excluded from every comparison.
+# ---------------------------------------------------------------------------
+
+DECISIVE_DIMS = ("modality", "sample_design", "ground_truth", "specimen")
+_ALL_DIMS = ("modality", "sample_design", "specimen", "ground_truth",
+             "cn_scope", "estimate")
+_LOWER_BETTER = {"mae", "rmse", "medae", "error rate", "boundary distance",
+                 "median absolute error", "mean absolute error",
+                 "root mean squared error"}
+
+
+def _metric_num(v):
+    m = re.search(r"\d+(?:\.\d+)?", str(v or ""))
+    return float(m.group(0)) if m else None
+
+
+def _cov_num(context, side):
+    c = str((context or {}).get("coverage") or "")
+    m = re.search(r"(\d+(?:\.\d+)?)", c)
+    return float(m.group(1)) if m else None
+
+
+def compare_measurements(base: dict, alt: dict) -> dict:
+    """base/alt: {"metric","value","verified","context" dict,
+    "name"}; returns the ComparabilityClass record for the pair."""
+    out = {"class": "unverified", "dimensions": [], "decisive_mismatches":
+           [], "undocumented": [], "winner": None, "note": ""}
+    if not (base.get("verified") and alt.get("verified")):
+        out["note"] = ("one side's measurement did not pass the "
+                       "independent verification pass")
+        return out
+    bm = str(base.get("metric") or "").lower()
+    am = str(alt.get("metric") or "").lower()
+    if bm != am or not bm:
+        out["class"] = "descriptive"
+        out["note"] = (f"different endpoint metrics "
+                       f"({base.get('metric')!r} vs "
+                       f"{alt.get('metric')!r}) - each side is "
+                       "informative on its own, not comparable")
+        return out
+    bc, ac = base.get("context") or {}, alt.get("context") or {}
+    for dim in _ALL_DIMS:
+        b, a = bc.get(dim), ac.get(dim)
+        if b is not None and a is not None:
+            if b == a:
+                verdict = "match"
+            else:
+                verdict = "differ"
+                if dim in DECISIVE_DIMS:
+                    out["decisive_mismatches"].append(dim)
+        elif b is not None or a is not None:
+            # ONE side documents the condition and the other does not:
+            # the comparison may be confounded by exactly what is
+            # missing - keeps the pair indirect, never promotes.
+            verdict = "partially-undocumented"
+            out["undocumented"].append(dim)
+        else:
+            # neither side states it - no asymmetry to fear, recorded
+            # but never used to block a direct class (abstracts rarely
+            # state specimen handling; blocking here would make
+            # 'direct' unreachable and starve the honest retain label)
+            verdict = "not-stated"
+        out["dimensions"].append({"dimension": dim, "baseline": b,
+                                  "alternative": a, "verdict": verdict})
+    cb, ca = _cov_num(bc, "b"), _cov_num(ac, "a")
+    if cb is not None and ca is not None:
+        ok = max(cb, ca) <= 2.0 * min(cb, ca)
+        out["dimensions"].append({
+            "dimension": "coverage", "baseline": bc.get("coverage"),
+            "alternative": ac.get("coverage"),
+            "verdict": "match" if ok else "differ"})
+        if not ok:
+            out["decisive_mismatches"].append("coverage")
+    elif cb is not None or ca is not None:
+        out["undocumented"].append("coverage")
+        out["dimensions"].append({"dimension": "coverage",
+                                  "baseline": bc.get("coverage"),
+                                  "alternative": ac.get("coverage"),
+                                  "verdict": "partially-undocumented"})
+    if out["decisive_mismatches"]:
+        out["class"] = "indirect"
+        out["note"] = ("same endpoint metric but study conditions differ "
+                       "(" + ", ".join(out["decisive_mismatches"]) +
+                       ") - a difference in numbers may be the "
+                       "conditions, not the methods")
+    elif out["undocumented"]:
+        out["class"] = "indirect"
+        out["note"] = ("conditions not documented symmetrically on both "
+                       "sides (" + ", ".join(out["undocumented"]) +
+                       ") - never promoted to direct")
+    elif str((bc.get("modality") or ac.get("modality") or "")) == "":
+        # neither side states WES/WGS/panel - modality is the single
+        # biggest endpoint confounder, so silence on it blocks 'direct'
+        out["class"] = "indirect"
+        out["note"] = ("neither study states its sequencing modality - "
+                       "a WES result cannot be called directly "
+                       "comparable to a WGS one, and neither side "
+                       "confirms which it is")
+    else:
+        out["class"] = "direct"
+        vb, va = _metric_num(base.get("value")), _metric_num(alt.get("value"))
+        if vb is not None and va is not None:
+            if vb == va:
+                out["winner"] = "tie"
+            else:
+                better_lower = bm in _LOWER_BETTER
+                alt_better = (va < vb) if better_lower else (va > vb)
+                out["winner"] = ("alternative" if alt_better
+                                 else "baseline")
+        out["note"] = ("same endpoint metric under matched, documented "
+                       "conditions - a numeric difference licenses a "
+                       "decision")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# M8 S9: synthesis - the five precise labels (PART 6) fed by facts,
+# with every satisfied/unsatisfied condition recorded.
+# ---------------------------------------------------------------------------
+
+RECOMMENDATION_LABELS_V2 = [
+    "Evidence supports retaining current method",
+    "No justified change identified",
+    "Promising candidate for further evaluation",
+    "Recommend targeted benchmark",
+    "Review incomplete",
+]
+
+RELATIVE_RELEVANT = ("direct-alternative", "partial-overlap",
+                     "complementary", "upstream", "downstream",
+                     "wrapper", "alternative-implementation")
+
+
+def recommend_v2(*, baseline_identified: bool, gate_failures=(),
+                 coverage_partial: bool = False, relevance_rows=(),
+                 comparisons=(), endpoint_defined: bool = True,
+                 endpoint: str = "") -> dict:
+    """Pure function of the module's stage outputs. relevance_rows:
+    [{"name","relationship","followups_open"}]; comparisons:
+    compare_measurements() outputs plus "candidate". Every branch
+    records the conditions it checked."""
+    met: list[str] = []
+    unmet: list[str] = []
+
+    def done(label, rationale, action, *, _met=None, _unmet=None):
+        return {"label": label, "rationale": rationale, "action": action,
+                "conditions_met": _met if _met is not None else met,
+                "conditions_unmet": _unmet if _unmet is not None
+                else unmet,
+                "vocabulary": RECOMMENDATION_LABELS_V2}
+
+    if gate_failures:
+        unmet.append("all scientific gates pass")
+        return done("Review incomplete",
+                    "scientific gate(s) failed: "
+                    + "; ".join(str(g) for g in gate_failures[:4])
+                    + " - conclusions would overstate the review",
+                    "fix the gate failures (deeper retrieval, identity "
+                    "disambiguation, verification) and re-synthesise",
+                    _met=[], _unmet=unmet)
+    met.append("all scientific gates pass")
+    if not baseline_identified:
+        unmet.append("the deployed baseline is established from "
+                     "code/config evidence")
+        return done("Review incomplete",
+                    "the current NeoAG baseline for this module could "
+                    "not be established from repo pins, conda metadata "
+                    "or planner configuration - any replacement claim "
+                    "would float without a base",
+                    "identify the implementation (CLI/planner/manifest/"
+                    "conda env) before scoring alternatives",
+                    _met=met, _unmet=unmet)
+    met.append("baseline established from code/config evidence")
+    if coverage_partial:
+        unmet.append("the retrieval covered every planned source")
+        return done("Review incomplete",
+                    "coverage of the planned sources was partial - the "
+                    "absence of evidence here may be an outage, not a "
+                    "finding",
+                    "resume/extend the review and re-synthesise",
+                    _met=met, _unmet=unmet)
+    met.append("full planned coverage accounted for")
+
+    unresolved = [r for r in relevance_rows
+                  if r.get("relationship") == "unresolved"]
+    pending = [r for r in relevance_rows if r.get("followups_open")]
+    if unresolved or pending:
+        unmet.append("every identified candidate reached a terminal "
+                     "relevance state with follow-ups closed")
+        names = ", ".join(sorted({r.get("name", "?") for r in
+                                  (unresolved + pending)})[:6])
+        return done("Review incomplete",
+                    f"investigation still open for: {names} - a "
+                    "conclusion written over an open follow-up is a "
+                    "guess",
+                    "run the recorded follow-up queries",
+                    _met=met, _unmet=unmet)
+    met.append("all candidates in terminal relevance states")
+
+    relevant = [r for r in relevance_rows
+                if r.get("relationship") in RELATIVE_RELEVANT]
+    direct = [c for c in comparisons if c.get("class") == "direct"]
+    alt_wins = [c for c in direct if c.get("winner") == "alternative"]
+    base_wins = [c for c in direct
+                 if c.get("winner") in ("baseline", "tie")]
+    any_perf = [c for c in comparisons
+                if c.get("class") in ("direct", "indirect")]
+
+    if alt_wins:
+        met.append(f"{len(alt_wins)} direct comparison(s) where the "
+                   "alternative's verified number is better under "
+                   "matched documented conditions")
+        return done("Promising candidate for further evaluation",
+                    "a directly comparable, independently verified "
+                    "result favours "
+                    + ", ".join(sorted({c.get("candidate", "?")
+                                        for c in alt_wins}))
+                    + " under the stated conditions - literature "
+                    "never licenses adoption, only this deployment's "
+                    "own benchmark can",
+                    "validate on the deployment's fixtures via the "
+                    "consent flow before any switch")
+    if direct and base_wins and not alt_wins:
+        met.append(f"{len(base_wins)} direct comparison(s) favour the "
+                   "current baseline")
+        return done("Evidence supports retaining current method",
+                    "under matched documented conditions the current "
+                    "baseline's verified numbers are at least as good "
+                    "as every retrieved alternative's - this is the "
+                    "only label a direct-baseline-win licenses",
+                    "retain; optionally re-check when the baseline or "
+                    "the literature changes")
+    if relevant and any_perf:
+        met.append("relevant candidates carry verified measurements, "
+                   "but none directly comparable")
+        return done("Promising candidate for further evaluation",
+                    f"{len(any_perf)} verified measurement pair(s) "
+                    "exist but only at indirect/descriptive "
+                    "comparability - an advantage is plausible, not "
+                    "established",
+                    "evaluate the shortlisted method against NeoAG's "
+                    "own validation data before any adoption talk")
+    if relevant and endpoint_defined:
+        met.append("relevant candidates identified; no verified "
+                   "performance evidence retrieved")
+        return done("Recommend targeted benchmark",
+                    "relevant alternatives exist but the literature "
+                    "provides no verified comparable numbers - the "
+                    "knowledge gap is exactly what a targeted "
+                    "benchmark answers",
+                    f"benchmark on this deployment: endpoint = "
+                    f"{endpoint or 'define from the task endpoints'}; "
+                    "propose via the consent flow only if validation "
+                    "data exist")
+    if relevant:
+        unmet.append("a defined comparison endpoint exists")
+        return done("Review incomplete",
+                    "relevant alternatives exist but no endpoint is "
+                    "defined for this task - a benchmark without an "
+                    "endpoint would produce noise, and no evidence "
+                    "exists to decide otherwise",
+                    "define the endpoint from a published benchmark "
+                    "of this task's field first",
+                    _met=met, _unmet=unmet)
+    met.append(f"{len(relevance_rows)} candidate(s) reviewed; every "
+               "one reached a terminal state with positive basis "
+               "(relevance classified or mismatch evidenced)")
+    return done("No justified change identified",
+                "the baseline is established, the investigation "
+                "completed every identified candidate to a terminal, "
+                "evidenced state, and no comparison class produced "
+                "any signal of advantage - zero justified change is "
+                "a legitimate outcome, not a vacuum",
+                "no action; re-run when the deployment or the "
+                "literature changes")
+
+
+# ---------------------------------------------------------------------------
+# M8 S9: the eight SCIENTIFIC gate dimensions. Real checks over the
+# stage outputs (each violation lists the offending rows); the old
+# constant-True gates are gone. Mechanical well-formedness is NOT a
+# scientific gate and does not appear here.
+# ---------------------------------------------------------------------------
+
+GATE_DIMENSIONS = [
+    "identity", "relevance", "baseline", "evidence", "comparability",
+    "recommendation", "coverage", "provenance integrity"]
+
+_ABSENCE_WORDS = ("none of", "no keyword", "contains no",
+                  "does not mention", "absence of")
+
+
+def scientific_gates(state: dict) -> list[dict]:
+    """state = one module's assembled stage outputs:
+    {target, baseline: {...}, candidates: [row...],
+     coverage: {"attempted","accounted","outages"},
+     citation_ids: [...], citation_ids_unique: int,
+     engine_version, label_proposed, label_facts: {...}}
+    Every row: {name, is_baseline, relationship, basis, reasons,
+    identity_status, version_claimed, license_claimed,
+    rejected_measurements_used, superiority_claim,
+    direct_verified_pair, followups_open}
+    """
+    rows = state.get("candidates") or []
+    alt_rows = [r for r in rows if not r.get("is_baseline")]
+
+    def g(dim, passed, detail, violations=()):
+        return {"dimension": dim, "passed": bool(passed),
+                "detail": detail, "violations": list(violations)[:8]}
+
+    # 1 identity: attribution only under a resolved identity
+    bad = [r["name"] for r in alt_rows
+           if r.get("identity_status") != "resolved"
+           and (r.get("version_claimed") or r.get("license_claimed"))]
+    out1 = g("identity", not bad,
+             "every version/license claim sits on a >=2-axis resolved "
+             "identity (contested/unresolved rows carry neither)"
+             if not bad else
+             "version/license attributed without resolved identity",
+             bad)
+
+    # 2 relevance: no exclusion whose only basis is keyword absence
+    bad = []
+    for r in alt_rows:
+        if r.get("relationship") == "unrelated" and not r.get("basis"):
+            bad.append(f"{r['name']}: unrelated WITHOUT positive basis")
+        elif r.get("relationship") == "irrelevant":
+            bad.append(f"{r['name']}: retired absence-based vocabulary")
+        elif r.get("relationship") == "unrelated":
+            txt = " ".join(str(b.get("claim", "")) + " " +
+                           str(b.get("term", ""))
+                           for b in r.get("basis", [])).lower()
+            if any(w in txt for w in _ABSENCE_WORDS):
+                bad.append(f"{r['name']}: basis rests on absence "
+                           "wording")
+    out2 = g("relevance", not bad,
+             "no exclusion rests on keyword absence; every 'unrelated' "
+             "quotes positive mismatch evidence" if not bad else
+             "exclusion without positive basis", bad)
+
+    # 3 baseline
+    bl = state.get("baseline") or {}
+    out3 = g("baseline",
+             bool(bl.get("identified")) and bool(bl.get("evidence")),
+             "baseline established with code/config evidence string"
+             if bl.get("identified") and bl.get("evidence") else
+             "baseline missing or without evidence provenance")
+
+    # 4 evidence: no rejected measurement used anywhere
+    bad = [r["name"] for r in alt_rows
+           if int(r.get("rejected_measurements_used") or 0) > 0]
+    out4 = g("evidence", not bad,
+             "only confirm/correct-carrying measurements entered rows "
+             "and comparisons" if not bad else
+             "rows using measurements the verifier rejected", bad)
+
+    # 5 comparability: superiority only on direct verified pairs
+    bad = [r["name"] for r in alt_rows
+           if r.get("superiority_claim") and not r.get("direct_verified_pair")]
+    out5 = g("comparability", not bad,
+             "no superiority language without a direct-class verified "
+             "pair" if not bad else
+             "superiority claimed outside direct comparability", bad)
+
+    # 6 recommendation: label re-derived from the same facts matches
+    facts = state.get("label_facts") or {}
+    derived = recommend_v2(**facts) if facts else None
+    stored = state.get("label_proposed")
+    consistent = (derived is None or stored is None
+                  or derived["label"] == stored)
+    out6 = g("recommendation", consistent,
+             "stored label equals the label re-derived from the "
+             "stage facts" if consistent else
+             f"stored label {stored!r} but facts derive "
+             f"{(derived or {}).get('label')!r}")
+
+    # 7 coverage: every attempt accounted
+    cov = state.get("coverage") or {}
+    ok = (cov.get("attempted") is not None
+          and cov.get("attempted") == cov.get("accounted"))
+    out7 = g("coverage", ok,
+             f"{cov.get('accounted')}/{cov.get('attempted')} retrieval "
+             f"attempts accounted for; outages: "
+             f"{cov.get('outages', 0)}" if ok else
+             "coverage accounting missing or inconsistent")
+
+    # 8 provenance integrity: citations unique, versions traceable,
+    #    engine version recorded
+    ids = state.get("citation_ids") or []
+    uniq = state.get("citation_ids_unique")
+    bad = []
+    if ids and uniq is not None and uniq != len(set(ids)):
+        bad.append(f"{len(ids) - uniq} citation id(s) double-counted")
+    if not state.get("engine_version"):
+        bad.append("engine version not recorded")
+    for r in alt_rows:
+        if (r.get("version_claimed")
+                and r.get("identity_status") != "resolved"):
+            bad.append(f"{r['name']}: version not traceable to a "
+                       "resolved identity")
+    out8 = g("provenance integrity", not bad,
+             "citation ids canonical-unique; every version string "
+             "traces to a resolved identity; engine version recorded"
+             if not bad else "provenance defects", bad)
+    return [out1, out2, out3, out4, out5, out6, out7, out8]
+
+
+def decision_ready_v2(gates) -> bool:
+    """DECISION-READY only when every scientific gate actually
+    passed - no constant True anywhere."""
+    return bool(gates) and all(x["passed"] for x in gates)

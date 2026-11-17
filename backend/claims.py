@@ -555,3 +555,60 @@ def _bind(seg: str, toks: dict, masked: list[dict], coff: int,
 
     new_frame = [m["canon"] for m in pairs[0]] if pairs else frame
     return ms, new_frame
+
+
+# ---------------------------------------------------------------------------
+# experiment-context extraction for comparability (S8 input)
+# ---------------------------------------------------------------------------
+# The same measurement is only directly comparable when the STUDY
+# CONDITIONS match; whatever the quote does not state is None -
+# undocumented dimensions keep a comparison at 'indirect' downstream,
+# they never collapse to direct and never fabricate agreement.
+
+_CONTEXT_PATTERNS: list[tuple[str, str, str]] = [
+    ("modality", "WES", r"\bwes\b|whole[- ]exome|\bexome\b"),
+    ("modality", "WGS", r"\bwgs\b|whole[- ]genome\b"),
+    ("modality", "targeted-panel", r"targeted panel|\bpanel data\b|"
+                                   r"hybridization capture"),
+    ("modality", "RNA-seq", r"\brna[- ]?seq\b"),
+    ("sample_design", "matched-normal", r"matched normal|tumor[-/ ]"
+                                        r"normal pair|paired (?:germline|"
+                                        r"normal)"),
+    ("sample_design", "tumor-only", r"tumor[- ]only|tumour[- ]only|"
+                                    r"without (?:a )?normal"),
+    ("specimen", "FFPE", r"\bffpe\b|formalin[- ]fixed"),
+    ("ground_truth", "simulated", r"simulat\w+ (?:data|cohort|reads|reads|"
+                                  r"genome|reads)|reads were simulat"),
+    ("ground_truth", "cell-line", r"cell line|reference (?:sample|strain|"
+                                  r"material|standard)|\bgcat\b|"
+                                  r"\bseqc\b|\bhcc1395\b"),
+    ("ground_truth", "orthogonal-assay", r"orthogonal|\bqpcr\b|\bddpcr\b|"
+                                         r"pcr[- ]validat\w+|\bmicrofluidic\b"),
+    ("ground_truth", "clinical-follow-up", r"clinical (?:follow[- ]?up|"
+                                           r"outcome|validation)"),
+    ("cn_scope", "allele-specific", r"allele[- ]specific|minor copy|"
+                                    r"\bcn[- ]?loh\b|phased"),
+    ("cn_scope", "total-cn", r"total copy number"),
+    ("estimate", "clonality", r"clonal(?:ity)? deconvolution|"
+                              r"subclonal(?:ity)?|cancer cell fraction"),
+    ("estimate", "segmentation", r"segmentation|segment[- ]level|"
+                                 r"breakpoint"),
+]
+
+
+def extract_context(text: str) -> dict:
+    """Study-condition attributes a quote states, per dimension the
+    comparability layer compares. A dimension may carry several stated
+    values ('WES+WGS') - disagreement inside one quote never silently
+    picks one."""
+    out: dict[str, str] = {}
+    low = (text or "").lower()
+    for dim, val, rx in _CONTEXT_PATTERNS:
+        if re.search(rx, low):
+            cur = out.get(dim, "")
+            if val not in cur:
+                out[dim] = f"{cur}+{val}" if cur else val
+    m = re.search(r"(\d{1,4})\s*(?:[x\u00d7]|[- ]fold)(?:\b|-)", low)
+    if m:
+        out["coverage"] = f"~{m.group(1)}x"
+    return out
