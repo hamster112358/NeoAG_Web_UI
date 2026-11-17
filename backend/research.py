@@ -1516,6 +1516,27 @@ def build_example_report(scope: str, target_ids: list[str]) -> dict:
                          "illustrative placeholders)",
                 "independently_benchmarked": False,
             })
+    rec = _example_recommendation(scope, ",".join(target_ids))
+    # M7 §8: the example fixture mirrors the PRODUCTION report shape -
+    # it leads with the assessment too, and the assessment itself says
+    # in plain words that this is a labelled test fixture and not a
+    # decision (decision_ready is never true for a mock).
+    assessment = {
+        "headline": ("MOCK example digest for testing the report UI - "
+                     "NOT a decision: no live retrieval ran and every "
+                     "number below is an illustrative placeholder."),
+        "scope": (f"{len(keys)} module(s) in the example fixture's "
+                  + ("full-pipeline" if scope == "full" else "targeted")
+                  + " digest; live sources not connected"),
+        "top_findings": [str(rec)[:200]] if rec else [],
+        "evidence_gaps": ["example fixture: no live literature search, "
+                          "no registry verification, no benchmarks - "
+                          "submit a LIVE research run for a decision"],
+        "next_action": ("submit a live research run when a real "
+                        "decision is needed"),
+        "decision_ready": False,
+        "review_class": "MOCK example - not a review",
+    }
     return {
         "disclaimer": ("MOCK RESEARCH DIGEST - example content only, "
                        "selected deliberately as the 'example' testing "
@@ -1528,7 +1549,10 @@ def build_example_report(scope: str, target_ids: list[str]) -> dict:
             else ",".join(target_ids),
         "availability_classes_legend": AVAILABILITY,
         "comparison": comparison,
-        "recommendation": _example_recommendation(scope, ",".join(target_ids)),
+        "recommendation": rec,
+        "assessment": assessment,
+        "review_class": assessment["review_class"],
+        "decision_ready": False,
         "provenance": {"engine": "example-mock", "dataset_version":
                        DEMO_DATASET_VERSION,
                        "live_sources_connected": False},

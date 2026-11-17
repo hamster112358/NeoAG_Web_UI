@@ -15,6 +15,7 @@ const state = {
   jobDetail: null, resultsJob: null,
   manifest: null, agentMode: "mock",
   convs: [], activeCid: null, convMsgs: [],
+  sseDown: true, // until the live stream says otherwise (§6 status)
 };
 
 /* ---------------- API ---------------- */
@@ -128,11 +129,17 @@ function connectSSE() {
   // gone, so (re)opening always refetches the visible state. SSE is
   // best-effort - the streaming watchdog below is the guarantee.
   es.onopen = () => {
+    state.sseDown = false;
     $("conn-dot").className = "dot on"; $("conn-text").textContent = "live";
     refreshConv(); refreshSidebar(); refreshJobs(); renderAttention();
     renderResults();
   };
-  es.onerror = () => { $("conn-dot").className = "dot off"; $("conn-text").textContent = "reconnecting"; };
+  es.onerror = () => {
+    state.sseDown = true;
+    $("conn-dot").className = "dot off";
+    $("conn-text").textContent = "reconnecting";
+    if (state.activeCid) renderChat(); // status line must say "Reconnecting"
+  };
   es.onmessage = (m) => {
     let ev = {};
     try { ev = JSON.parse(m.data); } catch { return; }
@@ -144,8 +151,9 @@ function connectSSE() {
       refreshJobs(); renderAttention(); refreshConv();
     } else if (ev.type === "research" || ev.type === "research_changed") {
       refreshDiscovery();
+      refreshJobs(); // research rows are unified task rows too (§1.2)
     } else if (ev.type === "skills_changed") refreshSkills();
-    else if (ev.type === "manifest") refreshManifests();
+    else if (ev.type === "manifest") { /* the prep flow keeps its own state */ }
     else if (ev.type === "agent_mode") renderAgentBadge();
     else if (ev.type === "records_changed") boot();
   };
@@ -376,6 +384,31 @@ function msgHtml(m) {
     <div class="body">${esc(m.text)}</div></div>`;
 }
 
+/* M7 §6: the tool chatter of ONE turn collapses into a single expandable
+   activity summary once it is done - while tools are still running the
+   summary stays open so the work is visible. Nothing is hidden from the
+   audit trail: every call remains its own stored message, rendered
+   inside the fold. */
+function activityHtml(rows) {
+  if (rows.length === 1) return msgHtml(rows[0]);
+  const done = rows.filter((r) =>
+    (r.meta || {}).tool_status === "completed").length;
+  const failed = rows.filter((r) =>
+    (r.meta || {}).tool_status === "failed").length;
+  const live = rows.length - done - failed;
+  const bits = [];
+  if (done) bits.push(`${done} done`);
+  if (failed) bits.push(`${failed} failed`);
+  if (live) bits.push(`${live} running`);
+  return `<details class="msg activity"${live ? " open" : ""}>
+    <summary>Agent activity - ${rows.length} tool calls
+      (${bits.join(", ")})
+      <span class="ts">${esc(fmtTime(rows[rows.length - 1].ts))}</span>
+    </summary>
+    <div class="act-rows">${rows.map((r) => toolHtml(r)).join("")}
+    </div></details>`;
+}
+
 /* final answers deserve more visual weight than tool chatter */
 function mergeToolMsgs(msgs) {
   const merged = [], idxById = {};
@@ -423,18 +456,31 @@ function renderChat() {
   } else chip.classList.add("hidden");
 
   const merged = mergeToolMsgs(state.convMsgs || []);
+  // §6: consecutive tool messages (one turn's work) become one block
+  const blocks = [];
+  for (const m of merged) {
+    const last = blocks[blocks.length - 1];
+    if ((m.meta || {}).kind === "tool" && last && last.tools) {
+      last.tools.push(m);
+    } else if ((m.meta || {}).kind === "tool") {
+      blocks.push({ tools: [m] });
+    } else {
+      blocks.push({ msg: m });
+    }
+  }
   let lastDay = "";
-  let html = merged.map((m) => {
+  let html = blocks.map((b) => {
+    const first = b.tools ? b.tools[0] : b.msg;
     let sep = "";
     let dk = "";
-    try { dk = dayKey(m.ts); } catch { /* unparseable ts: no separator */ }
+    try { dk = dayKey(first.ts); } catch { /* unparseable ts: no separator */ }
     if (dk && dk !== lastDay) {
       sep = `<div class="date-sep">${esc(
-        new Date(m.ts).toLocaleDateString([],
+        new Date(first.ts).toLocaleDateString([],
           { year: "numeric", month: "short", day: "numeric" }))}</div>`;
       lastDay = dk;
     }
-    return sep + msgHtml(m);
+    return sep + (b.tools ? activityHtml(b.tools) : msgHtml(b.msg));
   }).join("");
   const gateCards = (state.boot?.approvals || []).filter((a) => {
     if (a.state !== "pending" || a.action !== "gate_op") return false;
@@ -475,14 +521,23 @@ function updateActivity(gatePending) {
   const working = !!turn && turn.state === "streaming";
   state.turnWorking = working;
   state.turnSince = turn && working ? new Date(turn.ts).getTime() : null;
+  // M7 §6 status semantics - honest at a glance: waiting for approval is
+  // never shown as "thinking", a lost connection is never shown as work
+  // in progress, and "thinking" only shows while no tool is executing.
+  const blocked = state.convObj && state.convObj.job_state === "blocked";
   let label = "";
-  if (working) {
+  if (working && (gatePending || blocked)) {
+    label = "Waiting for your approval";
+  } else if (working && state.sseDown) {
+    label = "Reconnecting - the last recorded state is shown below";
+  } else if (working) {
     const tools = (state.convMsgs || []).slice(-4).some(
       (m) => (m.meta || {}).kind === "tool" &&
-             (m.meta || {}).tool_status === "running");
-    label = tools ? "Agent is running a tool..." : "Agent is thinking...";
-  } else if (gatePending || (state.convObj && state.convObj.job_state === "blocked")) {
-    label = "Waiting for your confirmation";
+             !["completed", "failed"].includes((m.meta || {})
+               .tool_status || ""));
+    label = tools ? "Running tools" : "Thinking";
+  } else if (gatePending || blocked) {
+    label = "Waiting for your approval";
   } else if (turn) {
     label = "Last turn: " + turn.state;
   }
@@ -605,69 +660,29 @@ function renderTasks() {
       ${s.required ? '<span class="req">required</span>' : ""}
       <span class="dep">${esc(dep)}</span></label>`;
   }).join("");
-  $("adv-count").textContent = state.params
-    ? `${(state.params.science || []).length} verified science controls, ` +
-      `${state.params.groups.flatMap((g) => g.items).length} inventory rows, ` +
-      `all cited to the real pipeline code`
-    : "inventory unavailable";
-  renderAdvanced();
+  renderScience();
 }
 
-function renderAdvanced() {
-  const hosts = ["cfg-inputs", "cfg-science", "cfg-exec"].map((h) => $(h));
+function renderScience() {
+  const host = $("cfg-science");
   if (!state.params) {
-    hosts.forEach((h) => {
-      h.innerHTML = "<p class='hint'>parameter inventory unavailable - " +
-        "showing nothing rather than guessing options</p>";
-    });
-    $("cfg-managed").innerHTML = "";
+    host.innerHTML = "<p class='hint'>parameter inventory unavailable - " +
+      "showing nothing rather than guessing options</p>";
     return;
   }
-  const itemsOf = (concern) => state.params.groups.flatMap((g) =>
-    g.items.filter((p) => p.concern === concern));
-  $("cfg-inputs").innerHTML = `
-    <h3>Inputs &amp; sample (agent-managed, auto-discovery)</h3>
-    <p class="hint">You normally describe where the data is; the input
-    detector / planner discovers the files and proposes a manifest
-    (native plan step 01). Only override a path when discovery picked
-    wrong - every override is recorded in the run snapshot.</p>
-    ${itemsOf("inputs").map((p) => pitemHtml(p)).join("")}`;
   const modules = state.params.groups.filter((g) => g.concern === "science");
-  $("cfg-science").innerHTML = sciencePanelHtml(modules);
-  // M6 PART E: ids that live in the structured science panel must not
-  // also appear as free-text rows in the execution foldout (one control,
-  // one meaning).
-  const sciIds = new Set((state.params.science || []).map((c) => c.id));
-  $("cfg-exec").innerHTML = itemsOf("execution")
-    .filter((p) => !sciIds.has(p.id))
-    .map((p) => pitemHtml(p)).join("");
-  const managed = itemsOf("managed");
-  $("cfg-managed").innerHTML = managed.length
-    ? "Managed automatically, never a form field: " +
-      managed.map((p) => `<b>${esc(p.label)}</b> (${esc(p.desc || "")})`).join("; ")
-    : "";
-  hosts.forEach((h) =>
-    h.querySelectorAll("input,select").forEach((el) =>
-      el.addEventListener("change", collectAdvanced)));
-  collectAdvanced();
+  host.innerHTML = sciencePanelHtml(modules);
+  host.querySelectorAll("input,select").forEach((el) =>
+    el.addEventListener("change", updateSciState));
+  updateSciState();
 }
 
-function pitemHtml(p) {
-  let ctrl;
-  if (p.type === "choice") {
-    ctrl = `<select data-param="${esc(p.id)}"><option value="">(leave default)</option>${(p.values || []).map((v) =>
-      `<option>${esc(v)}</option>`).join("")}</select>`;
-  } else if (p.type === "flag") {
-    ctrl = `<input type="checkbox" data-param="${esc(p.id)}">`;
-  } else {
-    ctrl = `<input type="text" data-param="${esc(p.id)}" placeholder="${esc(p.default || "")}">`;
-  }
-  return `<div class="pitem">
-    <div><div class="pname">${esc(p.label)}${p.cli ? ` <code>${esc(p.cli)}</code>` : ""}</div><div class="pdef">default: ${esc(p.default ?? "none")}</div></div>
-    <div>${ctrl}</div>
-    <div class="pdesc">${esc(p.desc || "")}</div>
-    <div class="psrc">${esc(p.source || "")}</div>
-  </div>`;
+function updateSciState() {
+  const el = $("sci-state");
+  if (!el) return;
+  const n = Object.keys(collectAdvanced()).length;
+  el.textContent = n ? `${n} customization${n > 1 ? "s" : ""} - recorded in the run`
+                     : "NeoAG defaults";
 }
 
 function collectAdvanced() {
@@ -755,138 +770,154 @@ function scCtrlHtml(c) {
     <div class="psrc">${esc(c.evidence || "")}</div></div>`;
 }
 
-/* manifest */
-$("man-propose").addEventListener("click", async () => {
-  const desc = $("man-desc").value.trim();
-  if (!desc) { toast("describe the data location first", true); return; }
-  try {
-    const m = await api("POST", "/api/manifests/propose", { description: desc });
-    state.manifest = m;
-    renderManifest();
-    toast("manifest proposed - review below");
-  } catch (e) { toast("propose failed: " + e.message, true); }
-});
-function renderManifest() {
-  const m = state.manifest;
-  const host = $("manifest-view");
-  if (!m) { host.innerHTML = ""; return; }
-  const native = m.proposal.kind === "native";
-  const rows = (m.proposal.inputs || []).map((i) => `
-    <tr>${native ? `<td><input type="checkbox" class="man-use" data-path="${esc(i.path)}" checked
-      title="use this input in the run"></td>` : ""}
-    <td><b>${esc(i.role)}</b></td><td><code>${esc(i.path)}</code></td>
-    <td>${esc(i.confidence)}</td><td>${esc(i.basis)}</td></tr>`).join("");
-  const amb = (m.proposal.ambiguous || []).map((x) =>
-    `<li><code>${esc(typeof x === "string" ? x : x.file)}</code>${typeof x === "object" ? " - " + esc(x.reason) : ""}</li>`).join("");
-  const inf = (m.proposal.informational || []).map((x) =>
-    `<li><code>${esc(x.file)}</code> - ${esc(x.role)}</li>`).join("");
-  const mis = (m.proposal.missing || []).map((x) => `<li>${esc(x)}</li>`).join("");
-  const notes = (m.proposal.notes || []).map((x) => `<li>${esc(x)}</li>`).join("");
-  host.innerHTML = `<div class="manifest-card">
-    <div class="mnote">${esc(m.proposal.note)}${native ? ' &middot; <span class="pill accent">from a real directory scan</span>' : ""}</div>
-    <div class="tablewrap"><table class="data">
-      <thead><tr>${native ? "<th>Use</th>" : ""}<th>Role</th><th>Path</th><th>Confidence</th><th>Basis</th></tr></thead>
-      <tbody>${rows}</tbody></table></div>
-    ${native && m.status === "proposed" ? `<label class="lbl">Sample / case id for this run</label>
-      <input type="text" id="man-sample" value="${esc(m.proposal.sample_id || "")}">` : ""}
-    ${mis ? `<p class="hint">Blocking: <ul>${mis}</ul></p>` : ""}
-    ${amb ? `<p class="hint">Ambiguous (untick above or state in chat which one): <ul>${amb}</ul></p>` : ""}
-    ${inf ? `<p class="hint">Recorded, not forwarded: <ul>${inf}</ul></p>` : ""}
-    ${notes ? `<p class="hint">${notes}</p>` : ""}
-    ${m.status === "proposed"
-      ? `<div class="btnrow">
-           <button class="btn primary sm" id="man-confirm">Confirm manifest</button>
-           <span class="hint">the confirmed manifest is the run's authoritative input - nothing will be asked again${native ? "; untick any input it should not use" : " (or correct it in chat first)"}</span>
-         </div>`
-      : `<span class="pill ${m.status === "linked" ? "accent" : "ok"}">${esc(m.status)}</span>`}
-  </div>`;
-  const cb = $("man-confirm");
-  if (cb) cb.addEventListener("click", async () => {
-    const edits = native ? {
-      removed: [...document.querySelectorAll(".man-use:not(:checked)")]
-        .map((c) => c.dataset.path),
-      sample_id: ($("man-sample") || {}).value || m.proposal.sample_id || ""
-    } : {};
-    try {
-      const m2 = await api("POST", `/api/manifests/${m.id}/confirm`, { edits });
-      state.manifest = m2; renderManifest();
-      toast("manifest confirmed - it is now the authoritative input list");
-    } catch (e) { toast("confirm failed: " + e.message, true); }
-  });
+/* M7 PART 2: the unified preparation flow. ONE data location in; the
+   NATIVE NeoAG detector's answer reviewed; the human confirms (picking
+   among real candidates where genuinely ambiguous); the confirmed
+   manifest file is the single input source for planning AND execution.
+   No per-file fields, no engine choice, no mock substitution in this
+   flow - the simulation engine lives under Demo & developer controls. */
+const prep = { disc: null, manifest: null };
+
+function prepSetState(txt, cls) {
+  const el = $("prep-state");
+  el.textContent = txt;
+  el.className = "pill " + (cls || "muted");
 }
-async function refreshManifests() {
-  state.manifest = (state.manifest && state.manifest.id)
-    ? await api("GET", `/api/manifests/${state.manifest.id}`) : null;
-  renderManifest();
+function prepSetActions(hint, canPreview, canSubmit) {
+  $("prep-hint").textContent = hint;
+  $("nj-native-preview").disabled = !canPreview;
+  $("nj-submit").disabled = !canSubmit;
 }
 
-/* submit */
-$("nj-submit").addEventListener("click", async () => {
-  if (nativeEngineSel() === "native") {
-    /* M6 PART D1/D4: the GUI posts to the SAME unified /api/jobs
-       endpoint as the chat path - one Job ID either way. There is no
-       profile choice: a confirmed data-directory manifest IS the
-       request (backend derives every input from it), or the user
-       explicitly asks for the bundled synthetic demo. */
-    const body = { engine: "native" };
-    if ($("nj-n-demo").checked) {
-      body.synthetic_demo = true;
-      const sid = $("nj-n-case").value.trim();
-      if (sid) body.sample_id = sid;
-    } else {
-      const m = state.manifest;
-      if (!(m && m.status === "confirmed" && m.proposal
-            && m.proposal.kind === "native")) {
-        toast("first scan a data directory and confirm its manifest - " +
-              "the confirmed manifest is the run's input list (or tick " +
-              "the bundled synthetic demo)", true);
-        return;
-      }
-      body.manifest_id = m.id;
-      const sci = collectAdvanced();
-      const fwd = {};
-      // M6 PART E: exactly the verified science controls (and the three
-      // long-standing rows); each is re-validated server-side.
-      ["event_top_n", "candidate_top_n", "genome_build",
-       "rna_quant_method", "automatic_tool_policy",
-       "skip_dna_sv", "skip_bam_matcher"].forEach((k) => {
-        if (sci[k] !== undefined && sci[k] !== "") fwd[k] = sci[k];
-      });
-      if (Object.keys(fwd).length) body.native_params = fwd;
-    }
-    body.stub = $("nj-n-stub").checked;
-    try {
-      const res = await api("POST", "/api/jobs", body);
-      toast(`native job ${res.job_id} waiting for your approval ` +
-        "(Tasks panel above)");
-      await refreshJobs();
-    } catch (e) { toast("native submit failed: " + e.message, true); }
+$("prep-discover").addEventListener("click", async () => {
+  const data_dir = $("prep-dir").value.trim();
+  if (!data_dir) { toast("enter the sequencing data directory first", true); return; }
+  $("prep-flow").innerHTML =
+    '<div class="hint">inspecting the directory with the NeoAG detector ' +
+    "(read-only; VCFs and tables are read as the detector requires)...</div>";
+  prepSetState("discovering...", "warn");
+  prepSetActions("scanning", false, false);
+  loadNativeCap();
+  try {
+    const d = await api("POST", "/api/native/discover", { data_dir });
+    prep.disc = d; prep.manifest = null;
+    renderDiscovery(d);
+  } catch (e) {
+    $("prep-flow").innerHTML = `<div class="mnote warn"><b>Discovery ` +
+      `failed:</b> ${esc(e.message)}<br><span class="hint">nothing was ` +
+      `proposed from this directory, and no demo data was substituted.</span></div>`;
+    prepSetState("discovery failed", "danger");
+    prepSetActions("fix the path above and try again", false, false);
+  }
+});
+
+function renderDiscovery(d) {
+  const s = d.summary || {};
+  const amb = d.ambiguous || [];
+  const blocked = (d.missing || []).length > 0;
+  const pill = blocked ? '<span class="pill danger">blocked - see details</span>'
+    : amb.length ? '<span class="pill warn">needs one confirmation</span>'
+    : '<span class="pill ok">ready for native analysis</span>';
+  const list = (a) => (a && a.length) ? a.map(esc).join(" &middot; ") : "none found";
+  const ambHtml = amb.map((a) => (a.candidates || []).length ? `
+    <div class="pitem"><div><div class="pname">${esc(a.label || a.field)}</div>
+    <div class="pdesc">several candidates were found - pick one:</div></div>
+    <div>${(a.candidates || []).map((c) =>
+      `<label class="chk"><input type="radio" name="amb-${esc(a.field)}" ` +
+      `value="${esc(c)}"> <code>${esc(String(c).split("/").pop())}</code></label>`
+    ).join("")}</div></div>` : `
+    <div class="pitem"><div><div class="pname">${esc(a.label || a.field)}</div>
+    <div class="pdesc">${esc(a.reason || "the native scanner flagged this")}` +
+    ` - add or correct the file, then scan again</div></div></div>`).join("");
+  $("prep-flow").innerHTML = `<div class="manifest-card">
+    <div class="mnote"><b>Case ${esc(s.case_guess || "")}</b> ${pill}</div>
+    <div class="kv">
+      <div class="k">Sample identity</div><div>${esc(s.relationship ||
+        (s.tumor_sample_id ? "tumor sample " + s.tumor_sample_id +
+         " read from the data" :
+         "no paired-sample evidence yet - the directory name is used, " +
+         "rename it below if you like"))}</div>
+      <div class="k">DNA sequencing</div><div>${list(s.dna)}</div>
+      <div class="k">RNA sequencing</div><div>${list(s.rna)}</div>
+      <div class="k">Existing evidence</div><div>${list(s.evidence)}</div>
+      <div class="k">Ambiguous assignments</div><div>${amb.length ? amb.length + " - choose below" : "none"}</div>
+      <div class="k">Missing required data</div><div>${blocked ? (d.missing || []).length + " - blocking" : "none"}</div>
+      <div class="k">HLA</div><div>${esc(d.native_hla_note || "")}</div>
+    </div>
+    ${amb.length ? `<h3>Confirm which file to use</h3>${ambHtml}` : ""}
+    <details class="adv"><summary>Input details - the ${s.n_recognized || 0} recognized file(s) of ${s.n_files || 0} seen</summary>
+      <div class="tablewrap"><table class="data"><thead><tr><th>Role</th><th>File</th><th>State</th></tr></thead><tbody>
+      ${(d.inputs || []).map((i) => `<tr><td>${esc(i.role)}</td><td><code>${esc(i.path)}</code></td><td>${esc([i.status, i.bam_index && ("bam index " + i.bam_index)].filter(Boolean).join(", "))}</td></tr>`).join("")}
+      </tbody></table></div>
+      ${(d.routes || []).length ? `<p class="hint">Native routing from these inputs: ${(d.routes || []).map((r) => `<b>${esc(r.route)}</b> ${esc(r.status)}`).join(" &middot; ")}</p>` : ""}
+      ${blocked ? `<p class="hint">Blocking: <ul>${(d.missing || []).map((m) => `<li>${esc(m.field || "")}${m.field ? ": " : ""}${esc(m.reason || m)}</li>`).join("")}</ul></p>` : ""}
+      ${(d.warnings || []).length ? `<p class="hint">${(d.warnings || []).map(esc).join("<br>")}</p>` : ""}
+      ${(d.unmatched || []).length ? `<p class="hint">${d.unmatched.length} file(s) were not recognized as inputs and stay untouched: ${(d.unmatched || []).slice(0, 12).map((f) => `<code>${esc(f)}</code>`).join(" ")}${d.unmatched.length > 12 ? " ..." : ""}</p>` : ""}
+    </details>
+    <label class="lbl">Sample / case id for this run</label>
+    <input type="text" id="prep-sample" value="${esc(((s.tumor_sample_id || s.case_guess || "").replace(/_T$/i, "")).toUpperCase())}">
+    <div class="btnrow">
+      <button id="prep-confirm" class="btn primary" ${blocked ? "disabled" : ""}>Confirm these inputs</button>
+      <span class="hint">${blocked ? "resolve the blocking items first - a plan would fail honestly the same way" : "the confirmed manifest is reused by planning and execution - nothing will be asked again"}</span>
+    </div>
+  </div>`;
+  prepSetState(blocked ? "blocked" : (amb.length ? "review needed" : "inputs detected"),
+               blocked ? "danger" : (amb.length ? "warn" : "ok"));
+  prepSetActions(blocked ? "the detector reported what is missing - add it to the directory and re-scan"
+                         : "review the detected inputs, then confirm", false, false);
+  const cb = $("prep-confirm");
+  if (cb) cb.addEventListener("click", confirmInputs);
+}
+
+async function confirmInputs() {
+  const picked = {};
+  document.querySelectorAll("#prep-flow input[type=radio]:checked").forEach((r) => {
+    picked[r.name.replace(/^amb-/, "")] = r.value;
+  });
+  const unresolved = (prep.disc.ambiguous || [])
+    // only entries that actually offer candidate files can be picked;
+    // the rest are notes resolved by fixing the directory + re-scan
+    .filter((a) => (a.candidates || []).length && !picked[a.field])
+    .map((a) => a.label || a.field);
+  if (unresolved.length) {
+    toast("choose among the candidates for: " + unresolved.join(", "), true);
     return;
   }
-  const sample = $("nj-sample").value;
-  const stage_ids = [...document.querySelectorAll("[data-stage]")]
-    .filter((c) => c.checked).map((c) => c.dataset.stage);
-  const execution_mode = document.querySelector(
-    'input[name="execmode"]:checked').value;
-  const simulate_failure = $("nj-fail").checked;
-  const body = { sample_id: sample, stage_ids, mode: "auto",
-                 execution_mode, simulate_failure,
-                 kind: "analysis", requested_config: collectAdvanced() };
-  if (state.manifest && state.manifest.status === "confirmed")
-    body.manifest_id = state.manifest.id;
   try {
-    const res = await api("POST", "/api/jobs", body);
-    toast(`job ${res.job_id} waiting for your approval (Tasks panel above)`);
-    await refreshJobs();
-  } catch (e) { toast("submit failed: " + e.message, true); }
-});
-
-/* M5: engine selection + native controls (honest capability reporting) */
-let nativeCap = null;
-function nativeEngineSel() {
-  return (document.querySelector(
-    'input[name="njengine"]:checked') || {}).value || "mock";
+    const m = await api("POST", "/api/native/manifest", {
+      data_dir: prep.disc.data_dir,
+      sample_id: $("prep-sample").value.trim(),
+      picked });
+    prep.manifest = m;
+    renderConfirmed(m);
+    toast("manifest written - the planner and the runner both read this run's inputs from that single file");
+  } catch (e) { toast("could not write the manifest: " + e.message, true); }
 }
+
+function renderConfirmed(m) {
+  const p = m.proposal || {};
+  const old = $("confirmed-card");
+  if (old) old.remove();
+  const div = document.createElement("div");
+  div.id = "confirmed-card";
+  div.innerHTML = `<div class="manifest-card">
+    <div class="mnote"><span class="pill ok">confirmed</span> input manifest
+      <b>${esc(m.id)}</b> &middot; sample <b>${esc(p.sample_id || "")}</b>
+      &middot; ${(p.inputs || []).length} inputs &middot; native schema
+      open-neo-sample-v1</div>
+    <p class="hint">${esc(p.note || "")}</p>
+    <details class="adv"><summary>Confirmed input list</summary>
+      ${(p.inputs || []).map((i) => `<div><b>${esc(i.role)}</b>: <code>${esc(i.path)}</code></div>`).join("")}</details>
+  </div>`;
+  $("prep-flow").appendChild(div);
+  const c = $("prep-confirm");
+  if (c) { c.disabled = true; c.textContent = "Confirmed"; }
+  prepSetState("manifest confirmed", "ok");
+  prepSetActions("preview the native plan, or submit for approval", true, true);
+}
+
+/* native capability line (honest, cached) */
+let nativeCap = null;
 function renderNativeCap() {
   const host = $("native-cap");
   if (!nativeCap || !host) return;
@@ -900,27 +931,22 @@ function renderNativeCap() {
         ? "running (" + esc(String(nativeCap.gateway.url)) + ")"
         : "not running - started on demand at submission"}` +
       ` &middot; gateway cancel: ${nativeCap.cancel_supported_by_native_gateway ? "supported" : "NOT supported (verified limitation)"}`
-    : `<b>Native execution UNAVAILABLE on this host</b> - a native job ` +
-      `will fail honestly; the mock engine is never silently substituted`;
+    : `<b>Native execution UNAVAILABLE on this host</b> - discovery and ` +
+      `native jobs report the failure honestly; nothing is silently ` +
+      `substituted by the simulation engine`;
 }
 async function loadNativeCap() {
   if (nativeCap) { renderNativeCap(); return; }
-  $("native-cap").textContent = "checking native capability...";
+  const host = $("native-cap");
+  if (!host) return;
+  host.textContent = "checking native capability...";
   try { nativeCap = await api("GET", "/api/native/capability"); renderNativeCap(); }
-  catch (e) { $("native-cap").innerHTML = "capability check failed: " + esc(e.message); }
+  catch (e) { host.innerHTML = "capability check failed: " + esc(e.message); }
 }
-document.querySelectorAll('input[name="njengine"]').forEach((r) =>
-  r.addEventListener("change", () => {
-    const nat = nativeEngineSel() === "native";
-    $("native-box").classList.toggle("hidden", !nat);
-    $("mock-box").classList.toggle("hidden", nat);
-    if (nat) loadNativeCap();
-    applyDevMode();
-  }));
-$("nj-n-demo").addEventListener("change", () => applyDevMode());
-/* Demo/Developer mode gate (Milestone 5 PART 2 concern D): demo-only
-   controls are hidden until explicitly enabled, and stay off by
-   default in every fresh session (choice persisted per browser). */
+
+/* Demo/Developer mode gate (Milestone 5 PART 2 concern D): the
+   simulation engine and developer controls are hidden until explicitly
+   enabled, and stay off by default in every fresh session. */
 function devModeOn() {
   try { return localStorage.getItem("nj_devmode") === "1"; }
   catch (_) { return false; }
@@ -932,118 +958,124 @@ function applyDevMode() {
   $("dev-controls").classList.toggle("hidden", !on);
   if (!on) $("nj-fail").checked = false;
   const stubWrap = $("nj-stub-wrap");
-  const engNat = (document.querySelector(
-    'input[name="njengine"]:checked') || {}).value === "native";
-  const showStub = on && engNat && !$("nj-n-demo").checked;
-  stubWrap.style.display = showStub ? "" : "none";
-  if (!showStub) $("nj-n-stub").checked = false;
+  if (stubWrap) {
+    const showStub = on && !$("nj-n-demo").checked;
+    stubWrap.style.display = showStub ? "" : "none";
+    if (!showStub) $("nj-n-stub").checked = false;
+  }
 }
 $("devmode-toggle").addEventListener("change", (e) => {
   try { localStorage.setItem("nj_devmode", e.target.checked ? "1" : "0"); }
   catch (_) { /* storage unavailable: session-only toggle */ }
   applyDevMode();
 });
+$("nj-n-demo").addEventListener("change", () => applyDevMode());
 applyDevMode();
+
 function renderNativePlan(plan) {
-  const host = $("native-preview");
-  if (!host || !plan) return;
-  const steps = (plan.steps || []).map((s) =>
-    `<li><b>${esc(s.step_id || "")} ${esc(s.name || "")}</b> ` +
-    `<span class="pill ${s.status === "PASS" ? "ok"
-      : s.status === "SKIPPED" || s.status === "DRY_RUN" ? "muted"
-      : s.status === "FAILED" || s.status === "BLOCKED" ? "danger"
-      : "warn"}">${esc(s.status || "")}</span>` +
-    (s.detail ? ` <span class="hint">${esc(String(s.detail).slice(0, 140))}</span>` : "") +
+  let host = $("native-plan-view");
+  if (!host) {
+    host = document.createElement("div");
+    host.id = "native-plan-view";
+    $("prep-flow").appendChild(host);
+  }
+  if (!plan) return;
+  const steps = (plan.steps || []).map((st) =>
+    `<li><b>${esc(st.step_id || "")} ${esc(st.name || "")}</b> ` +
+    `<span class="pill ${st.status === "PASS" ? "ok"
+      : st.status === "SKIPPED" || st.status === "DRY_RUN" ? "muted"
+      : st.status === "FAILED" || st.status === "BLOCKED" ? "danger"
+      : "warn"}">${esc(st.status || "")}</span>` +
+    (st.detail ? ` <span class="hint">${esc(String(st.detail).slice(0, 140))}</span>` : "") +
     `</li>`).join("");
   host.innerHTML = `<div class="manifest-card">
     <div class="mnote ${plan.ok ? "" : "warn"}">native plan: <b>${esc(plan.status || plan.status_code || "?")}</b>${plan.run_id ? " &middot; run " + esc(plan.run_id) : ""}</div>
     ${steps ? `<ul>${steps}</ul>` : ""}
     ${plan.blocking_issues && plan.blocking_issues.length
       ? `<p class="hint">Blocking: ${plan.blocking_issues.map(esc).join(", ")}</p>` : ""}
+    ${plan.missing_evidence && plan.missing_evidence.length
+      ? `<p class="hint">Toolchain not installed for: ${plan.missing_evidence.map(esc).join(", ")} - the plan marks those steps BLOCKED honestly</p>` : ""}
     ${plan.detail ? `<p class="hint">${esc(plan.detail)}</p>` : ""}
     ${plan.run_plan_md ? `<details><summary class="hint">generated run plan (native markdown)</summary><pre class="tool-out">${esc(plan.run_plan_md)}</pre></details>` : ""}
   </div>`;
 }
+
 $("nj-native-preview").addEventListener("click", async () => {
-  const host = $("native-preview");
-  const m = state.manifest;
-  if (!($("nj-n-demo").checked) &&
-      !(m && m.status === "confirmed" && m.proposal
-        && m.proposal.kind === "native")) {
-    host.innerHTML = '<div class="mnote">scan a data directory and ' +
-      'confirm its manifest first - the preview plans exactly the ' +
-      'inputs you confirmed, nothing invented.</div>';
+  const m = prep.manifest;
+  if (!(m && m.status === "confirmed")) {
+    toast("confirm the detected inputs first - the preview plans exactly those inputs, nothing invented", true);
     return;
   }
-  host.innerHTML = '<div class="hint">running the REAL NeoAG planner (read-only, executes nothing)... this can take a minute</div>';
-  const body = { native_params: {} };
-  if (m && m.status === "confirmed" && m.proposal
-      && m.proposal.kind === "native") body.manifest_id = m.id;
+  let host = $("native-plan-view");
+  if (!host) {
+    host = document.createElement("div");
+    host.id = "native-plan-view";
+    $("prep-flow").appendChild(host);
+  }
+  host.innerHTML = '<div class="hint">running the REAL NeoAG planner on the confirmed manifest (read-only, executes nothing)... this can take a minute</div>';
   try {
-    const plan = await api("POST", "/api/jobs/native/preview", body);
+    const plan = await api("POST", "/api/jobs/native/preview", { manifest_id: m.id });
     renderNativePlan(plan);
   } catch (e) {
     host.innerHTML = `<div class="mnote warn">preview failed: ${esc(e.message)}</div>`;
   }
 });
-/* M6 D2: real input discovery -> manifest proposal (the user confirms;
-   the confirmed manifest is then the run's authoritative input) */
-$("nj-n-scan").addEventListener("click", async () => {
-  const data_dir = $("nj-n-dir").value.trim();
-  if (!data_dir.startsWith("/")) {
-    toast("give the absolute path of the data directory", true); return;
-  }
-  const host = $("native-discover");
-  host.innerHTML = '<div class="hint">scanning (file names only, read-only)...</div>';
-  try {
-    const d = await api("POST", "/api/native/discover", { data_dir });
-    state.discovery = d;
-    renderDiscovery(d);
-  } catch (e) {
-    host.innerHTML = `<div class="mnote warn">scan failed: ${esc(e.message)}</div>`;
-  }
-});
-function renderDiscovery(d) {
-  const host = $("native-discover");
-  if (!d || !d.exists) {
-    host.innerHTML = `<div class="mnote warn">${esc((d && d.error) || "directory not readable")}</div>`;
+
+/* submit: the GUI and the chat path post to the SAME /api/jobs endpoint
+   - one Job ID either way, registered in the unified task system. */
+$("nj-submit").addEventListener("click", async () => {
+  if (devModeOn() && $("nj-n-demo").checked) {
+    const body = { engine: "native", synthetic_demo: true,
+                   stub: $("nj-n-stub").checked };
+    const sid = ($("prep-sample") || {}).value;
+    if (sid) body.sample_id = sid;
+    try {
+      const res = await api("POST", "/api/jobs", body);
+      toast(`native synthetic-demo job ${res.job_id} waiting for your approval (Tasks panel above)`);
+      await refreshJobs();
+    } catch (e) { toast("native demo submit failed: " + e.message, true); }
     return;
   }
-  const row = (i) => `<tr><td><b>${esc(i.role)}</b></td>` +
-    `<td><code>${esc(i.path)}</code></td><td>${esc(String(i.confidence))}</td></tr>`;
-  const amb = (d.ambiguous || []).map((a) =>
-    `<li><code>${esc(typeof a === "string" ? a : a.file)}</code>${typeof a === "object" ? " - " + esc(a.reason) : ""}</li>`).join("");
-  const inf = (d.informational || []).map((a) =>
-    `<li><code>${esc(a.file)}</code> - ${esc(a.role)} (kept for the record, not forwarded)</li>`).join("");
-  const mis = (d.missing || []).map((x) => `<li>${esc(x)}</li>`).join("");
-  const notes = (d.notes || []).map((x) => `<li>${esc(x)}</li>`).join("");
-  host.innerHTML = `<div class="manifest-card">
-    <div class="mnote">found ${(d.inputs || []).length} input(s) among
-      ${esc(String(d.n_files_seen))} file(s)${d.capped ? " (scan capped)" : ""}${d.sample_guess ? " &middot; sample guess: <b>" + esc(d.sample_guess) + "</b>" : ""}</div>
-    ${(d.inputs || []).length ? `<div class="tablewrap"><table class="data">
-      <thead><tr><th>Role</th><th>Path</th><th>Conf.</th></tr></thead>
-      <tbody>${d.inputs.map(row).join("")}</tbody></table></div>`
-      : '<p class="hint">no recognised inputs in this directory</p>'}
-    ${mis ? `<p class="hint">Blocking: <ul>${mis}</ul></p>` : ""}
-    ${amb ? `<p class="hint">Ambiguous names (confirm or move them): <ul>${amb}</ul></p>` : ""}
-    ${inf ? `<p class="hint">Recorded, not forwarded: <ul>${inf}</ul></p>` : ""}
-    ${notes ? `<p class="hint">${notes}</p>` : ""}
-    ${d.unclassified && d.unclassified.length ? `<p class="hint">${d.unclassified.length} other file(s) not recognised (listed in the record)</p>` : ""}
-    <div class="btnrow">
-      <button id="nj-n-topropose" class="btn primary sm">Propose manifest from scan</button>
-      <span class="hint">you confirm the manifest - then it is the run's input list</span>
-    </div></div>`;
-  const btn = $("nj-n-topropose");
-  if (btn) btn.addEventListener("click", async () => {
-    try {
-      const m = await api("POST", "/api/native/manifest", {
-        data_dir: d.data_dir,
-        sample_id: $("nj-n-case").value.trim() || d.sample_guess || "" });
-      state.manifest = m; renderManifest();
-      toast("manifest proposed from the real scan - review and confirm it");
-    } catch (e) { toast("manifest proposal failed: " + e.message, true); }
+  const m = prep.manifest;
+  if (!(m && m.status === "confirmed")) {
+    toast("first discover the inputs and confirm them - the confirmed manifest is the run's input list", true);
+    return;
+  }
+  const body = { engine: "native", manifest_id: m.id,
+                 stub: $("nj-n-stub").checked };
+  const sci = collectAdvanced();
+  const fwd = {};
+  ["event_top_n", "candidate_top_n", "genome_build",
+   "rna_quant_method", "automatic_tool_policy",
+   "skip_dna_sv", "skip_bam_matcher"].forEach((k) => {
+    if (sci[k] !== undefined && sci[k] !== "") fwd[k] = sci[k];
   });
-}
+  if (Object.keys(fwd).length) body.native_params = fwd;
+  try {
+    const res = await api("POST", "/api/jobs", body);
+    toast(`native job ${res.job_id} waiting for your approval ` +
+      "(Tasks panel above) - this page stays usable while it runs");
+    await refreshJobs();
+  } catch (e) { toast("native submit failed: " + e.message, true); }
+});
+
+/* simulation engine (demo) submission - dev controls only */
+$("nj-submit-demo").addEventListener("click", async () => {
+  const sample = $("nj-sample").value;
+  const stage_ids = [...document.querySelectorAll("[data-stage]")]
+    .filter((c) => c.checked).map((c) => c.dataset.stage);
+  const execution_mode = document.querySelector(
+    'input[name="execmode"]:checked').value;
+  const body = { sample_id: sample, stage_ids, mode: "auto",
+                 execution_mode, simulate_failure: $("nj-fail").checked,
+                 kind: "analysis", requested_config: collectAdvanced(),
+                 requested_by: "user (simulation engine)" };
+  try {
+    const res = await api("POST", "/api/jobs", body);
+    toast(`simulated job ${res.job_id} waiting for your approval (demo engine)`);
+    await refreshJobs();
+  } catch (e) { toast("submit failed: " + e.message, true); }
+});
 
 /* attention strip: anything blocked on a human click */
 function renderAttention() {
@@ -1128,7 +1160,19 @@ function renderJobs() {
     `<div class="job-row" data-job="${esc(j.id)}">${jobRowHtml(j)}</div>`).join("")
     : `<div class="empty">No finished jobs yet.</div>`;
   document.querySelectorAll("[data-job]").forEach((el) =>
-    el.addEventListener("click", () => openJob(el.dataset.job)));
+    el.addEventListener("click", () => {
+      const id = el.dataset.job;
+      if (/^res-/.test(id)) {
+        // §1.2: research task row -> its report lives in the Discovery
+        // workspace; jump there instead of opening the job modal
+        const tab = document.querySelector(
+          '.wtab[data-view="discovery"]');
+        if (tab) tab.click();
+        showReport(id);
+        return;
+      }
+      openJob(id);
+    }));
 }
 
 document.querySelectorAll("#kind-filter .chip").forEach((c) =>
@@ -1261,7 +1305,10 @@ function candTable(rows) {
 }
 
 function renderResults() {
-  const done = (state.boot.jobs || []).filter((j) => j.state === "completed");
+  // research rows share the unified task list but have no run results -
+  // their report lives in the Discovery workspace
+  const done = (state.boot.jobs || []).filter((j) => j.state === "completed"
+                                              && !/^res-/.test(j.id));
   $("res-job").innerHTML = done.map((j) =>
     `<option value="${esc(j.id)}">${esc(j.id)} - ${esc(j.sample_id)}` +
     `${j.outcome ? " - " + esc(j.outcome) : ""}</option>`).join("");
@@ -1747,36 +1794,44 @@ async function refreshDiscovery() {
   } catch (e) { /* transient */ }
 }
 
-/* ---------------- skills (advisory instructions, PART C) -------------- */
+/* ---------------- skills (advisory instructions, M7 §5) ---------------
+ * Normal UI = name + instructions only. One Save validates, records a
+ * version and applies the skill for new chats; slug/category/frontmatter
+ * and deploy are generated or pinned by the backend. Version history and
+ * raw text live in a collapsed "Advanced" fold; rollback is there too. */
+function stripFrontmatter(t) {
+  const m = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/.exec(t || "");
+  return m ? t.slice(m[0].length).replace(/^\s+/, "") : (t || "");
+}
+
 function renderSkills() {
   const skills = state.boot.skills || [];
-  const cats = {};
-  for (const s of skills) (cats[s.category] = cats[s.category] || []).push(s);
-  $("skill-list").innerHTML = Object.entries(cats).map(([cat, rows]) => `
-    <h3 class="sec">${esc(cat)}</h3>
-    ${rows.map((s) => `
+  $("skill-list").innerHTML = skills.map((s) => `
     <div class="job-row skill-row" data-skill="${esc(s.slug)}">
       <div class="jr-top">
         <span class="jr-id">${esc(s.title || s.slug)}</span>
-        <span class="pill muted">v${esc(s.version)}</span>
         <span class="pill ${s.enabled ? "ok" : "muted"}">${s.enabled ? "enabled" : "disabled"}</span>
         <span class="pill ${s.active_in_new_sessions ? "accent" : "warn"}">${
-          s.active_in_new_sessions ? "deployed - new sessions"
-          : "not deployed (current version)"}</span>
+          !s.enabled ? "not loaded"
+          : s.active_in_new_sessions ? "applies to new chats"
+          : "saved - not applied yet"}</span>
       </div>
-      <div class="jr-meta hint">slug ${esc(s.slug)} · deployed v${esc(
-        s.deployed_version ?? "never")}${s.deployed_at ? " @ " + esc(s.deployed_at) : ""}</div>
+      <div class="jr-meta hint">${esc(s.description || "")}</div>
       <div class="btnrow">
         <button class="btn sm" data-sedit="${esc(s.slug)}">Edit</button>
-        <button class="btn sm" data-svers="${esc(s.slug)}">Versions</button>
-        <button class="btn sm" data-stest="${esc(s.slug)}">Test</button>
-        <button class="btn sm" data-sdep="${esc(s.slug)}">Deploy</button>
         <button class="btn sm ${s.enabled ? "danger" : ""}" data-stog="${esc(s.slug)}"
           data-on="${s.enabled ? "0" : "1"}">${s.enabled ? "Disable" : "Enable"}</button>
       </div>
-      <div class="skill-versions hidden" id="sv-${esc(s.slug)}"></div>
-      <div class="hint" id="st-${esc(s.slug)}"></div>
-    </div>`).join("")}`).join("") ||
+      <details class="skill-adv">
+        <summary>Advanced (version history, raw text)</summary>
+        <div class="btnrow">
+          <button class="btn sm ghost" data-svers="${esc(s.slug)}">Version history</button>
+          <button class="btn sm ghost" data-sraw="${esc(s.slug)}">Raw SKILL.md</button>
+        </div>
+        <div class="skill-versions hidden" id="sv-${esc(s.slug)}"></div>
+        <pre class="skill-raw hidden" id="raw-${esc(s.slug)}"></pre>
+      </details>
+    </div>`).join("") ||
     `<div class="empty">No skills yet.</div>`;
   const on = (attr, fn) => document.querySelectorAll(`[data-${attr}]`)
     .forEach((el) => el.addEventListener("click", (ev) => {
@@ -1784,27 +1839,14 @@ function renderSkills() {
   on("sedit", (el) => openSkillEditor(el.dataset.sedit));
   on("stog", async (el) => {
     try {
-      await api("POST", `/api/skills/${el.dataset.stog}/` +
+      const r = await api("POST", `/api/skills/${el.dataset.stog}/` +
         (el.dataset.on === "1" ? "enable" : "disable"), {});
+      const st = (r.deploy || {}).state || "";
+      toast(el.dataset.on === "1"
+        ? `${el.dataset.stog}: enabled - ${st || "applies to new chats"}`
+        : `${el.dataset.stog}: disabled - ${st || "will not load"}`);
       await refreshSkills();
     } catch (e) { toast("toggle failed: " + e.message, true); }
-  });
-  on("sdep", async (el) => {
-    try {
-      const r = await api("POST", `/api/skills/${el.dataset.sdep}/deploy`, {});
-      toast(`${el.dataset.sdep}: ` +
-        (r.results || []).map((x) => x.state).join(", "));
-      $("skill-deploy-note").textContent = r.activation_note || "";
-      await refreshSkills();
-    } catch (e) { toast("deploy failed: " + e.message, true); }
-  });
-  on("stest", async (el) => {
-    try {
-      const r = await api("POST", `/api/skills/${el.dataset.stest}/test`, {});
-      const host = $(`st-${el.dataset.stest}`);
-      host.classList.remove("hidden");
-      host.textContent = (r.valid ? "valid. " : "INVALID: " + r.errors.join("; ") + ". ") + r.note;
-    } catch (e) { toast("test failed: " + e.message, true); }
   });
   on("svers", async (el) => {
     const host = $(`sv-${el.dataset.svers}`);
@@ -1822,90 +1864,79 @@ function renderSkills() {
           try {
             await api("POST", `/api/skills/${b.dataset.srestore}/restore`,
                       { version: parseInt(b.dataset.ver, 10) });
-            toast(`restored v${b.dataset.ver} (saved as a NEW version)`);
+            toast(`restored v${b.dataset.ver} as a new version - applies to new chats`);
             await refreshSkills();
           } catch (e) { toast("restore failed: " + e.message, true); }
         }));
     } catch (e) { toast("versions failed: " + e.message, true); }
+  });
+  on("sraw", async (el) => {
+    const host = $(`raw-${el.dataset.sraw}`);
+    if (!host.classList.contains("hidden")) { host.classList.add("hidden"); return; }
+    try {
+      const d = await api("GET", `/api/skills/${el.dataset.sraw}`);
+      host.textContent = d.content;
+      host.classList.remove("hidden");
+    } catch (e) { toast("cannot load raw text: " + e.message, true); }
   });
 }
 
 async function refreshSkills() {
   try {
     const d = await api("GET", "/api/skills");
-    state.boot.skills = d.skills; state.boot.skillCategories = d.categories;
+    state.boot.skills = d.skills;
     renderSkills();
   } catch (e) { /* transient */ }
 }
 
 function openSkillEditor(slug) {
   const host = $("skill-editor");
-  const fill = async (s) => {
-    const cats = state.boot.skillCategories || [];
+  const fill = (s) => {
     host.innerHTML = `<div class="card">
       <div class="card-head"><h2>${s ? "Edit skill" : "New skill"}</h2></div>
-      <label class="lbl">Slug ${s ? "" : "(leave empty - generated from the title)"}</label>
-      <input id="sk-slug" value="${esc(s ? s.slug : "")}" ${s ? "disabled" : ""}>
-      <label class="lbl">Title</label>
-      <input id="sk-title" value="${esc(s ? s.title : "")}">
-      <label class="lbl">Category</label>
-      <select id="sk-cat">${cats.map((c) =>
-        `<option ${s && s.category === c ? "selected" : ""}>${esc(c)}</option>`).join("")}</select>
-      <label class="lbl">Content (SKILL.md - no need to write frontmatter: name/description are generated for you)</label>
-      <textarea id="sk-body" rows="14" spellcheck="false">${esc(s ? s.content :
-        "---\nname: my-skill\ndescription: one line about when this skill applies\n---\n\n# My skill\n\nWhat the agent should know or do.\n")}</textarea>
+      <label class="lbl">Name</label>
+      <input id="sk-name" value="${esc(s ? s.title : "")}"
+        placeholder="What is this skill called?">
+      <label class="lbl">Instructions</label>
+      <textarea id="sk-body" rows="14" spellcheck="false"
+        placeholder="What should the agent know or do differently? Write it in plain language - the agent reads this at the start of each new chat.">${esc(s ? stripFrontmatter(s.content) : "")}</textarea>
       <div class="btnrow">
         <button class="btn primary sm" id="sk-save">Save</button>
-        <button class="btn sm" id="sk-save-apply">Save &amp; apply to new sessions</button>
         <button class="btn ghost sm" id="sk-cancel">Cancel</button>
-        <span class="hint">Save records a version. "Save &amp; apply" also
-        deploys the file into the agent workspace so NEW chat sessions pick
-        it up (a live session keeps what it loaded). Skills are advisory -
-        the gate and policies stay enforced regardless.</span>
+        <span class="hint">Changes apply to new chats.</span>
       </div>
       <div id="sk-err" class="hint"></div></div>`;
-    $("sk-cancel").addEventListener("click", () => host.innerHTML = "");
-    const doSave = async (apply) => {
-      const body = { slug: $("sk-slug").value.trim(),
-                     title: $("sk-title").value.trim(),
-                     category: $("sk-cat").value,
-                     content: $("sk-body").value };
+    $("sk-cancel").addEventListener("click", () => { host.innerHTML = ""; });
+    $("sk-save").addEventListener("click", async () => {
+      const body = { name: $("sk-name").value.trim(),
+                     instructions: $("sk-body").value };
       try {
-        let saved;
-        if (s) saved = await api("POST", `/api/skills/${s.slug}/update`, body);
-        else saved = await api("POST", "/api/skills", body);
-        if (apply) {
-          const r = await api("POST", `/api/skills/${saved.slug}/deploy`, {});
-          const st = (r.results || [])[0] || {};
-          toast(st.state === "written"
-            ? `saved + deployed ${saved.slug} - active in NEW sessions`
-            : `saved, but deploy reported: ${st.state || "?"} ` +
-              `${st.error || ""}`.trim(), st.state !== "written");
+        const r = await api("POST",
+                            s ? `/api/skills/${s.slug}/update` : "/api/skills",
+                            body);
+        const st = (r.deploy || {}).state || "";
+        if (r.applied) {
+          toast(`saved v${r.skill.version} - changes apply to new chats`);
+        } else if (st.startsWith("disabled")) {
+          toast("saved - but the skill is disabled, so new chats will not " +
+                "load it. Press Enable to apply.", true);
         } else {
-          toast("saved (new version recorded)");
+          toast("saved, but applying failed: " + st + " " +
+                ((r.deploy || {}).error || ""), true);
         }
         host.innerHTML = "";
         await refreshSkills();
       } catch (e) {
-        $("sk-err").textContent = (e.data?.errors || [e.data?.error || e.message]).join("; ");
+        $("sk-err").textContent =
+          (e.data?.errors || [e.data?.error || e.message]).join("; ");
       }
-    };
-    $("sk-save").addEventListener("click", () => doSave(false));
-    $("sk-save-apply").addEventListener("click", () => doSave(true));
+    });
   };
   if (!slug) return fill(null);
   api("GET", `/api/skills/${slug}`).then(fill)
     .catch((e) => toast("cannot load skill: " + e.message, true));
 }
 $("skill-new").addEventListener("click", () => openSkillEditor(null));
-$("skill-deploy").addEventListener("click", async () => {
-  try {
-    const r = await api("POST", "/api/skills/deploy", {});
-    $("skill-deploy-note").textContent = r.activation_note || "";
-    toast((r.results || []).map((x) => `${x.slug}: ${x.state}`).join(" | "));
-    await refreshSkills();
-  } catch (e) { toast("deploy failed: " + e.message, true); }
-});
 
 /* ---------------- help ---------------- */
 function renderHelp() {

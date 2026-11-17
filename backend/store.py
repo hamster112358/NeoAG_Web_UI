@@ -697,7 +697,8 @@ class Store:
         with self.lock:
             rows = self.db.execute(
                 "SELECT id,created_at,finished_at,status,scope,target,engine,"
-                "conv_id FROM research ORDER BY created_at DESC LIMIT ?",
+                "conv_id,progress_json FROM research ORDER BY created_at "
+                "DESC LIMIT ?",
                 (limit,)).fetchall()
         return [dict(r) for r in rows]
 

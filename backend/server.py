@@ -101,6 +101,65 @@ def job_public(job: dict) -> dict:
 
 
 
+def research_task_rows(store) -> list[dict]:
+    """Milestone 7 §1/§9: a research run IS a formal background task.
+    These rows are DERIVED live from the research table (never a second
+    copy of the truth), so the unified task list, the official task
+    query API and the agent all see research with the same fields as
+    analyses."""
+    out = []
+    for r in store.research_list():
+        try:
+            prog = json.loads(r.get("progress_json") or "{}")
+        except ValueError:
+            prog = {}
+        state = {"queued": "queued", "running": "running",
+                 "completed": "completed",
+                 "cancelled": "cancelled"}.get(r["status"], "failed")
+        steps = prog.get("steps") or []
+        done = len(prog.get("done_queries") or [])
+        total = len(prog.get("queries") or [])
+        if state == "completed":
+            pct = 100
+        elif state == "queued":
+            pct = 0
+        elif total:
+            pct = min(95, int(90 * done / total))
+        else:
+            pct = min(30, 8 * len(steps))
+        outcome = ""
+        if state == "completed":
+            full = store.research_get(r["id"]) or {}
+            rep = full.get("report") or {}
+            outcome = ("decision_ready" if rep.get("decision_ready")
+                       else "preliminary")
+        err = ""
+        if state in ("failed", "cancelled"):
+            err = str(prog.get("note") or r["status"])[:120]
+        out.append({"id": r["id"], "created_at": r["created_at"],
+                    "updated_at": r.get("finished_at") or r["created_at"],
+                    "started_at": r["created_at"],
+                    "finished_at": r.get("finished_at"),
+                    "state": state, "kind": "discovery",
+                    "sample_id": f"research ({r.get('engine') or '?'})",
+                    "stage": f"{r['scope']} · "
+                             + (r.get("target") or "")[:48],
+                    "progress": pct, "error": err,
+                    "approval_id": None,
+                    "conv_id": r.get("conv_id") or "",
+                    "outcome": outcome, "spec": {}})
+    return out
+
+
+def unified_tasks(store, limit: int = 50) -> list[dict]:
+    """One chronological list: analyses + partial stages + research,
+    regardless of which interface started them (§1.2)."""
+    rows = [job_public(j) for j in store.job_list(200)]
+    rows += research_task_rows(store)
+    rows.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+    return rows[:limit]
+
+
 def task_detail(store, job: dict) -> dict:
     """Official task-query view of one formal run (B1): everything a user
     or the agent needs to answer 'what did this run do and what did it
@@ -398,7 +457,7 @@ class Handler(BaseHTTPRequestHandler):
                 "samples": SAMPLES, "stages": STAGES, "policies": POLICIES,
                 "conversations": convs, "active_conv": cid,
                 "messages": store.msg_list(400, cid) if cid else [],
-                "jobs": [job_public(j) for j in store.job_list(50)],
+                "jobs": unified_tasks(store, 50),
                 "approvals": store.approval_list(),
                 "decisions": store.decision_list(),
                 "research": store.research_list(),
@@ -534,9 +593,15 @@ class Handler(BaseHTTPRequestHandler):
             cid = (q.get("conv_id") or [None])[0]
             kinds = (q.get("kind") or [None])[0]
             lim = min(int((q.get("limit") or ["50"])[0]), 200)
-            rows = store.job_list(
-                lim, conv_id=cid,
-                kinds=[kinds] if kinds else None)
+            # §1/§9: research runs are part of the official task query
+            # too; the 'research' filter name is an alias for their
+            # 'discovery' kind.
+            rows = unified_tasks(store, 200)
+            if cid:
+                rows = [j for j in rows if j.get("conv_id") == cid]
+            if kinds:
+                want = {"research": "discovery"}.get(kinds, kinds)
+                rows = [j for j in rows if j["kind"] == want]
             return self._json(200, {
                 "tasks": [{"id": j["id"], "kind": j["kind"],
                            "state": j["state"], "outcome": j["outcome"],
@@ -545,14 +610,15 @@ class Handler(BaseHTTPRequestHandler):
                            "finished_at": j["finished_at"],
                            "conv_id": j["conv_id"],
                            "detail_url": f"/api/tasks/{j['id']}"}
-                          for j in rows]})
+                          for j in rows[:lim]]})
         if path == "/api/tasks/active":
             # B2: which run belongs to THIS conversation? Never guess the
             # most-recent job: no conv link -> empty list, not a fallback.
             cid = (q.get("conv_id") or [""])[0]
-            rows = [j for j in store.job_list(200, conv_id=cid or None)
+            rows = [j for j in unified_tasks(store, 200)
                     if j["state"] in ("queued", "running", "paused",
-                                      "blocked")]
+                                      "blocked")
+                    and ((j.get("conv_id") or None) == (cid or None))]
             return self._json(200, {"conv_id": cid,
                                     "tasks": [job_public(j)
                                               for j in rows]})
@@ -561,6 +627,25 @@ class Handler(BaseHTTPRequestHandler):
             jid = parts[2]
             job = store.job_get(jid)
             if not job:
+                rr = store.research_get(jid)
+                if rr:
+                    # research task detail: derived, honest about where
+                    # the full report and the event trail live
+                    row = next((x for x in research_task_rows(store)
+                                if x["id"] == jid), None) or {}
+                    prog = rr.get("progress") or {}
+                    return self._json(200, {
+                        **{k: row.get(k) for k in
+                           ("id", "kind", "state", "outcome", "sample_id",
+                            "created_at", "finished_at", "conv_id")},
+                        "research": True,
+                        "scope": rr["scope"],
+                        "engine": rr.get("engine"),
+                        "targets": prog.get("targets") or [],
+                        "steps": (prog.get("steps") or [])[-20:],
+                        "status_url": f"/api/research/{jid}",
+                        "events_url": f"/api/research/{jid}/events",
+                        "has_report": bool(rr.get("report"))})
                 return self._json(404, {"error": "no such task"})
             if len(parts) > 3 and parts[3] == "snapshot":
                 snap = store.snapshot_get(jid)
@@ -946,52 +1031,53 @@ class Handler(BaseHTTPRequestHandler):
                                  "sample_id": body.get("sample_id", "")})
                 return self._json(202, res)
             if path == "/api/native/discover":
-                # M6 D2: user names ONE data directory; this is the real
-                # read-only input discovery (file names only - contents
-                # are never read). Nothing is written anywhere except
-                # the audit row.
+                # M7 PART 2: ONE authorized directory in, the NATIVE
+                # NeoAG detector's answer out (routing.scan_input_directory
+                # + inventory + router, run in the native environment).
+                # Invalid/unauthorized directories fail clearly (400);
+                # nothing is ever fabricated or rerouted to a demo path.
                 ddir = str(body.get("data_dir") or "").strip()
-                if not ddir or not os.path.isabs(ddir):
-                    return self._json(400, {"error": "data_dir must be an "
-                                                     "absolute path"})
                 disc = native_mod.discover_inputs(ddir)
                 store.audit("user", "native.discover", "",
-                            {"data_dir": ddir,
+                            {"data_dir": ddir, "ok": disc.get("ok"),
                              "found": len(disc.get("inputs") or []),
                              "ambiguous": len(disc.get("ambiguous") or [])})
+                if not disc.get("ok"):
+                    return self._json(400, disc)
                 return self._json(200, disc)
             if path == "/api/native/manifest":
-                # discovery result -> proposed manifest for the human to
-                # confirm; the confirmed manifest becomes the run's
-                # authoritative input list
+                # the human's confirmation step: write the CONFIRMED
+                # manifest in the native open-neo-sample-v1 schema.
+                # Ambiguities are resolved by PICKING among the detected
+                # candidates (validated inside the scanned directory),
+                # never by free-path typing.
                 ddir = str(body.get("data_dir") or "").strip()
-                if not ddir or not os.path.isabs(ddir):
-                    return self._json(400, {"error": "data_dir must be an "
-                                                     "absolute path"})
-                disc = native_mod.discover_inputs(ddir)
-                if not disc.get("exists"):
-                    return self._json(400, {"error": disc.get(
-                        "error", "directory not readable")})
-                proposal = {
-                    "kind": "native", "mock": False,
-                    "note": ("derived from a real read-only scan of "
-                             f"{ddir} - file contents were never read"),
-                    "source_description": str(
-                        body.get("description") or f"data directory {ddir}")[:400],
-                    "sample_id": str(body.get("sample_id")
-                                     or disc.get("sample_guess") or ""),
-                    "data_dir": ddir,
-                    "inputs": disc.get("inputs") or [],
-                    "missing": disc.get("missing") or [],
-                    "ambiguous": disc.get("ambiguous") or [],
-                    "informational": disc.get("informational") or [],
-                    "notes": disc.get("notes") or []}
+                picked = body.get("picked") or {}
+                if not isinstance(picked, dict):
+                    return self._json(400, {"error": "picked must be an "
+                                                     "object"})
+                try:
+                    proposal = native_mod.write_native_manifest(
+                        ddir, str(body.get("sample_id") or ""),
+                        picked={str(k): str(v) for k, v in picked.items()})
+                except ValueError as e:
+                    return self._json(400, {"error": str(e)})
                 mid = new_id("man")
                 m = store.manifest_add(mid, proposal[
                     "source_description"], proposal)
-                store.audit("user", "manifest.propose.native", mid,
+                # M7 §2: THIS call is the human's confirmation step - the
+                # ambiguities above were resolved by picking real files.
+                # Recording it confirmed here is what makes the manifest
+                # the single source of truth: planning and execution
+                # receive this same record, never a re-entered copy.
+                m = store.manifest_set(mid, "confirmed", confirmed={
+                    "sample_id": proposal["sample_id"],
+                    "picked": picked,
+                    "method": "native discovery + human picks"}) or m
+                store.audit("user", "manifest.confirm.native", mid,
                             {"data_dir": ddir,
-                             "inputs": len(proposal["inputs"])})
+                             "inputs": len(proposal["inputs"]),
+                             "picked": len(picked)})
                 publish({"type": "manifest", "id": mid})
                 return self._json(201, m)
             if path == "/api/jobs/native/preview":
@@ -1164,34 +1250,18 @@ class Handler(BaseHTTPRequestHandler):
                                                  "unknown id)"})
             # ---------- skills (PART C: advisory instructions only) ----
             if path == "/api/skills":
-                title0 = str(body.get("title", "")).strip()
-                content0 = str(body.get("content", ""))
-                slug = str(body.get("slug", "")).strip()
-                # usability (M5 PART 3): slug derived from the title when
-                # omitted, mechanical frontmatter generated when missing -
-                # the author only writes the knowledge itself.
-                if not slug:
-                    slug = skills_mod.slugify(
-                        title0 or (content0.strip().splitlines()
-                                   or ["skill"])[0])
-                if content0.strip():
-                    content0 = skills_mod.autofrontmatter(slug, title0,
-                                                          content0)
-                errs = skills_mod.validate_skill(slug, content0, title0)
-                if errs:
-                    return self._json(400, {"errors": errs})
-                cat = str(body.get("category", ""))
-                if cat not in skills_mod.CATEGORIES:
-                    return self._json(400, {"error": "category must be one "
-                                       "of " + ", ".join(
-                                           skills_mod.CATEGORIES)})
-                if store.skill_get(slug, by_slug=True):
-                    return self._json(409, {"error": "slug already exists"})
-                s = store.skill_create(slug, slug, title0 or slug, cat,
-                                       content0)
-                store.audit("user", "skill.create", slug, {"category": cat})
+                # Milestone 7 §5: the author supplies name + instructions
+                # only. ONE Save validates, records a version, and writes
+                # the file so NEW chat sessions load it (title/content
+                # accepted as compatibility aliases).
+                r = skills_mod.save_and_apply(
+                    store,
+                    str(body.get("name", body.get("title", ""))),
+                    str(body.get("instructions", body.get("content", ""))))
+                if r.get("errors"):
+                    return self._json(400, {"errors": r["errors"]})
                 publish({"type": "skills_changed"})
-                return self._json(201, s)
+                return self._json(201, r)
             if path.startswith("/api/skills/deploy"):
                 res = skills_mod.deploy(store)
                 publish({"type": "skills_changed"})
@@ -1204,29 +1274,32 @@ class Handler(BaseHTTPRequestHandler):
                 if not s:
                     return self._json(404, {"error": "no such skill"})
                 if act == "update":
-                    content = str(body.get("content", ""))
-                    errs = skills_mod.validate_skill(slug, content,
-                                                     str(body.get("title",
-                                                                 "")))
-                    if errs:
-                        return self._json(400, {"errors": errs})
-                    cat = body.get("category")
-                    if cat is not None and cat not in \
-                            skills_mod.CATEGORIES:
-                        return self._json(400, {"error": "bad category"})
-                    s2 = store.skill_update(
-                        s["id"], content, "edited in Skills tab",
-                        title=str(body.get("title", "")) or None,
-                        category=cat)
-                    store.audit("user", "skill.update", slug,
-                                {"version": s2["version"]})
+                    # same single-Save chain as creation; the slug is
+                    # pinned to this skill so a renamed edit updates in
+                    # place instead of creating a second skill
+                    r = skills_mod.save_and_apply(
+                        store,
+                        str(body.get("name", body.get("title", ""))),
+                        str(body.get("instructions",
+                                     body.get("content", ""))),
+                        slug=slug)
+                    if r.get("errors"):
+                        return self._json(400, {"errors": r["errors"]})
                     publish({"type": "skills_changed"})
-                    return self._json(200, s2)
+                    return self._json(200, r)
                 if act in ("enable", "disable"):
                     s2 = store.skill_set_enabled(s["id"], act == "enable")
-                    store.audit("user", f"skill.{act}", slug, {})
+                    # §5: the toggle is the apply switch - re-run the
+                    # deploy for this skill so Enable writes the file and
+                    # Disable removes it (a stale file would still load)
+                    res = skills_mod.deploy(store, slug)
+                    store.audit("user", f"skill.{act}", slug,
+                                {"deploy": (res.get("results")
+                                            or [{}])[0].get("state")})
                     publish({"type": "skills_changed"})
-                    return self._json(200, s2)
+                    return self._json(200, {"skill": s2,
+                                            "deploy": (res.get("results")
+                                                       or [{}])[0]})
                 if act == "restore":
                     ver = body.get("version")
                     try:
@@ -1240,29 +1313,21 @@ class Handler(BaseHTTPRequestHandler):
                                                          f"version {ver}"})
                     s2 = store.skill_update(s["id"], content,
                                             f"restored from version {ver}")
+                    res = skills_mod.deploy(store, slug)
                     store.audit("user", "skill.restore", slug,
-                                {"from_version": ver})
+                                {"from_version": ver,
+                                 "deploy": (res.get("results")
+                                            or [{}])[0].get("state")})
                     publish({"type": "skills_changed"})
-                    return self._json(200, s2)
+                    return self._json(200, {"skill": s2,
+                                            "deploy": (res.get("results")
+                                                       or [{}])[0]})
                 if act == "deploy":
+                    # retained for scripted repair only - the normal UI
+                    # applies through Save/Enable (§5), no Deploy button
                     res = skills_mod.deploy(store, slug)
                     publish({"type": "skills_changed"})
                     return self._json(200 if res.get("ok") else 404, res)
-                if act == "test":
-                    # C1 "test": static validation + rendered check, honest
-                    # about what it does NOT check (no agent session run)
-                    errs = skills_mod.validate_skill(
-                        slug, s["content"], s["title"])
-                    return self._json(200, {
-                        "slug": slug, "valid": not errs,
-                        "errors": errs,
-                        "render_check": skills_mod.render_check(
-                            s["content"])[:12],
-                        "note": ("structural validation only: frontmatter, "
-                                 "slug, size. It does NOT run an agent "
-                                 "session; behaviour check = start a new "
-                                 "chat after deploy and ask the agent."),
-                    })
                 return self._json(404, {"error": "not found", "path": path})
             if path.startswith("/api/decisions/"):
                 d_id = path.strip("/").split("/")[2]

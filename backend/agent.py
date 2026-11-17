@@ -250,7 +250,11 @@ class DemoAgent:
             return self._conv.setdefault(
                 conv_id, {"job": None, "busy": False, "seen": set(),
                           "ops": set(), "replies": {}, "delivered": set(),
-                          "kick": None, "stop": False})
+                          "kick": None, "stop": False,
+                          # M7 §6 delivery repair: what this turn must
+                          # deliver, and whether it already got its one
+                          # automatic session-restore
+                          "text": "", "recovered": False})
 
     def stop_turn(self, conv_id: str) -> dict:
         """User-initiated interrupt of the CURRENT agent turn: set the
@@ -318,10 +322,13 @@ class DemoAgent:
         "starting open-ended tool exploration. The "
         "user's message follows.\n\n")
 
-    def handle_real(self, text: str, conv_id: str) -> list[dict]:
+    def handle_real(self, text: str, conv_id: str,
+                    recovering: bool = False) -> list[dict]:
         """Route one user turn to the conversation's real agent job
         (dispatch or multi-turn reply), then relay the real transcript
-        asynchronously ('chat' SSE events)."""
+        asynchronously ('chat' SSE events). recovering=True marks the
+        single automatic re-dispatch _turn performs after a delivery was
+        lost - it must not re-arm the recovery flag (no loops)."""
         try:
             client = self._ensure_client()
         except Exception as e:
@@ -339,20 +346,38 @@ class DemoAgent:
                 conv_id=conv_id)]
         conv = self.store.conv_get(conv_id) or {}
         job_id = conv.get("job_id")
+        # M7 §6 (delivered:false repair): "alive" is what the GATEWAY
+        # reports, and it is the precondition for a reply. A settled
+        # ("done") worker that is STILL ALIVE may legally be continued
+        # (verified multi-turn behaviour), so the gate is the gateway's
+        # alive boolean - not the turn state. A dead (alive=false) or
+        # stopped/failed record must never be replied to: the gateway
+        # would accept the text, nothing would process it, and the user
+        # message would silently disappear. Those take the session-
+        # restore path below.
         alive = False
         if job_id:
             d = client.job(job_id)
             alive = bool(d) and not d.get("unknown") and \
-                d.get("state") not in (None, "stopped", "failed")
+                bool(d.get("alive")) and \
+                d.get("state") not in ("stopped", "failed")
         had_prior_session = bool(job_id)
+        started = None
         try:
             if alive:
                 r = client.reply(job_id, text)
-                if not r.get("delivered"):
-                    raise RuntimeError(f"reply failed: "
-                                       f"{r.get('error') or r}")
-                started = "continued"
-            else:
+                if r.get("delivered"):
+                    started = "continued"
+                else:
+                    # worker died between the liveness check and the
+                    # reply (or refuses it): fall through to session
+                    # restore instead of surfacing a dead-end error
+                    self.store.audit("agent", "real.reply_refused",
+                                     conv_id,
+                                     {"job": job_id,
+                                      "err": str(r.get("error")
+                                                 or r)[:200]})
+            if started is None:
                 # durable-history recovery: rebuild context from saved
                 # messages, then dispatch a fresh job. The "previous
                 # session ended" notice is only honest when a real
@@ -374,7 +399,8 @@ class DemoAgent:
                 job_id = d.get("id")
                 self.store.conv_set_job(conv_id, job_id, "working")
                 self.store.audit("agent", "real.dispatch", conv_id,
-                                 {"job": job_id})
+                                 {"job": job_id,
+                                  "recovery": had_prior_session})
                 started = "started"
         except Exception as e:
             self.store.conv_set_job(conv_id, None, "error")
@@ -387,6 +413,9 @@ class DemoAgent:
         st["job"] = job_id
         st["busy"] = True
         st["stop"] = False
+        st["text"] = text
+        if not recovering:
+            st["recovered"] = False
         msgs = []
         if started == "started" and had_prior_session:
             # honest ONLY for a re-dispatch after a real session ended -
@@ -453,6 +482,33 @@ class DemoAgent:
         max_seconds = max_seconds or self.TURN_MAX_SECONDS
         t0 = time.time()
         errors = 0
+        dead_ticks = 0
+
+        def _recover(reason: str) -> bool:
+            """M7 §6: the reply never came back because the session died
+            (deploy / idle reclaim / gateway restart). Repair by session
+            restore EXACTLY ONCE per message - the user's message is
+            already saved, so re-dispatching it loses nothing - instead
+            of parking the chat on the turn timeout."""
+            if st.get("recovered") or not st.get("text"):
+                return False
+            st["recovered"] = True
+            self.store.audit("agent", "relay.session_lost", conv_id,
+                             {"job": job_id, "why": reason})
+            self._finish_turn(st, "session lost - recovering")
+            st["busy"] = False
+            try:
+                self.handle_real(st["text"], conv_id, recovering=True)
+            except Exception as e:  # dispatch failed: honest, no loop
+                self.store.msg_add(
+                    "agent",
+                    f"(The agent session was lost ({reason}) and the "
+                    f"automatic recovery could not start: {e}. Resend "
+                    "your message to try again.)",
+                    {"badges": ["real agent", "integration error"],
+                     "job_id": job_id}, conv_id)
+            publish({"type": "chat", "conv_id": conv_id})
+            return True
         try:
             if not st["seen"]:
                 # First relay since (re)start: replayed history of earlier
@@ -508,6 +564,20 @@ class DemoAgent:
                     self._finish_turn(st, "cancelled (user interrupt)")
                     publish({"type": "chat", "conv_id": conv_id})
                     return
+                # zombie guard (M7 §6): the gateway no longer has a live
+                # worker, yet the record still claims the job runs
+                # (deploy / reclaim left it behind). Do not wait out the
+                # turn timeout for events that can never arrive.
+                if not detail.get("unknown") and \
+                        not detail.get("alive") and \
+                        state not in ("done", "failed", "stopped"):
+                    dead_ticks += 1
+                    if dead_ticks >= 4 and _recover(
+                            f"worker gone while job still recorded "
+                            f"'{state}'"):
+                        return
+                else:
+                    dead_ticks = 0
                 for u in items:
                     kind = str(u.get("sessionUpdate") or "")
                     if kind in ("tool_call", "tool_call_update"):
@@ -558,6 +628,18 @@ class DemoAgent:
                              "source": "codebuddy", "job_id": job_id},
                             conv_id)
                         self._finish_turn(st, "completed")
+                    elif state == "done" and _recover(
+                            "job reached 'done' with no assistant reply"):
+                        # the delivered:false failure mode: the gateway
+                        # took our text, then died before answering -
+                        # restore the session and retry the message once
+                        # before declaring the turn lost. 'failed' and
+                        # 'stopped' do NOT recover: those are recorded
+                        # outcomes (a crashed job, or deliberate cancel
+                        # from Tasks/R7-style stop) - re-dispatching
+                        # them would duplicate work someone ended on
+                        # purpose; the honest terminal below stands.
+                        return
                     else:
                         live = str(detail.get("detail") or "")[:200]
                         label = {"done": "no reply recorded",
@@ -761,6 +843,10 @@ class DemoAgent:
             if not st["busy"]:
                 st["busy"] = True
                 st["job"] = job_id
+                # this relay carries a decision outcome, not a chat
+                # message - no automatic re-dispatch for it (the
+                # single-use grant would be the thing duplicated)
+                st["text"] = ""
                 kick = self.store.msg_add(
                     "agent",
                     f"Acting on your decision (job {str(job_id)[:8]}...) - "

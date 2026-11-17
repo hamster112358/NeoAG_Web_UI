@@ -209,6 +209,61 @@ def render_check(content: str) -> str:
     return hashlib.sha256((content or "").encode("utf-8")).hexdigest()
 
 
+def frontmatter_field(content: str, key: str) -> str:
+    """One value out of the YAML-ish frontmatter (first match)."""
+    body = (content or "").lstrip()
+    if not body.startswith("---"):
+        return ""
+    fm = body.split("---", 2)
+    if len(fm) < 3:
+        return ""
+    m = re.search(rf"^{key}:\s*(.+)$", fm[1], re.M)
+    return m.group(1).strip() if m else ""
+
+
+# Milestone 7 §5: the normal UI no longer asks for a category; skills
+# created through it carry this internal label.
+USER_CATEGORY = "User-authored"
+
+
+def save_and_apply(store, name: str, instructions: str,
+                   slug: str | None = None) -> dict:
+    """Milestone 7 §5: ONE Save does the whole apply chain -
+    derive slug, generate frontmatter, validate, record a version, and
+    write the file so NEW chat sessions load it. Returns
+    {skill, deploy, applied} or {errors: [...]} (nothing was written)."""
+    name = (name or "").strip()
+    if not name:
+        return {"errors": ["skill needs a name"]}
+    if not (instructions or "").strip():
+        return {"errors": ["skill needs instructions - what should the "
+                           "agent know or do differently?"]}
+    creating = slug is None
+    slug = slug or slugify(name)
+    content = autofrontmatter(slug, name, instructions)
+    errs = validate_skill(slug, content, name)
+    if errs:
+        return {"errors": errs}
+    existing = store.skill_get(slug, by_slug=True)
+    if creating and existing and (existing["title"] or "").lower() != \
+            name.lower():
+        return {"errors": [f"another skill already uses the id '{slug}' "
+                           f"(\"{existing['title']}\") - rename this one "
+                           "or edit the existing skill"]}
+    if existing:
+        s = store.skill_update(existing["id"], content,
+                               "saved in Skills tab", title=name)
+    else:
+        s = store.skill_create(slug, slug, name, USER_CATEGORY, content,
+                               source="created in Skills tab")
+    store.audit("user", "skill.save", slug, {"version": s["version"],
+                                             "new": creating})
+    dep = deploy(store, slug)
+    res = (dep.get("results") or [{}])[0]
+    return {"skill": s, "deploy": res,
+            "applied": res.get("state") == "written"}
+
+
 def ensure_seed_skills(store) -> list[str]:
     """Create the initial skill set ONCE (empty table only). Reuses the
     existing native playbook file for neoag-operations if present."""
@@ -255,8 +310,28 @@ def deploy(store, slug: str | None = None) -> dict:
     results = []
     for s in skills:
         if not s["enabled"]:
-            results.append({"slug": s["slug"], "state": "disabled - not "
-                            "deployed", "version": s["version"]})
+            # §5: "Disable" must be real - a stale SKILL.md left in the
+            # workspace would still load into new chats. Remove it.
+            removed = False
+            try:
+                p = pathlib.Path(SKILLS_DIR) / s["slug"] / "SKILL.md"
+                if p.exists():
+                    p.unlink()
+                    try:
+                        p.parent.rmdir()
+                    except OSError:
+                        pass  # dir holds files we did not write
+                    removed = True
+                store.skill_set_deployed(s["id"], None, None)
+            except Exception as e:
+                results.append({"slug": s["slug"], "state": "removal "
+                                "failed", "error": str(e)[:200]})
+                continue
+            results.append({"slug": s["slug"],
+                            "state": "disabled" + (" - deployed file "
+                                                   "removed" if removed
+                                                   else ""),
+                            "version": s["version"]})
             continue
         errs = validate_skill(s["slug"], s["content"], s["title"])
         if errs:
@@ -298,6 +373,9 @@ def activation_state(store) -> list[dict]:
                        s["deployed_hash"] == render_check(s["content"]))
         out.append({"id": s["id"], "slug": s["slug"], "name": s["name"],
                     "title": s["title"], "category": s["category"],
+                    "description": frontmatter_field(s["content"],
+                                                     "description")
+                    or s["title"],
                     "version": s["version"], "enabled": bool(s["enabled"]),
                     "deployed_version": s["deployed_version"],
                     "deployed_at": s["deployed_at"],

@@ -36,6 +36,12 @@ AUTH_HEADER = "Basic " + base64.b64encode(
 
 # ---------- isolated server (fresh db, own port, throwaway deploy dirs
 # so the live agent workspace's skills + task token are never touched) ----------
+# a previous run that was SIGKILLed can leave its DB behind: remove it
+# BEFORE spawning so "fresh workspace" is genuinely fresh
+try:
+    (ROOT / "data" / "batterytest.sqlite3").unlink()
+except OSError:
+    pass
 _srv = subprocess.Popen(
     [sys.executable, "-u", "-m", "backend.server"], cwd=str(ROOT),
     env=dict(os.environ, NEOAG_DEMO_DB="batterytest.sqlite3",
@@ -170,7 +176,9 @@ st, raw_js = get_raw("/static/app.js")
 js = raw_js.decode()
 check("2 app.js wired", all(k in js for k in
       ["renderJobs", "/api/decisions/", "/api/jobs/", "execution_mode",
-       "showReport", "/api/research", "agent_mode", "manifests"]))
+       "showReport", "/api/research", "agent_mode",
+       # M7: the unified preparation flow replaces the old manifests UI
+       "/api/native/discover", "/api/native/manifest"]))
 st, _ = get_raw("/static/styles.css")
 check("3 styles served", st == 200)
 
@@ -372,6 +380,13 @@ while time.time() - t0 < 20:
 check("28 targeted digest (stability) rows", rep2 and
       len(rep2["comparison"]) == 2 and
       any("POL-001" in (row.get("notes") or "") for row in rep2["comparison"]))
+
+# M7 §1.2/§9: research runs are FORMAL background tasks - they must be
+# in the official task query, not only in the research panel.
+_, tks28 = call("/api/tasks?kind=research")
+check("28b research runs appear in the unified task query",
+      any(t["id"].startswith("res-") and t["kind"] == "discovery"
+          for t in tks28.get("tasks", [])), str(tks28)[:160])
 
 # ---------- 9 SSE events flow ----------
 sse_events = []
@@ -903,51 +918,55 @@ def _status(path, body=None):
         return e.code
 
 
-st_bad1 = _status("/api/skills", {"slug": "gate.py", "category":
-                     skl["categories"][0], "content":
-                     "---\nname: gate.py\n---\nx"})
-st_bad2 = _status("/api/skills", {"slug": "no-fm", "category":
-                     skl["categories"][0], "content": "plain text"})
-st_bad3 = _status("/api/skills", {"slug": "valid-slug", "category":
-                     "nope", "content": "---\nname: valid-slug\n---\ny"})
-# 2026-11-16 (M5 PART 3): missing frontmatter is no longer refused - the
-# author writes knowledge, the backend auto-fills the frontmatter (the
-# acceptance side is check 99). Protected names and bad categories still 400.
-check("81 protected names / bad category refused; missing frontmatter now auto-completed",
-      st_bad1 == 400 and st_bad2 == 201 and st_bad3 == 400)
-_body1 = "---\nname: battery-probe\ndescription: t\n---\nbody one\n"
-_body2 = "---\nname: battery-probe\ndescription: t\n---\nbody two\n"
-st_mk, _ = call("/api/skills", {"slug": "battery-probe",
-                                "title": "Probe",
-                                "category": skl["categories"][0],
-                                "content": _body1})
-call("/api/skills/battery-probe/update", {"content": _body2})
+# M7 §5: the author supplies NAME + INSTRUCTIONS only; slug, category
+# and frontmatter are internal. ONE Save validates, versions and
+# applies the file for new chats; Disable really removes it again.
+st_bad1 = _status("/api/skills", {"name": "gate",
+                                  "instructions": "collision attempt"})
+st_bad2 = _status("/api/skills", {"name": "", "instructions": "x"})
+st_bad3 = _status("/api/skills", {"name": "Battery Probe NoFM",
+                                  "instructions": "plain text, no fm"})
+check("81 protected name + empty name refused; missing frontmatter "
+      "auto-completed",
+      st_bad1 == 400 and st_bad2 == 400 and st_bad3 == 201,
+      f"{st_bad1}/{st_bad2}/{st_bad3}")
+st_mk, mk82 = call("/api/skills", {"name": "Battery Probe",
+                                   "instructions": "body one"})
+check("82 ONE Save creates (name-derived slug) and applies it for "
+      "new chats",
+      st_mk == 201 and mk82.get("applied") and
+      mk82["skill"]["slug"] == "battery-probe" and
+      os.path.isfile("/tmp/neoag-battery-skills/battery-probe/SKILL.md"),
+      str(mk82)[:160])
+st_up, up83 = call("/api/skills/battery-probe/update",
+                   {"name": "Battery Probe", "instructions": "body two"})
+check("83 update bumps the version and re-applies in the same Save",
+      st_up == 200 and up83["skill"]["version"] == 2 and
+      up83.get("applied") and
+      "body two" in open("/tmp/neoag-battery-skills/battery-probe/"
+                         "SKILL.md").read(), str(up83)[:120])
 _, sv = call("/api/skills/battery-probe/versions")
-check("82 edit keeps full version history", st_mk == 201 and
+check("84 full version history is kept behind the single Save",
       len(sv.get("versions", [])) == 2, str(sv)[:120])
+st_dis, _d85 = call("/api/skills/battery-probe/disable", {})
+check("85 disable REMOVES the deployed file (new chats stop loading it)",
+      st_dis == 200 and not os.path.exists(
+          "/tmp/neoag-battery-skills/battery-probe/SKILL.md"),
+      str(_d85)[:120])
+st_en, _e85 = call("/api/skills/battery-probe/enable", {})
+check("85b enable re-applies the current version",
+      st_en == 200 and os.path.isfile(
+          "/tmp/neoag-battery-skills/battery-probe/SKILL.md"))
+st_tt = _status("/api/skills/battery-probe/test", {})
+check("85c the inert Test route is gone (§5: removed, not hidden)",
+      st_tt == 404, str(st_tt))
 st_rs, rs = call("/api/skills/battery-probe/restore", {"version": 1})
-check("83 restore re-applies v1 content AS A NEW version",
-      st_rs == 200 and rs["version"] == 3 and
-      rs["content"].rstrip().endswith("body one"), str(rs.get("version")))
-_, sk_now = call("/api/skills")
-probe = next(s for s in sk_now["skills"] if s["slug"] == "battery-probe")
-check("84 activation is honest: edited-but-not-deployed != active",
-      probe["active_in_new_sessions"] is False and
-      probe["deployed_version"] != probe["version"],
-      str({k: probe[k] for k in ("version", "deployed_version",
-                                 "active_in_new_sessions")}))
-st_dp, dep = call("/api/skills/battery-probe/deploy", {})
-_written = [r for r in dep.get("results", []) if r.get("state") == "written"]
-check("85 deploy writes inside the skills dir only + activation note "
-      "states NEW sessions",
-      st_dp == 200 and len(_written) == 1 and
-      _written[0]["path"].startswith("/tmp/neoag-battery-skills/") and
-      "NEW" in str(dep.get("activation_note", "")).upper(),
-      str(dep)[:160])
-on_disk_probe = open(
-    "/tmp/neoag-battery-skills/battery-probe/SKILL.md").read()
-check("86 deployed file content == saved skill content (byte-for-byte)",
-      on_disk_probe == _body1, "")
+_disk86 = open("/tmp/neoag-battery-skills/battery-probe/SKILL.md").read()
+check("86 restore re-applies v1 content AS A NEW version (file == "
+      "record)",
+      st_rs == 200 and rs["skill"]["version"] == 3 and
+      "body one" in _disk86 and "body two" not in _disk86,
+      str(rs.get("skill", {}).get("version")))
 
 # ---------- 87-95 Milestone-5 formal-job routing (PART 1, P0) ---------
 def _tokpost(path, obj, token=None, auth=False):
@@ -1111,23 +1130,21 @@ _ncli = sum(1 for g in pv96["groups"] for i in g["items"] if i.get("cli"))
 check("98 CLI mapping shown per option (only flags the code actually "
       "exposes)", _ncli >= 15, f"cli rows={_ncli}")
 
-# ---------- 99-102 Milestone-5 skills usability + dataset consent -----
+# ---------- 99-102 M7 §5 skills usability + dataset consent -----------
 st99a, sk99 = call("/api/skills", {
-    "title": "Battery Auto Slug Probe", "category": "NeoAG Operation",
-    "content": "Just the knowledge text - no frontmatter written."})
-check("99 skills usability: slug generated from title + frontmatter "
-      "auto-filled when absent (author writes only knowledge)",
-      st99a == 201 and sk99["slug"] == "battery-auto-slug-probe" and
-      sk99["content"].startswith("---") and
-      "name: battery-auto-slug-probe" in sk99["content"],
+    "name": "Battery Auto Slug Probe",
+    "instructions": "Just the knowledge text - no frontmatter written."})
+check("99 skills usability: slug generated from the name, frontmatter "
+      "auto-filled, and the SAME Save applies it for new chats",
+      st99a == 201 and
+      sk99["skill"]["slug"] == "battery-auto-slug-probe" and
+      sk99.get("applied") and
+      sk99["skill"]["content"].startswith("---") and
+      "name: battery-auto-slug-probe" in sk99["skill"]["content"],
       f"{st99a} {str(sk99)[:120]}")
-st99b, sk99d = call("/api/skills/battery-auto-slug-probe/deploy", {})
-_w = [r for r in sk99d.get("results", []) if r.get("state") == "written"]
-check("100 save+deploy is one click-able path (Save & Apply semantics)",
-      st99b == 200 and len(_w) == 1 and
+check("100 the applied file on disk == the saved record (byte-for-byte)",
       open("/tmp/neoag-battery-skills/battery-auto-slug-probe/"
-           "SKILL.md").read() == sk99["content"],
-      str(sk99d)[:120])
+           "SKILL.md").read() == sk99["skill"]["content"])
 _ds_cmd = ("wget -O /tmp/neoag-dl-consent-test/expr.h5ad "
            "https://figshare.com/ndownloader/files/12345")
 _gd = _gate.decide({"tool_name": "Bash",
@@ -1822,83 +1839,94 @@ check("130 M6 C limit_scope demands the scope text ('what will you "
       and _a129d.get("state") == "pending",
       f"{_sd129d} state={_a129d.get('state')} body={str(_bd129d)[:80]}")
 
-# ---- M6 PART D: unified native entry (one data directory) -----------
-import tempfile as _tf131
-_droot = _tf131.mkdtemp(prefix="m6batt-disc-")
-_case = os.path.join(_droot, "PAT-B1")
-for _sub, _names in (("fastq", ["P1_T_R1.fastq.gz", "P1_T_R2.fastq.gz",
-                                "P1_N_R1.fastq.gz"]),
-                     ("bam", ["tumor_WGS.bam", "normal_WGS.bam",
-                              "mystery.bam"]),
-                     ("vcf", ["somatic.mutect2.filtered.vcf.gz",
-                              "normal.gatk.vcf.gz"]),
-                     (None, ["rnaseq.gene_tpm.tsv"])):
-    _dd = _case if _sub is None else os.path.join(_case, _sub)
-    os.makedirs(_dd, exist_ok=True)
-    for _n in _names:
-        open(os.path.join(_dd, _n), "w").close()
-_s131, _p131 = call("/api/native/discover", {"data_dir": _case})
-_flags131 = {i["flag"]: i["path"] for i in _p131.get("inputs", [])
-             if i["flag"] not in ("tumor_dna_fastq", "normal_dna_fastq",
-                                  "tumor_rna_fastq", "sv_vcf")}
-_multi131 = {}
-for _i in _p131.get("inputs", []):
-    _multi131.setdefault(_i["flag"], []).append(
-        os.path.basename(_i["path"]))
-check("131 M6 D real input discovery from ONE data directory: roles map "
-      "onto real open-neo run flags (somatic VCF, tumor/normal BAM, "
-      "T/N FASTQ pairing, expression), an unnamed BAM surfaces as "
-      "AMBIGUOUS instead of a silent pick, a germline VCF is recorded "
-      "not forwarded, and the sample id is guessed from the directory",
-      _s131 == 200 and _p131.get("sample_guess") == "PAT-B1"
-      and "somatic_vcf" in _flags131
-      and _flags131.get("tumor_dna_bam", "").endswith("tumor_WGS.bam")
-      and _flags131.get("normal_dna_bam", "").endswith("normal_WGS.bam")
-      and sorted(_multi131.get("tumor_dna_fastq", [])) ==
-      ["P1_T_R1.fastq.gz", "P1_T_R2.fastq.gz"]
-      and _multi131.get("normal_dna_fastq") == ["P1_N_R1.fastq.gz"]
-      and _flags131.get("expression_tsv", "").endswith(
-          "rnaseq.gene_tpm.tsv")
-      and any("mystery.bam" in a["file"] for a in _p131.get(
-          "ambiguous", []))
-      and any("normal.gatk" in a["file"] for a in _p131.get(
-          "informational", []))
-      and _p131.get("missing") == [],
+# ---- M7 PART 2: ONE data directory -> NATIVE discovery -> confirmed
+# manifest -> unified submit, over synthetic-but-parseable fixtures
+# under an authorized input root (m7_fixtures, no patient data).
+sys.path.insert(0, str(ROOT / "tests"))
+import m7_fixtures as _m7fx
+_case_clean, _case_amb = _m7fx.ensure()
+_s131, _p131 = call("/api/native/discover", {"data_dir": str(_case_clean)})
+_flags131 = {i["flag"]: i["path"] for i in _p131.get("inputs", [])}
+_sum131 = _p131.get("summary") or {}
+check("131 M7 discovery over one data directory is the NATIVE scanner's "
+      "own answer: every recognized file carries a role + category, the "
+      "tumor/normal pair is read from the somatic VCF's genotype columns "
+      "(not filenames), routes come from native routing, and a clean "
+      "directory is READY with no invented ambiguity",
+      _s131 == 200 and _p131.get("ok")
+      and _p131["engine"]["detector"].startswith("neoag.open_neo.routing")
+      and {"tumor_dna_bam", "normal_dna_bam", "somatic_vcf", "hla_file"}
+      <= set(_flags131)
+      and all(i.get("role") and i.get("category")
+              for i in _p131.get("inputs", []))
+      and _sum131.get("tumor_sample_id") == "TEST001_T"
+      and _sum131.get("normal_sample_id") == "TEST001_N"
+      and _p131.get("ready") and _p131.get("routes")
+      and not _p131.get("ambiguous"),
       f"{_s131} {sorted(_flags131)}")
-_s132a, _p132m = call("/api/native/manifest", {"data_dir": _case})
+_s131b, _p131b = call("/api/native/discover",
+                      {"data_dir": str(_case_amb)})
+_amb131 = [a for a in _p131b.get("ambiguous", [])
+           if a.get("field") == "normal_dna_bam"]
+check("131b a genuine ambiguity (two candidate normal BAMs) comes back "
+      "as ONE structured choice listing EVERY real candidate - never a "
+      "silent pick, and never an alternative dropped by the parser",
+      _s131b == 200 and not _p131b.get("ready") and len(_amb131) == 1
+      and sorted(os.path.basename(c) for c in _amb131[0]["candidates"])
+      == ["test002_normal_dna_run1.bam", "test002_normal_dna_run2.bam"],
+      str([(a["field"], a["candidates"])
+           for a in _p131b.get("ambiguous", [])])[:160])
+_s131c = _status("/api/native/discover", {"data_dir": "/etc"})
+_s131d = _status("/api/native/discover", {"data_dir": "some/relative"})
+check("131c a directory outside the authorized roots and a relative "
+      "path fail with a clear 400 - nothing is scanned and nothing is "
+      "fabricated from an unreadable location",
+      _s131c == 400 and _s131d == 400, f"{_s131c}/{_s131d}")
+_pick132 = _amb131[0]["candidates"][0]
+_s132a, _p132m = _post("/api/native/manifest",
+                       {"data_dir": str(_case_amb),
+                        "sample_id": "TEST002",
+                        "picked": {"normal_dna_bam": _pick132}})
 _mid132 = _p132m.get("id", "")
-_prop132 = _p132m.get("proposal") or {}
+_mpath132 = (_p132m.get("proposal") or {}).get("manifest_path") or ""
+_mfile132 = (json.loads(pathlib.Path(_mpath132).read_text())
+             if _mpath132 and pathlib.Path(_mpath132).exists() else {})
 _s132b, _p132b = _post("/api/jobs", {"engine": "native",
-                                     "manifest_id": _mid132})
-_expr = _flags131.get("expression_tsv", "")
-_s132c, _p132c = call(f"/api/manifests/{_mid132}/confirm", {
-    "edits": {"removed": [_expr], "sample_id": "PAT-B1"}})
-_s132, _p132 = _post("/api/jobs", {"engine": "native",
-                                   "manifest_id": _mid132})
-_jid132 = _p132.get("job_id", "")
+                                     "manifest_id": _mid132,
+                                     "native_params":
+                                         {"event_top_n": 7}})
+_jid132 = _p132b.get("job_id", "")
 _c132 = _s3.connect(str(_db))
 _spec132 = json.loads(_c132.execute(
     "SELECT spec_json FROM jobs WHERE id=?", (_jid132,)).fetchone()[0])
 _mstat132 = _c132.execute("SELECT status FROM manifests WHERE id=?",
                           (_mid132,)).fetchone()[0]
 _c132.close()
-check("132 M6 D the CONFIRMED manifest is the authoritative input: an "
-      "unconfirmed manifest is refused (409), submission derives every "
-      "native param from the manifest (no profile chosen by the user), "
-      "an unticked input is REMOVED from the run, and the manifest ends "
-      "linked to the formal job",
-      _s132a == 201 and _prop132.get("kind") == "native"
-      and _s132b == 409
-      and _s132c == 200 and _p132c.get("status") == "confirmed"
-      and _s132 == 202
-      and _spec132.get("native_profile") == "gateway"
-      and _spec132["native_params"].get("somatic_vcf") == \
-      _flags131["somatic_vcf"]
-      and _spec132["native_params"].get("sample_id") == "PAT-B1"
-      and "expression_tsv" not in _spec132["native_params"]
-      and len(_spec132["native_params"].get("tumor_dna_fastq", [])) == 2
-      and _mstat132 == "linked",
-      f"{_s132a}/{_s132b}/{_s132} profile={_spec132.get('native_profile')}")
+# the confirmation gate stays real: an UNCONFIRMED manifest (the
+# agent-side proposal path) still cannot submit.
+_s132e, _p132e = _post("/api/manifests/propose",
+                       {"description": "battery probe proposal"})
+_s132f = _status("/api/jobs", {"engine": "native",
+                               "manifest_id": _p132e.get("id", "")})
+_np132 = _spec132.get("native_params") or {}
+check("132 M7 the confirmation step IS the single source of input "
+      "truth: /api/native/manifest writes the human-confirmed manifest "
+      "in the NATIVE open-neo-sample-v1 schema honoring the pick, "
+      "submission forwards THAT FILE (never re-derived inputs) plus the "
+      "recorded override, the manifest links to the formal job, and an "
+      "unconfirmed proposal is still refused (409)",
+      _s132a == 201 and _p132m.get("status") == "confirmed"
+      and _mfile132.get("schema_version") == "open-neo-sample-v1"
+      and _mfile132.get("sample_id") == "TEST002"
+      and _mfile132.get("inputs", {}).get("normal_dna_bam") == _pick132
+      and _s132b == 202
+      and _np132.get("sample_manifest") == _mpath132
+      and _np132.get("event_top_n") == 7
+      and _np132.get("sample_id") == "TEST002"
+      and _mstat132 == "linked"
+      and _s132e == 201 and _s132f == 409,
+      f"{_s132a}/{_s132b}/{_s132f} mstat={_mstat132} "
+      f"params={sorted(_np132)}")
 _s133a, _p133a = _post("/api/jobs/native/preview",
                        {"manifest_id": "man-does-not-exist"})
 _s133b, _p133b = _post("/api/jobs", {"engine": "native",

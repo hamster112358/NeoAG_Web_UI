@@ -105,6 +105,12 @@ _LIST_KEYS = ("tumor_dna_fastq", "normal_dna_fastq", "tumor_rna_fastq",
 # SCIENCE_CONTROLS for the user-facing statement of the same set).
 _SCIENTIFIC_KEYS = ("event_top_n", "candidate_top_n", "genome_build",
                     "automatic_tool_policy")
+# M7: the confirmed Manifest is the single source of input truth. Both
+# the native CLI (`--sample-manifest`, cli.py:140) and the gateway
+# `/open/run` ROUTE_SPECS list (gateway.py:113) carry `sample_manifest`
+# (verified against deployed source 2026-11-17), so the plan and execute
+# paths forward the manifest FILE rather than re-derived input fields.
+_MANIFEST_KEYS = ("sample_manifest",)
 
 # M6 PART E: server-side validation of every scientific override before
 # it can reach a run - the UI shows only constrained controls, and the
@@ -317,7 +323,7 @@ def build_plan_argv(params, outdir):
             "--case-id", str(params.get("case_id") or params.get("sample_id")),
             "--sample-id", str(params.get("sample_id")),
             "--genome-build", str(params.get("genome_build") or "GRCh38")]
-    for k in _INPUT_KEYS + _SCIENTIFIC_KEYS:
+    for k in _INPUT_KEYS + _SCIENTIFIC_KEYS + _MANIFEST_KEYS:
         v = params.get(k)
         if v in (None, "", []):
             continue
@@ -390,7 +396,7 @@ def build_execute_payload(params, outdir, stub=False, timeout=EXEC_TIMEOUT_DEFAU
                "doctor": False,
                "sync_public_assets": False,
                "timeout": int(timeout)}
-    for k in _INPUT_KEYS + _SCIENTIFIC_KEYS:
+    for k in _INPUT_KEYS + _SCIENTIFIC_KEYS + _MANIFEST_KEYS:
         v = params.get(k)
         if v in (None, "", []):
             continue
@@ -477,250 +483,344 @@ def tail_log(outdir, name="run_full.log", limit=4000):
 
 
 # --------------------------------------------------------------------------
-# M6 PART D2: real input discovery for the unified native entry. The
-# user names a data directory; this is a READ-ONLY scan of file NAMES
-# (contents are never read - patient data safety), mapping discovered
-# files onto the entry point's input roles. The proposal becomes the
-# manifest the human confirms; the manifest is then authoritative and
-# the native planner stays the authority on what can run (its --mode
-# plan pass is the honest preflight).
-_DISCOVER_MAX_FILES = 1500
-_DISCOVER_MAX_DEPTH = 3
-_SKIP_DIR_NAMES = (".git", "__pycache__", "node_modules", ".snakemake",
-                   ".nextflow")
+# M7 2.2/2.3: REAL input discovery, executed by NeoAG's OWN detector.
+# The user names ONE data directory; we invoke the deployed
+# neoag.open_neo.routing scanner + inventory + router in the native
+# environment (subprocess) - NOT a second web-layer input router. The
+# native detector classifies VCFs by CONTENT (SVTYPE header), tables by
+# HEADER GROUPS (fusion/splice/peptide) and HLA files by allele pattern;
+# the inventory reports existence, size, BAM-index presence, VCF
+# genotype-sample columns and detected genome builds; the router states
+# which branches are READY and what is missing/ambiguous. The proposal
+# becomes the manifest the human confirms; the CONFIRMED manifest is
+# written in the native open-neo-sample-v1 schema and passed to the
+# planner/executor as --sample-manifest (single source of input truth -
+# native precedence: manifest -> explicit CLI -> directory scan).
+AUTHORIZED_INPUT_ROOTS = [
+    os.path.realpath(r) for r in os.environ.get(
+        "NEOAG_INPUT_ROOTS", "/data1/neoag").split(os.pathsep) if r]
+
+_SCAN_SCRIPT = r"""
+import json, sys
+from pathlib import Path
+from neoag.open_neo import routing
+q = json.loads(sys.argv[1])
+root = Path(q["data_dir"]).resolve()
+if not root.is_dir():
+    print(json.dumps({"error": "not a directory or not readable: "
+                               + str(root)}))
+    raise SystemExit(0)
+detected, ambiguous, warnings = routing.scan_input_directory(
+    root, max_files=1000)
+matched = set()
+for v in detected.values():
+    for x in (v if isinstance(v, list) else [v]):
+        matched.add(str(Path(x).resolve()))
+n_files, unmatched = 0, []
+for f in sorted(p for p in root.rglob("*") if p.is_file()):
+    n_files += 1
+    if n_files > 1000:
+        warnings.append("listing capped at 1000 files")
+        break
+    if str(f.resolve()) not in matched and len(unmatched) < 80:
+        unmatched.append(str(f.relative_to(root)))
+inventory = routing.build_inventory(detected)
+routes, missing, ambiguous2, warnings2 = routing.route_inputs(detected)
+print(json.dumps({
+    "dir": str(root),
+    "detected": detected,
+    "ambiguous": ambiguous + ambiguous2,
+    "warnings": warnings + warnings2,
+    "inventory": inventory,
+    "routes": [{"route": r.route, "skill": r.skill, "status": r.status,
+                "reason": r.reason} for r in routes],
+    "missing": missing,
+    "n_files": n_files,
+    "unmatched": unmatched,
+}))
+"""
+
+_ROLE_LABEL = {
+    "tumor_dna_bam": ("Tumor DNA alignments", "sequencing_dna"),
+    "normal_dna_bam": ("Matched normal DNA alignments", "sequencing_dna"),
+    "tumor_dna_fastq": ("Tumor DNA reads", "sequencing_dna"),
+    "normal_dna_fastq": ("Matched normal DNA reads", "sequencing_dna"),
+    "tumor_rna_bam": ("RNA alignments", "sequencing_rna"),
+    "tumor_rna_fastq": ("RNA reads", "sequencing_rna"),
+    "somatic_vcf": ("Somatic variant calls", "processed_evidence"),
+    "sv_vcf": ("Structural variant calls", "processed_evidence"),
+    "fusion_tsv": ("Fusion caller table", "processed_evidence"),
+    "splice_junction_tsv": ("Splice junction table", "processed_evidence"),
+    "hla_file": ("HLA typing result", "processed_evidence"),
+    "peptide_csv": ("Existing peptide-HLA table", "processed_evidence"),
+    "expression_tsv": ("Gene expression table", "processed_evidence"),
+    "purity_tsv": ("Purity/ploidy table", "processed_evidence"),
+    "cnv_tsv": ("Copy-number segments", "processed_evidence"),
+    "hla_loh_tsv": ("HLA LOH evidence", "processed_evidence"),
+    "capture_bed": ("Capture kit BED", "processed_evidence"),
+}
+
+_VCF_KEY = {"input_key": "somatic_vcf"}
 
 
-def _toks(fn: str) -> str:
-    import re as _re
-    return _re.sub(r"[^a-z0-9*]+", " ", fn.lower())
+def authorized_dir(data_dir: str):
+    """Resolve + authorization-check a requested input directory.
+    Returns (real_path, error_string - empty when allowed)."""
+    if not data_dir or not os.path.isabs(data_dir):
+        return "", "an absolute directory path is required"
+    real = os.path.realpath(data_dir)
+    if not os.path.isdir(real):
+        return "", f"directory not found or not readable: {real}"
+    for root in AUTHORIZED_INPUT_ROOTS:
+        if real == root or real.startswith(root.rstrip(os.sep) + os.sep):
+            return real, ""
+    return "", ("not an authorized input location - input directories "
+                "must live under: " + ", ".join(AUTHORIZED_INPUT_ROOTS))
 
 
-def _modality(lc: str) -> str:
-    """tumor | normal | rna | unknown from filename words. Single-letter
-    T/N tokens (the classic T/N pairing convention) count; R1/R2 are read
-    numbers, never RNA. Human confirmation of the manifest is the safety
-    net for genuinely ambiguous names."""
-    words = [w for w in _toks(lc).split() if w]
-    if any(w in ("rna", "trna", "rnaseq", "rnaseq") or
-               (w.startswith("rna") and w != "rnaseq") for w in words):
-        return "rna"
-    if any(w in ("normal", "norm", "germline", "blood", "n", "ng")
-           for w in words):
-        return "normal"
-    if any(w in ("t", "tum", "tumor", "tumour", "tumort") for w in words) \
-            or "tumor" in lc or "tumour" in lc:
-        return "tumor"
-    return "unknown"
-
-
-def _classify_file(fn: str):
-    """Return (flag, role_label, confidence, basis) or a tuple with
-    flag in ('ambiguous', 'germline_vcf', None)."""
-    lc = fn.lower()
-    toks = " " + _toks(fn) + " "
-    tabular = lc.endswith((".tsv", ".csv", ".txt"))
-    is_fastq = lc.endswith((".fastq", ".fq", ".fastq.gz", ".fq.gz"))
-    is_vcf = lc.endswith((".vcf", ".vcf.gz"))
-    is_bam = lc.endswith((".bam", ".cram"))
-    if "fusion" in toks and tabular:
-        return ("fusion_tsv", "Fusion caller table", 0.9,
-                "fusion named tabular output")
-    if ("junction" in toks or "sj.out" in lc or "splice" in toks) \
-            and tabular:
-        return ("splice_junction_tsv", "Splice junction table", 0.85,
-                "junction-named tabular output")
-    if "loh" in toks and tabular:
-        return ("hla_loh_tsv", "HLA LOH evidence", 0.85,
-                "LOH-named tabular output")
-    if ("purity" in toks or "ploidy" in toks) and tabular:
-        return ("purity_tsv", "Purity/ploidy", 0.85,
-                "purity/ploidy-named table")
-    if any(w in toks for w in ("cnv", "sequenza", "facets", "segments",
-                               "purple")) and tabular:
-        return ("cnv_tsv", "Copy-number segments", 0.8,
-                "CNV-tool-named table")
-    if ("hla" in toks or "typing" in toks) and tabular:
-        return ("hla_file", "HLA typing result", 0.8,
-                "HLA-named tabular output")
-    if any(w in toks for w in ("expression", "tpm", "fpkm", "counts",
-                               "quant", "salmon", "rsem")) and tabular:
-        return ("expression_tsv", "Gene expression", 0.75,
-                "expression-named table")
-    if is_fastq:
-        mod = _modality(lc)
-        flag = {"tumor": "tumor_dna_fastq", "normal": "normal_dna_fastq",
-                "rna": "tumor_rna_fastq"}.get(mod)
-        if flag is None:
-            return ("ambiguous", f"FASTQ reads with no tumor/normal/RNA "
-                                 f"signal in the name", 0.4,
-                    "filename lacks modality hints")
-        return (flag, {"tumor_dna_fastq": "Tumor DNA reads",
-                       "normal_dna_fastq": "Normal DNA reads",
-                       "tumor_rna_fastq": "RNA reads"}[flag],
-                0.7, "fastq + modality name hint")
-    if is_bam:
-        mod = _modality(lc)
-        flag = {"tumor": "tumor_dna_bam", "normal": "normal_dna_bam",
-                "rna": "tumor_rna_bam"}.get(mod)
-        if flag is None:
-            return ("ambiguous", "alignment with no tumor/normal/RNA "
-                                 "signal in the name", 0.4,
-                    "filename lacks modality hints")
-        return (flag, {"tumor_dna_bam": "Tumor DNA alignments",
-                       "normal_dna_bam": "Normal DNA alignments",
-                       "tumor_rna_bam": "RNA alignments"}[flag],
-                0.8, "bam/cram + modality name hint")
-    if is_vcf:
-        if any(w in toks for w in ("sv", "structural", "delly", "manta",
-                                   "sopra")):
-            return ("sv_vcf", "Structural variant calls", 0.85,
-                    "SV-named VCF")
-        if any(w in toks for w in ("somatic", "tn", "snpindel", "mutect",
-                                   "strelka", "varscan", "msisensor",
-                                   "snpeff", "vep", "filtered",
-                                   "tumor")):
-            return ("somatic_vcf", "Somatic variant calls", 0.85,
-                    "somatic-caller-named VCF")
-        if any(w in toks for w in ("germline", "normal", "gatk hc",
-                                   "freebayes")):
-            return ("germline_vcf", "Germline VCF (informational)", 0.7,
-                    "germline-named VCF")
-        return ("ambiguous", "VCF with no somatic/germline/SV signal",
-                0.4, "filename lacks caller/modality hints")
-    if lc.endswith(".bed"):
-        return ("capture_bed", "Capture kit BED", 0.7, ".bed extension")
-    return (None, "", 0.0, "")
+def native_scan(data_dir: str) -> dict:
+    """Run NeoAG's OWN scanner/inventory/router over data_dir."""
+    real, err = authorized_dir(data_dir)
+    if err:
+        return {"ok": False, "error": err, "data_dir": data_dir}
+    cap = probe()
+    if not cap.get("available"):
+        return {"ok": False, "data_dir": real,
+                "error": ("native NeoAG is not importable on this host, "
+                          "and input discovery is performed BY the native "
+                          "detector by design - no web-layer substitute "
+                          "scan is offered. Capability probe: "
+                          + str(cap.get("import_error") or cap)[:300])}
+    try:
+        r = subprocess.run(
+            [NATIVE_PY, "-c", _SCAN_SCRIPT,
+             json.dumps({"data_dir": real})],
+            capture_output=True, text=True, timeout=180, env=_env(),
+            cwd=NATIVE_ROOT)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "data_dir": real,
+                "error": "native scan timed out after 180s"}
+    except Exception as exc:                           # noqa: BLE001
+        return {"ok": False, "data_dir": real,
+                "error": f"native scan could not run: {str(exc)[:300]}"}
+    try:
+        out = json.loads(r.stdout)
+    except ValueError:
+        return {"ok": False, "data_dir": real,
+                "error": "native scan produced no parseable result: "
+                         + (r.stderr or r.stdout)[-300:]}
+    if out.get("error"):
+        return {"ok": False, "data_dir": real, "error": out["error"]}
+    return {"ok": True, "data_dir": real, **out,
+            "engine": {"detector":
+                       "neoag.open_neo.routing.scan_input_directory",
+                       "root": NATIVE_ROOT,
+                       "note": "classification performed by the deployed "
+                               "NeoAG code itself (VCFs by content, "
+                               "tables by header, alleles by pattern)"}}
 
 
 def discover_inputs(data_dir: str) -> dict:
-    """Read-only discovery of native entry inputs under data_dir."""
-    out = {"data_dir": data_dir, "exists": False, "scanned_at": _now(),
-           "inputs": [], "ambiguous": [], "informational": [],
-           "unclassified": [], "missing": [], "notes": [],
-           "sample_guess": "", "n_files_seen": 0, "capped": False}
-    if not os.path.isdir(data_dir):
-        out["error"] = "not a directory or not readable"
-        return out
-    out["exists"] = True
-    base = os.path.abspath(data_dir)
-    stem = os.path.basename(base.rstrip("/"))
-    import re as _re
-    if _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{2,24}", stem or "") \
-            and stem.lower() not in ("data", "input", "inputs", "files",
-                                     "raw", "bam", "vcf", "fastq"):
-        out["sample_guess"] = stem
-    n = 0
-    capped = False
-    stack = [(base, 0)]
-    while stack:
-        d, depth = stack.pop()
-        if depth > _DISCOVER_MAX_DEPTH:
-            continue
-        try:
-            entries = sorted(os.listdir(d))
-        except OSError:
-            continue
-        for fn in entries:
-            p = os.path.join(d, fn)
-            if fn.startswith(".") and depth:
-                continue
-            if os.path.isdir(p):
-                if not os.path.islink(p) and fn not in _SKIP_DIR_NAMES:
-                    stack.append((p, depth + 1))
-                continue
-            n += 1
-            if n > _DISCOVER_MAX_FILES:
-                capped = True
-                break
-            flag, role, conf, basis = _classify_file(fn)
-            rel = os.path.relpath(p, base)
-            if flag is None:
-                if len(out["unclassified"]) < 60:
-                    out["unclassified"].append(rel)
-            elif flag == "ambiguous":
-                out["ambiguous"].append({"file": rel, "reason": role})
-            elif flag == "germline_vcf":
-                out["informational"].append(
-                    {"file": rel, "role": role,
-                     "note": "the unified entry consumes somatic calls; "
-                             "a germline VCF is recorded, not forwarded"})
-            else:
-                out["inputs"].append({"flag": flag, "role": role,
-                                      "path": p, "confidence": conf,
-                                      "basis": basis})
-        if capped:
-            break
-    out["n_files_seen"] = n
-    out["capped"] = capped
-    if capped:
-        out["notes"].append(f"scan stopped after {_DISCOVER_MAX_FILES} "
-                            "files - move the case's files into one "
-                            "flatter directory if inputs are missing")
-    got = {i["flag"] for i in out["inputs"]}
-    if not ({"somatic_vcf", "tumor_dna_bam", "tumor_dna_fastq"} & got):
-        out["missing"].append(
-            "no somatic variant calls AND no tumor DNA alignments/reads - "
-            "the entry needs at least one of somatic VCF, tumor DNA BAM "
-            "or tumor DNA FASTQ")
-    if "hla_file" not in got:
-        out["notes"].append(
-            "no HLA typing result found - HLA stays unset; the native "
-            "planner types HLA itself from DNA inputs when the toolchain "
-            "is installed, and its plan reports exactly what is missing")
-    if not ({"tumor_rna_bam", "tumor_rna_fastq"} & got):
-        out["notes"].append(
-            "no RNA inputs found - RNA-dependent branches (fusion, "
-            "splice, RNA evidence) will be skipped by the plan")
-    # deterministic order, and only the first file per single-valued flag
-    # is forwarded; additional candidates surface as ambiguity for the
-    # human - never a silent pick
-    first = {}
-    merged = []
-    for i in out["inputs"]:
-        if i["flag"] in _LIST_KEYS:
-            merged.append(i)
-            continue
-        if i["flag"] not in first:
-            first[i["flag"]] = i
-            merged.append(i)
+    """M7 presentation of the native scan: concise, non-expert-readable
+    summary + expandable details. Ambiguities come back as STRUCTURED
+    choices (field + candidates) for the confirmation step - the user
+    picks among real files, never retypes paths blind."""
+    raw = native_scan(data_dir)
+    if not raw.get("ok"):
+        return {"ok": False, "data_dir": data_dir,
+                "error": raw.get("error", "discovery failed")}
+    inv = {r["input_key"]: r for r in raw.get("inventory") or []}
+    inputs = []
+    for flag, value in sorted((raw.get("detected") or {}).items()):
+        label, cat = _ROLE_LABEL.get(flag, (flag, "processed_evidence"))
+        row = inv.get(flag) or {}
+        for path in (value if isinstance(value, list) else [value]):
+            inputs.append({"flag": flag, "role": label, "category": cat,
+                           "path": path,
+                           "status": row.get("status", ""),
+                           "size_bytes": row.get("size_bytes", 0),
+                           "bam_index": ("present" if row.get("bam_index")
+                                         else ("missing"
+                                               if path.endswith(".bam")
+                                               else ""))})
+    # tumor/normal relationship FROM EVIDENCE: the somatic VCF's
+    # genotype columns are the authority (native inventory read them).
+    vcf_row = inv.get("somatic_vcf") or {}
+    vcf_samples = [s for s in str(vcf_row.get("vcf_samples") or "").split(",")
+                   if s]
+    tumor_sid = normal_sid = ""
+    rel_note = ""
+    if len(vcf_samples) == 2:
+        t = [s for s in vcf_samples
+             if s.lower().endswith(("_t", "-t", "_tumor", "_tumour"))
+             or "tum" in s.lower()]
+        n = [s for s in vcf_samples if s not in t]
+        if len(t) == 1 and len(n) == 1:
+            tumor_sid, normal_sid = t[0], n[0]
+            rel_note = (f"paired tumor/normal samples {tumor_sid} / "
+                        f"{normal_sid} read from the somatic VCF "
+                        "genotype columns")
         else:
-            prev = first[i["flag"]]
-            out["ambiguous"].append(
-                {"file": i["path"],
-                 "reason": f"second candidate for "
-                           f"{prev['role'].lower()} "
-                           f"(kept: {os.path.basename(prev['path'])})"})
-    out["inputs"] = merged
-    return out
+            rel_note = ("the VCF carries two genotype samples ("
+                        + ", ".join(vcf_samples)
+                        + ") - which is the tumor needs one confirmation")
+    elif len(vcf_samples) == 1:
+        tumor_sid = vcf_samples[0]
+        rel_note = f"single genotype sample {tumor_sid} in the VCF"
+    ambiguous = []
+    for a in raw.get("ambiguous") or []:
+        field = str(a.get("field") or "")
+        reason = str(a.get("reason") or "")
+        # native formats the one pickable case as
+        # "multiple directory-scan candidates: p1;p2;..." - the FIRST
+        # path carries the prose prefix, so the prefix must be stripped
+        # before collecting (else the human is shown one option too few).
+        cands = []
+        for chunk in reason.split(";"):
+            chunk = chunk.strip()
+            if "candidates:" in chunk:
+                chunk = chunk.split("candidates:", 1)[1].strip()
+            if chunk.startswith("/"):
+                cands.append(chunk)
+        label = _ROLE_LABEL.get(field, (field,))[0]
+        ambiguous.append({"field": field, "label": label,
+                          "reason": reason, "candidates": cands})
+    if vcf_samples and not tumor_sid:
+        ambiguous.append({
+            "field": "tumor_sample_id", "label": "Which sample is the tumor?",
+            "reason": "two VCF samples, unclear which is tumor",
+            "candidates": vcf_samples})
+    dna = [i for i in inputs if i["category"] == "sequencing_dna"]
+    rna = [i for i in inputs if i["category"] == "sequencing_rna"]
+    ev = [i for i in inputs if i["category"] == "processed_evidence"]
+    routes = raw.get("routes") or []
+    ready = bool(routes) and not raw.get("missing") and not ambiguous
+    stem = os.path.basename(raw["data_dir"].rstrip("/"))
+    return {
+        "ok": True, "data_dir": raw["data_dir"], "scanned_at": _now(),
+        "engine": raw["engine"],
+        "summary": {
+            "case_guess": stem, "tumor_sample_id": tumor_sid,
+            "normal_sample_id": normal_sid, "relationship": rel_note,
+            "dna": [i["role"] for i in dna],
+            "rna": [i["role"] for i in rna],
+            "evidence": [i["role"] for i in ev],
+            "n_recognized": len(inputs), "n_files": raw.get("n_files", 0)},
+        "inputs": inputs, "ambiguous": ambiguous,
+        "missing": raw.get("missing") or [],
+        "warnings": raw.get("warnings") or [],
+        "routes": routes, "unmatched": raw.get("unmatched") or [],
+        "inventory": raw.get("inventory") or [],
+        "ready": ready,
+        "native_hla_note": (
+            "HLA alleles, if a typing result was found, are read by the "
+            "native code from that file - you never enter alleles "
+            "yourself" if any(i["flag"] == "hla_file" for i in inputs)
+            else "no HLA typing result found - the native planner types "
+                 "HLA itself from DNA inputs when the toolchain is "
+                 "installed, and its plan reports what it needs"),
+    }
+
+
+def write_native_manifest(data_dir: str, sample_id: str,
+                          picked: dict | None = None) -> dict:
+    """Confirmed manifest in the NATIVE open-neo-sample-v1 schema
+    (schema verified in deployed run.py / routing.normalize_manifest
+    2026-11-17). `picked` resolves structured ambiguities with the
+    human's choices {field: path}. The file lands in our scratch work
+    dir and is what the planner/executor receives via
+    --sample-manifest: one manifest, no re-entry anywhere later."""
+    raw = native_scan(data_dir)
+    if not raw.get("ok"):
+        raise ValueError(raw.get("error", "discovery failed"))
+    detected = dict(raw.get("detected") or {})
+    for field, path in (picked or {}).items():
+        if field in _ROLE_LABEL and isinstance(path, str) and path:
+            if not os.path.realpath(path).startswith(
+                    raw["data_dir"].rstrip(os.sep) + os.sep):
+                raise ValueError(
+                    f"choice for {field} is outside the scanned "
+                    "directory - re-scan instead of free-path entry")
+            detected[field] = path
+    if not detected:
+        raise ValueError("no recognizable inputs in "
+                         f"{raw['data_dir']} - nothing to manifest")
+    sid = str(sample_id or os.path.basename(
+        raw["data_dir"].rstrip("/")) or "CASE001")
+    vcf_row = next((r for r in raw.get("inventory") or []
+                    if r.get("input_key") == "somatic_vcf"), {})
+    vcf_samples = [s for s in str(vcf_row.get("vcf_samples") or "").split(",")
+                   if s]
+    tumor = next((s for s in vcf_samples if "tum" in s.lower()
+                  or s.lower().endswith(("_t", "-t"))), "")
+    normal = next((s for s in vcf_samples if s != tumor), "") \
+        if tumor and len(vcf_samples) == 2 else ""
+    data = {"schema_version": "open-neo-sample-v1",
+            "case_id": sid, "sample_id": sid,
+            "genome_build": "GRCh38",
+            "inputs": dict(detected),
+            "input_dir": raw["data_dir"]}
+    if tumor:
+        data["tumor_sample_id"] = tumor
+        data["inputs"]["tumor_sample_id"] = tumor
+    if normal:
+        data["normal_sample_id"] = normal
+        data["inputs"]["normal_sample_id"] = normal
+    os.makedirs(os.path.join(WORK, "manifests"), exist_ok=True)
+    path = os.path.join(WORK, "manifests",
+                        "sample_manifest.%s.json" % time.strftime("%Y%m%d%H%M%S"))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=1)
+    proposal = {
+        "kind": "native", "mock": False,
+        "note": ("inputs detected by the NATIVE NeoAG scanner over "
+                 f"{raw['data_dir']}; the confirmed manifest below is the "
+                 "single input source - planning and execution receive "
+                 "this file, never re-typed values"),
+        "source_description": f"data directory {raw['data_dir']}"[:400],
+        "sample_id": sid, "data_dir": raw["data_dir"],
+        "manifest_path": path,
+        "inputs": [{"flag": k, "role": _ROLE_LABEL.get(k, (k,))[0],
+                    "path": (v if isinstance(v, str) else ";".join(v))}
+                   for k, v in sorted(detected.items())],
+        "missing": raw.get("missing") or [],
+        "ambiguous": raw.get("ambiguous") or [],
+        "notes": raw.get("warnings") or []}
+    return proposal
 
 
 def params_from_manifest(manifest: dict) -> dict:
-    """Confirmed manifest -> native_params (manifest is authoritative;
-    this only maps what the human confirmed - removals and the final
-    sample_id from the confirmation step included - and adds nothing
-    the human did not see)."""
-    params = {}
+    """Confirmed manifest -> native params. The manifest FILE itself is
+    forwarded (--sample-manifest) - native reads the confirmed inputs
+    from it; we add only the case identity and the scanned directory
+    (for native's own QC cross-check). Nothing is re-derived here."""
     prop = manifest.get("proposal") or {}
     conf = manifest.get("confirmed") or {}
     if not isinstance(conf, dict):
         conf = {}
-    removed = {str(x) for x in (conf.get("removed") or [])}
-    inputs = [i for i in (prop.get("inputs") or [])
-              if i.get("path") not in removed]
-    for i in (conf.get("added") or []):
-        if isinstance(i, dict) and i.get("flag") and i.get("path"):
-            inputs.append(i)
-    for i in inputs:
-        flag, path = i.get("flag"), i.get("path")
-        if not flag or not path:
-            continue
-        if flag in _LIST_KEYS:
-            params.setdefault(flag, []).append(path)
-        else:
-            params.setdefault(flag, path)
     sid = str(conf.get("sample_id") or prop.get("sample_id") or "")
-    if sid:
-        params["sample_id"] = sid
+    params = {"sample_id": sid, "case_id": sid}
+    if prop.get("manifest_path") and os.path.exists(prop["manifest_path"]):
+        params["sample_manifest"] = prop["manifest_path"]
+    else:
+        # pre-M7 manifests (role flags inline): forward what the human
+        # confirmed, minus removals
+        removed = {str(x) for x in (conf.get("removed") or [])}
+        inputs = [i for i in (prop.get("inputs") or [])
+                  if i.get("path") not in removed]
+        for i in (conf.get("added") or []):
+            if isinstance(i, dict) and i.get("flag") and i.get("path"):
+                inputs.append(i)
+        for i in inputs:
+            flag, path = i.get("flag"), i.get("path")
+            if not flag or not path:
+                continue
+            if flag in _LIST_KEYS:
+                params.setdefault(flag, []).append(path)
+            else:
+                params.setdefault(flag, path)
+    if prop.get("data_dir"):
+        params["input_dir"] = prop["data_dir"]
     return params
 
 

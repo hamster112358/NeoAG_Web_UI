@@ -67,55 +67,37 @@
         <div class="card">
           <div class="card-head">
             <h2>Prepare an analysis</h2>
-            <span class="pill muted">demo engine</span>
+            <span class="pill muted" id="prep-state">no inputs yet</span>
           </div>
 
           <div class="block">
-            <label class="lbl">Sequencing data location</label>
-            <p class="hint">Tell us where the data live; we propose the manifest, you confirm it.</p>
-            <textarea id="man-desc" rows="2" placeholder="e.g. Sequencing data for case X are under /data/project-x - tumor DNA, matched normal DNA, and RNA-seq."></textarea>
+            <label class="lbl" for="prep-dir">Sequencing data location</label>
+            <p class="hint">One directory is enough. Tumor / normal DNA,
+              RNA and any already-processed evidence (variant calls, HLA
+              typing, fusion or junction tables) are recognized there by
+              the NeoAG detector itself - you will never enter BAM, VCF
+              or HLA values by hand, at this step or any later one.</p>
             <div class="btnrow">
-              <button id="man-propose" class="btn ghost">Propose manifest</button>
+              <input type="text" id="prep-dir" placeholder="/data/projects/case-042">
+              <button id="prep-discover" class="btn primary">Discover inputs / Prepare analysis</button>
             </div>
-            <div id="manifest-view"></div>
+            <div id="native-cap" class="mnote">checking native capability&hellip;</div>
+            <div id="prep-flow"></div>
           </div>
 
-          <details class="adv" open id="prep-details">
-            <summary>Engine, sample, stages and mode</summary>
-            <div class="block">
-              <label class="lbl">Execution engine (one task system, two real engines)</label>
-              <div class="mode-row" id="nj-engine-row">
-                <label class="mode-opt">
-                  <input type="radio" name="njengine" value="mock" checked>
-                  <div><b>Demo engine (mock)</b><span>seeded simulation for UI/workflow testing - clearly labelled, never real science</span></div>
-                </label>
-                <label class="mode-opt">
-                  <input type="radio" name="njengine" value="native">
-                  <div><b>Native NeoAG</b><span>the deployed NeoAG's own planner and runner decide the stages - real execution</span></div>
-                </label>
-              </div>
-              <div id="native-box" class="hidden">
-                <div id="native-cap" class="mnote">checking native capability&hellip;</div>
-                <label class="lbl">Data directory (absolute path)</label>
-                <p class="hint">One path is enough: NeoAG's own planner inspects what is there and decides which branches run. You will not be asked for VCF, BAM or HLA values twice.</p>
-                <input type="text" id="nj-n-dir" placeholder="/data/projects/case-042">
-                <label class="lbl">Sample / case id (optional)</label>
-                <input type="text" id="nj-n-case" placeholder="leave empty to take the name found by the scan">
-                <div class="btnrow">
-                  <button id="nj-n-scan" class="btn ghost">Scan directory (read-only)</button>
-                  <span class="hint">reads file names only; contents are never opened, nothing is copied</span>
-                </div>
-                <div id="native-discover"></div>
-                <label class="chk"><input type="checkbox" id="nj-n-demo"> Use the bundled synthetic demo instead - real pipeline code on the repo's own fixtures, predictors stubbed (no patient data, cancels cleanly)</label>
-                <label class="chk" id="nj-stub-wrap" style="display:none"><input type="checkbox" id="nj-n-stub"> stub predictor outputs (developer control - testing only, flagged in every record)</label>
-                <div class="btnrow">
-                  <button id="nj-native-preview" class="btn ghost">Preview native plan (read-only)</button>
-                  <span class="hint">runs the REAL NeoAG planner on your confirmed manifest; executes nothing</span>
-                </div>
-                <div id="native-preview"></div>
-                <p class="hint">One entry, one flow: data directory &rarr; input discovery &rarr; confirm the manifest &rarr; the native planner plans the stages &rarr; a background job after your approval. Native gateway jobs run outside this browser and cannot be cancelled once submitted (verified limitation) - the demo run can be cancelled.</p>
-              </div>
-              <div id="mock-box">
+          <details class="adv" id="sci-block">
+            <summary>Scientific configuration: <b id="sci-state">NeoAG defaults</b></summary>
+            <div id="cfg-science"></div>
+          </details>
+
+          <details class="adv" id="dev-block">
+            <summary>Demo &amp; developer controls</summary>
+            <label class="chk"><input type="checkbox" id="devmode-toggle"> Show demo &amp; developer controls</label>
+            <div id="dev-controls" class="hidden">
+              <p class="hint">Simulation engine: a seeded, clearly-labelled
+                mock run for UI/workflow testing only - never real science.
+                Native controls below run REAL NeoAG code on the bundled
+                synthetic fixtures.</p>
               <label class="lbl">Sample</label>
               <select id="nj-sample"></select>
               <label class="lbl">Stage plan</label>
@@ -131,35 +113,22 @@
                   <div><b>Autonomous</b><span>validated defaults applied on its own, every choice recorded</span></div>
                 </label>
               </div>
-              </div>
-            </div>
-          </details>
-
-          <details class="adv" id="adv-block">
-            <summary>Scientific configuration &amp; inputs <span id="adv-count" class="count"></span></summary>
-            <div id="cfg-inputs"></div>
-            <div id="cfg-science"></div>
-            <details class="adv" id="cfg-exec-block">
-              <summary>Execution &amp; environment (usually left unchanged)</summary>
-              <div id="cfg-exec"></div>
-            </details>
-            <div id="cfg-managed" class="hint"></div>
-            <p class="hint">Scientific controls are structured (fixed choices, bounded numbers, checkboxes), each cites the deployed code, is re-validated on the server and is forwarded to native execution; untouched controls forward nothing and the native defaults apply. The demo engine records requested values in the run snapshot without consuming them. Expert input overrides and execution/environment rows exist in the configured NeoAG code (each cites its file) but stay off by default - nothing here is a decorative placeholder.</p>
-          </details>
-
-          <details class="adv" id="dev-block">
-            <summary>Demo / developer controls</summary>
-            <label class="chk"><input type="checkbox" id="devmode-toggle"> Show demo &amp; developer controls</label>
-            <div id="dev-controls" class="hidden">
               <label class="chk"><input type="checkbox" id="nj-fail"> simulate missing stability tool (demo failure path - clearly labelled in the job)</label>
-              <p class="hint">Developer controls never change scientific results; they exercise demo paths only and are recorded in every artifact and report.</p>
+              <div class="btnrow"><button id="nj-submit-demo" class="btn sm">Submit simulated job (demo)</button></div>
+              <label class="chk"><input type="checkbox" id="nj-n-demo"> Native synthetic demo: real NeoAG pipeline code on the repo's own fixtures, predictors stubbed (no patient data, cancels cleanly)</label>
+              <label class="chk" id="nj-stub-wrap" style="display:none"><input type="checkbox" id="nj-n-stub"> stub predictor outputs (developer control - testing only, flagged in every record)</label>
             </div>
           </details>
 
-          <div class="btnrow">
-            <button id="nj-submit" class="btn primary">Submit for approval</button>
-            <span class="hint">Execute-class work always requires a human approval click (POL-005), in both modes.</span>
+          <div class="btnrow" id="prep-actions">
+            <button id="nj-native-preview" class="btn ghost" disabled>Preview native plan (read-only)</button>
+            <button id="nj-submit" class="btn primary" disabled>Submit for approval</button>
+            <span class="hint" id="prep-hint">enter the data directory above to begin</span>
           </div>
+          <p class="hint">Execute-class work always requires a human approval click (POL-005), in both modes.
+            The confirmed input manifest is the run's single input source: the native planner plans the
+            stages from it, and a background job runs after your approval (native gateway jobs cannot be
+            cancelled once submitted - verified limitation).</p>
         </div>
 
         <div class="card">
@@ -245,15 +214,14 @@
             <h2>Agent skills</h2>
             <span class="pill muted" id="skill-activation-note">advisory only</span>
           </div>
-          <p class="hint">Skills are <b>advisory instructions</b> the agent loads at the
-            start of a session. They cannot change the execution gate, the policies, the
+          <p class="hint">Skills are <b>advisory instructions</b> the agent loads when a
+            chat starts. They cannot change the execution gate, the policies, the
             thresholds or the approvals - those live elsewhere and stay enforced.
-            Deploying writes files into the agent workspace; only <b>new</b> agent
-            sessions pick them up.</p>
+            A saved skill is written for the agent automatically:
+            <b>changes apply to new chats</b>; a chat already in progress keeps what it
+            loaded.</p>
           <div class="btnrow">
             <button id="skill-new" class="btn ghost">New skill</button>
-            <button id="skill-deploy" class="btn primary">Deploy enabled skills</button>
-            <span id="skill-deploy-note" class="hint"></span>
           </div>
           <div id="skill-list"></div>
         </div>
