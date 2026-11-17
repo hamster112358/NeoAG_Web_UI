@@ -717,6 +717,16 @@ def _verify_candidate(n, target, citations, per_source, failures,
     _record(per_source, failures, queries_log, "bioconda",
             f"verify:{slug}", len(q_bc), e_bc, tid,
             skip_ok_error="not-on-bioconda")
+    # Bioconductor is the canonical registry for the R/Bioconductor
+    # tools this pipeline runs (PureCN, faCets, ...); its landing page
+    # carries the release version AND the project's GitHub link, which
+    # is the missing merge bridge for tools whose bioconda recipe is
+    # 'bioconductor-<name>' (measured 2026-11-17: PureCN stuck at one
+    # description axis)
+    q_bo, e_bo, _ = sources.bioconductor_package(base)
+    _record(per_source, failures, queries_log, "bioconductor",
+            f"verify:{base}", len(q_bo), e_bo, tid,
+            skip_ok_error="not-on-bioconductor")
 
     # A registry hit only counts as evidence about THIS candidate when
     # the record is actually named after it - never a topically near
@@ -730,6 +740,8 @@ def _verify_candidate(n, target, citations, per_source, failures,
           or base.lower() in (r.get("title") or "").lower()]
     bt = [r for r in q_bt if _about(r)]
     bc = [r for r in q_bc if (r.get("id") or "") == slug]
+    bo = [r for r in q_bo if (r.get("id") or "").lower() ==
+          base.lower()]
 
     # ---- citations naming this candidate (evidence sources) ----
     name_l = n["name"].lower()
@@ -828,7 +840,9 @@ def _verify_candidate(n, target, citations, per_source, failures,
                                        f"({c.get('id') or c.get('cid')})"})
     reg_hits = ([dict(r, source="bio.tools") for r in bt] +
                 [dict(r, source="bioconda") for r in bc] +
-                [dict(r, source="pypi") for r in py])
+                [dict(r, source="pypi") for r in py] +
+                [dict(r, source="bioconductor",
+                      home=(r.get("repo_url") or None)) for r in bo])
 
     def _probe(project, tool):
         full = str(project).replace("github.com/", "", 1)

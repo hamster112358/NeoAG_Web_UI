@@ -648,7 +648,8 @@ def _faked_sources():
         return [], "not-on-bioconda (fixture)", {}
 
     sources.anaconda_bioconda = _bc
-    sources.bioconductor_package = empty
+    sources.bioconductor_package = lambda s, n=1, **kw: (
+        [], "not-on-bioconductor (fixture)", {})
     sources.github_rate_limit = lambda: {"core": 50, "reset_utc": None}
     sources.github_releases_tags = lambda r: {
         "releases": ([{"tag": "v0.9.12", "prerelease": False}]

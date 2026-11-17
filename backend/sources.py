@@ -14,6 +14,8 @@ query, 15 s timeout) out of politeness to shared endpoints.
 """
 from __future__ import annotations
 
+import gzip
+import http.client
 import json
 import re
 import urllib.error
@@ -420,21 +422,46 @@ def bioconductor_package(name: str, max_results: int = 1):
     for repo in ("release", "devel"):
         url = (f"https://bioconductor.org/packages/{repo}/bioc/html/"
                f"{pkg}.html")
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=15) as r:
-                raw = r.read(40000).decode("utf-8", "replace")
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                last_err = "not-on-bioconductor"
-                continue
-            return [], f"HTTP {e.code}", {}
-        except Exception as e:
-            return [], f"{type(e).__name__}: {str(e)[:150]}", {}
+        raw = None
+        path = f"/packages/{repo}/bioc/html/{pkg}.html"
+        for attempt in (1, 2):  # bounded: one retry on a cold hang
+            # http.client + gzip, measured 2026-11-17: the CDN stalls
+            # urllib's default identity-encoded requests from this
+            # host (hangs at 15-28 s, twice reproduced) while
+            # compressed requests answer in ~4 s
+            try:
+                conn = http.client.HTTPSConnection("bioconductor.org",
+                                                   timeout=20)
+                conn.request("GET", path,
+                             headers={"User-Agent": UA,
+                                      "Accept": "*/*",
+                                      "Accept-Encoding": "gzip"})
+                resp = conn.getresponse()
+                body = resp.read(40000)
+                if "gzip" in str(resp.getheader("Content-Encoding")
+                                 or ""):
+                    body = gzip.decompress(body)
+                status = resp.status
+                conn.close()
+                if status == 404:
+                    last_err = "not-on-bioconductor"
+                    break
+                if status != 200:
+                    return [], f"HTTP {status}", {}
+                raw = body.decode("utf-8", "replace")
+                break
+            except Exception as e:
+                if attempt == 1:
+                    continue
+                return ([], f"{type(e).__name__}: {str(e)[:150]}", {})
+        if raw is None:
+            continue
         seen_any = True
-        # landing page carries e.g. "<b>Version:</b> 2.26.0"
-        m = re.search(r"Version:\s*(?:</?(?:b|strong|span|em)[^>]*>\s*)"
-                      r"*([0-9][\w.]+)", raw)
+        # landing page carries e.g. "<b>Version:</b> 2.26.0" (old
+        # layout) or a "<tr id=version>Version</td><td>2.18.0" row
+        # (astro redesign, measured 2026-11-17)
+        m = re.search(r"Version\s*:?\s*(?:<[^>]+>\s*)*([0-9][\w.]+)",
+                      raw)
         links = re.findall(r"https?://github\.com/[\w.\-]+/[\w.\-]+",
                            raw)
         return [_rec("bioconductor", pkg, url, pkg, None,
