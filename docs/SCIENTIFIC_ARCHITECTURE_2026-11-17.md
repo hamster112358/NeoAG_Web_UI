@@ -237,3 +237,39 @@ specific tool name; no UI/template redesign; no dataset downloads or
 pipeline execution without explicit consent; the production NeoAG
 pipeline and the frozen repo stay untouched; the evaluation corpus
 may not be built from the same heuristics it measures.
+
+---------------------------------------------------------------------------
+## 6. Implementation status (2026-11-17, engine live-retrieval-2026.11-m8-r1)
+
+Stages 1-10 are live in the retrieval path; the mapping to code:
+
+  S1 research.py _canon_cid + citation merge in run_live
+  S2 ontology.py     S3 identity.py      S5 baselines.py
+  S4 science.assess_relevance (state ladder + follow-ups)
+  S6 claims.py       S7 claimverify.py
+  S8 science.compare_measurements
+  S9 science.recommend_v2 / scientific_gates / decision_ready_v2
+  S10 research._live_report / _module_decision / _task_comparisons
+
+The stage prefixes S1..S9 from §1 were not adopted as function
+names; the contract lives in the dict shapes and in
+tests/verify_scientific.py (62 checks, offline, including a
+faked-source end-to-end run of the whole chain).
+
+Honest deltas against this document:
+
+- S1's `_s1_*` prefix: not used (same contracts, plain names).
+- §3 "may wait once when the GitHub reset is imminent": NOT
+  implemented - budget exhaustion is recorded as a budget-skipped
+  step with the reason, and the investigation stays open; no run
+  ever blocks on a wall-clock wait.
+- §3 query-budget priority ordering: implemented in the weaker form
+  - baseline tools resolve identity through the deployment channel
+  first (versions.resolve prefer=bioconda) and per-run caches
+  (version chain, identity, documents) prevent duplicate spend; the
+  full priority scheduler described above is not built.
+- §4 fact-class tags: carried inside each evidence row's
+  evidence_level string ("author-reported" / "independent claim,
+  confirmed|corrected|rejected") rather than as a separate
+  renderer-level tag; every comparison row additionally states its
+  comparability class and note.
