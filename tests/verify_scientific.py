@@ -565,6 +565,17 @@ _n1 = len([r for r in _rows1 if r.get("value")])
 chk("S6/S7 abstract of a paper whose full text is in hand counts "
     "ONCE (2026-11-17: rows duplicated via DOI + PMCID cids)",
     _n0 == 2 * _n1 and _n1 >= 2, (_n0, _n1))
+_DUP = _AB + " Repeating: CNVkit yielded 76.3% sensitivity and " \
+             "91.0% specificity on cohort A."
+_rows2, _log2 = _research._verified_measurements(
+    "CNVkit", [{"doc_cid": "d:dup", "kind": "fulltext", "text": _DUP,
+                "citation": {"title": "t"}}], {"cnvkit"})
+chk("S6/S7 the same claim twice inside ONE document yields one row, "
+    "the duplicate accounted for in the log",
+    len([r for r in _rows2 if r.get("value")]) == 2
+    and any("duplicate of the same claim" in str(x.get("verify_note"))
+            for x in _log2),
+    [r.get("value") for r in _rows2])
 
 # ------------------------------------------------------------- 7. E2E run_live
 REC_A = {"id": "epmc|A", "source": "europepmc",

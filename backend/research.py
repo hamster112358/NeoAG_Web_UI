@@ -638,7 +638,25 @@ def _verified_measurements(name, docs, known_names):
                     ctx.get("ground_truth") or ctx.get("modality")
                     or ctx.get("sample_design"))
                 rows.append(base)
-    return rows, log
+    # one claim, one row: the same (doc, subject, metric, value) may
+    # legitimately appear twice inside ONE document (PMC full text
+    # repeats its findings in prose and in the summary - measured
+    # 2026-11-17: PureCN's 19.3%/91.2% sentence produced two rows
+    # each); for comparisons that is still a single observation
+    seen_claims: set = set()
+    out_rows = []
+    for r in rows:
+        key = (r.get("doc_cid"), str(r.get("subject")).lower(),
+               r.get("metric"), r.get("value"))
+        if r.get("metric") and key in seen_claims:
+            log.append({**r, "excluded": True, "verify_note":
+                        "duplicate of the same claim within the same "
+                        "document - counted once"})
+            continue
+        if r.get("metric"):
+            seen_claims.add(key)
+        out_rows.append(r)
+    return out_rows, log
 
 
 def _evidence_rows(docs, verified):
