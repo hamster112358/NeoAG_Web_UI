@@ -576,6 +576,8 @@ def _verified_measurements(name, docs, known_names):
     for d in docs:
         if d.get("kind") not in ("citation-abstract", "fulltext"):
             continue
+        if d.get("superseded_by"):
+            continue  # same paper's full text already extracted once
         text = d.get("text") or ""
         if not text.strip():
             continue
@@ -648,6 +650,8 @@ def _evidence_rows(docs, verified):
     for d in docs:
         if d.get("kind") not in ("citation-abstract", "fulltext"):
             continue
+        if d.get("superseded_by"):
+            continue  # counted through the full text of the same paper
         cite = d.get("citation") or {"title": d["doc_cid"]}
         got = [r for r in verified if r["doc_cid"] == d["doc_cid"]]
         for r in got:
@@ -774,7 +778,8 @@ def _verify_candidate(n, target, citations, per_source, failures,
             ft["n"] -= 1
             xml, err = sources.pmc_fulltext(pcid)
             if xml:
-                docs.append({"doc_cid": f"pmc:{pcid.lower()}",
+                ft_cid = f"pmc:{pcid.lower()}"
+                docs.append({"doc_cid": ft_cid,
                              "kind": "fulltext",
                              "text": evidence.xml_to_text(xml),
                              "citation": {
@@ -783,6 +788,27 @@ def _verify_candidate(n, target, citations, per_source, failures,
                                         f"/articles/{pcid}/",
                                  "title": "full text (efetch db=pmc)",
                                  "year": None, "source": "ncbi-pmc"}})
+                # one physical paper must corroborate ONCE: when the
+                # full text of a paper is in hand, that same paper's
+                # abstract document (reached via its DOI cid, the
+                # full text via its PMCID cid) is textually a subset
+                # and is superseded for measurement extraction
+                # (measured 2026-11-17: every measurement of the
+                # diagnostics paper appeared twice, inflating the
+                # verified-pair count). Provenance is untouched - the
+                # abstract stays citable; extraction just does not
+                # count the same sentences twice.
+                for d in docs:
+                    if d.get("kind") != "citation-abstract" or \
+                            d.get("superseded_by"):
+                        continue
+                    for c in named_cits:
+                        if str(c.get("pmcid") or "").lower() == \
+                                pcid.lower() and \
+                                (c.get("cid") or _canon_cid(c)) == \
+                                d["doc_cid"]:
+                            d["superseded_by"] = ft_cid
+                            break
             else:
                 ft_note = f"full-text attempt failed: {err}"
 

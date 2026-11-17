@@ -545,6 +545,27 @@ chk("S1 virus token gets no eligibility claim",
     sc["eligibility"] == "insufficient information to classify"
     and not sc["comparable_for_replacement"], sc["eligibility"])
 
+# ------------------------------------ 6b. one paper corroborates ONCE
+from backend import research as _research  # noqa: E402
+
+_AB = ("BenchX benchmarks callers. CNVkit yielded 76.3% sensitivity "
+       "and 91.0% specificity on cohort A.")
+_FT = _AB + " No further results."
+_docs2 = [{"doc_cid": "10.3390/x", "kind": "citation-abstract",
+           "text": _AB, "citation": {"title": "t"}},
+          {"doc_cid": "pmc:pmc9", "kind": "fulltext",
+           "text": _FT, "citation": {"title": "t"}}]
+_rows0, _ = _research._verified_measurements("CNVkit", _docs2,
+                                             {"cnvkit"})
+_n0 = len([r for r in _rows0 if r.get("value")])
+_docs2[0]["superseded_by"] = "pmc:pmc9"
+_rows1, _ = _research._verified_measurements("CNVkit", _docs2,
+                                             {"cnvkit"})
+_n1 = len([r for r in _rows1 if r.get("value")])
+chk("S6/S7 abstract of a paper whose full text is in hand counts "
+    "ONCE (2026-11-17: rows duplicated via DOI + PMCID cids)",
+    _n0 == 2 * _n1 and _n1 >= 2, (_n0, _n1))
+
 # ------------------------------------------------------------- 7. E2E run_live
 REC_A = {"id": "epmc|A", "source": "europepmc",
          "doi": "10.1000/bench.2024", "pmcid": "",
