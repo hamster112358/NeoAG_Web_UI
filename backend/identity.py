@@ -63,6 +63,12 @@ def _norm_key(kind: str, ident: str) -> str:
     ident = (ident or "").strip().rstrip("/").lower()
     if ident.startswith("github.com/"):
         return "gh:" + ident[len("github.com/"):].split("#")[0]
+    if re.fullmatch(r"[a-z0-9-]+/[a-z0-9._~+-]+", ident):
+        # BARE owner/repo (the id a GitHub search record carries) is
+        # the same project as a registry's github.com/owner/repo link
+        # - without this the two routes never merge and a genuine
+        # two-axis identity reads as two one-axis projects
+        return "gh:" + ident.split("#")[0]
     if ident.startswith("pypi.org/project/"):
         return "pypi:" + ident.split("/project/", 1)[1]
     if ident.startswith("anaconda.org/"):

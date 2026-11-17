@@ -300,9 +300,18 @@ def extract_claims(text: str, *, doc_cid: str, level: str,
             subj, surf, sspan, owners = _clause_subject(seg,
                                                         known_names,
                                                         first_v)
+            # binding math is sentence-relative; the spans STORED on
+            # the claim are DOCUMENT-absolute (the verifier
+            # re-projects them onto the original text) - shift every
+            # span by the sentence offset s0
+            for m in mses:
+                for k in ("metric_span", "value_span", "ci_span"):
+                    if m.get(k):
+                        m[k] = [m[k][0] + s0, m[k][1] + s0]
             claim = Claim(
                 subject=subj, subject_surface=surf,
-                subject_span=[coff + sspan[0], coff + sspan[1]],
+                subject_span=[s0 + coff + sspan[0],
+                              s0 + coff + sspan[1]],
                 subjects_seen=sorted(owners),
                 ambiguous=bool(subj is None and len(owners) != 1),
                 quote=seg.strip()[:400],

@@ -24,19 +24,34 @@ import re
 import threading
 import time
 from collections import Counter
+from pathlib import Path
 
-from . import evidence, inventory, mock_data, science, sources, versions
+from . import (baselines, claims, claimverify, evidence, identity,
+               inventory, mock_data, ontology, science, sources, versions)
 from .store import Store, new_id, now
 from .mock_data import DEMO_DATASET_VERSION
 
-LIVE_ENGINE_VERSION = "live-retrieval-2026.11-m6-r1"
+LIVE_ENGINE_VERSION = "live-retrieval-2026.11-m8-r1"
 
 # M6 A9: the ONLY recommendations a module may receive (fixed
 # vocabulary, see backend/science.recommend for the evidence rules that
 # license each category). The old M5 vocabulary is retired because it
 # allowed "Consider candidate alternative" to coexist with "NO advantage
 # established" - a contradiction a reader had to reconcile alone.
-CONCLUSION_VOCABULARY = science.RECOMMENDATIONS
+CONCLUSION_VOCABULARY = science.RECOMMENDATION_LABELS_V2
+
+# M8 S4: the internal relevance relationship (assess_relevance output)
+# mapped onto the fixed eligibility vocabulary the report and UI use.
+# "irrelevant" is ONLY ever reached from a POSITIVE mismatch (see
+# science.assess_relevance); absence of vocabulary maps to
+# "insufficient information to classify" and keeps the row open.
+RELATIONSHIP_ELIGIBILITY = {
+    "direct-alternative": "direct alternative",
+    "complementary": "complementary method",
+    "wrapper": "wrapper/integration (not an independent algorithm)",
+    "unrelated": "irrelevant",
+    "unresolved": "insufficient information to classify",
+}
 
 AVAILABILITY = ("open-source | freely available with restrictions | "
                 "license-required | commercial | unavailable | unclear")
@@ -287,6 +302,8 @@ def run_live(rid, scope, targets, store, resume):
              else ""), prog,
           {"github_budget": budget})
     vcache, ft_budget = {}, {"n": 6}  # per-run chain cache + full-text cap
+    icache = {}          # per-run identity-record cache
+    followup_budget = {"n": 10}  # investigation follow-up queries per run
     def _attempted_ids():
         """targets that had at least one retrieval query (fresh or
         persisted) - what a stopped run may honestly claim as reached"""
@@ -364,13 +381,16 @@ def run_live(rid, scope, targets, store, resume):
             if not (rec.get("id") or rec.get("url")):
                 no_id_excluded += 1
                 continue
-            citations.append({**rec, "targets": [tid]})
+            citations.append({**rec, "targets": [tid],
+                              "cid": _canon_cid(rec)})
+    cid_keys = {c["cid"] for c in citations}
     _step(store, publish, rid,
           f"dedup: {dedup_removed} duplicate records removed; "
           f"{len(citations)} unique citations kept "
           f"({no_id_excluded} without resolvable id excluded)", prog)
 
     candidates = []
+    row_docs = {}  # run-scope: candidate name -> retrieved document set
     done_targets = set()  # targets whose full candidate work completed
     for target in resolved_targets:
         if cancelled():
@@ -378,6 +398,10 @@ def run_live(rid, scope, targets, store, resume):
         tid = target["id"]
         inv_stage = stages_by_id.get(tid) or {}
         prof = science.profile_for(tid, target.get("label") or "")
+        task = ontology.task_for(tid)
+        baseline_tool_names = [b["name"] for b in
+                               (inv_stage.get("baseline") or {}).get(
+                                   "tools") or []]
         # M6 A3/A4: candidate names come FIRST from the identified
         # baseline (current tools, never treated as alternatives) and
         # from tool identities extracted from the retrieved literature;
@@ -434,12 +458,36 @@ def run_live(rid, scope, targets, store, resume):
                                   failures, queries_log, done, store,
                                   publish, rid, vcache=vcache,
                                   budget=budget, ft=ft_budget,
-                                  profile=prof)
+                                  task=task,
+                                  known_names=[x["name"] for x in uniq],
+                                  baseline_names=baseline_tool_names,
+                                  icache=icache)
+            row_docs[c["name"].lower()] = c.pop("_docs", None) or []
             candidates.append(c)
             _step(store, publish, rid,
-                  f"[{tid}] {c['name']}: eligibility -> "
-                  f"{c['eligibility']} ({'; '.join(c['eligibility_reasons'])[:140]})",
+                  f"[{tid}] {c['name']}: {c['eligibility']} "
+                  f"(identity {c['identity_status']}, state "
+                  f"{c['research_state']}) - "
+                  f"{'; '.join(c['eligibility_reasons'])[:140]}",
                   prog, {})
+        # ---- M8 investigation loop: bounded deepening pass. Rows
+        # with recorded follow-up queries get those queries EXECUTED
+        # within the run budget; literature naming the candidate
+        # grows its document set, claims are re-verified and the
+        # relevance verdict + research-state ladder are RE-DERIVED
+        # from the grown evidence. Skips (budget) are recorded. ----
+        for c in [x for x in candidates
+                  if x["task"] == target["label"]
+                  and x.get("followups_open")]:
+            if cancelled():
+                break
+            _deepen_candidate(c, target, citations, per_source,
+                              failures, queries_log, done, cid_keys,
+                              store, publish, rid, budget=budget,
+                              fb=followup_budget, task=task, prof=prof,
+                              known_names=[x["name"] for x in uniq],
+                              baseline_names=baseline_tool_names,
+                              docs_by_name=row_docs)
         done_targets.add(tid)
     if cancelled():
         # a cancel after candidate work still publishes what was
@@ -473,15 +521,180 @@ def run_live(rid, scope, targets, store, resume):
     publish({"type": "research", "id": rid})
 
 
+# ---------------------------------------------------------------------------
+# M8 integration helpers (S3 identity attribution, S6 claim extraction,
+# S7 independent verification). All deterministic over ALREADY-RETRIEVED
+# text; no network, no model.
+# ---------------------------------------------------------------------------
+
+def _canon_cid(c: dict) -> str:
+    """One canonical id per paper (DOI > PMCID > PMID > arXiv > id >
+    normalised title): the doc_cid for claim extraction, the key for
+    provenance accounting and for follow-up dedup."""
+    for k, pfx in (("doi", ""), ("pmcid", ""), ("pmid", "pmid:"),
+                   ("arxiv", "arxiv:")):
+        v = str(c.get(k) or "").strip().lower()
+        if v:
+            return pfx + v
+    cid = str(c.get("cid") or c.get("id") or "").strip().lower()
+    if cid:
+        return cid
+    return "title:" + _norm_title(c.get("title") or "")
+
+
+def _record_agrees_domain(task, rec) -> bool:
+    """A NAME-EXACT registry record can still denote a different
+    project (PyPI's `purple` is a color library, not the PURPLE CNV
+    caller). A record may carry claims for this candidate only when
+    its own description speaks the task's domain vocabulary, or says
+    too little to contradict (PART 1.3: names never merge evidence)."""
+    if not task:
+        return True
+    desc = str(rec.get("description") or rec.get("summary") or "")
+    if not desc.strip():
+        return True  # no description: nothing contradicts the identity
+    return bool(ontology.match_domain(task, desc))
+
+
+def _same_subject(subj, name) -> bool:
+    s = str(subj or "").strip().lower()
+    n = str(name or "").strip().lower()
+    return bool(s) and bool(n) and (s == n or n in s or s in n)
+
+
+def _verified_measurements(name, docs, known_names):
+    """S6 + S7 per document: extract claims with exact spans, then let
+    the INDEPENDENT verifier re-parse those spans from the original
+    text. Returns (rows, log): rows are measurements that CONFIRMED as
+    this candidate's (or were CORRECTED to it, with the verifier's
+    corrected metric/subject applied); every rejected measurement,
+    unresolved binding and foreign-attribution result goes into the
+    log, which the candidate row carries verbatim - rejected items are
+    accounted for, never silently dropped, and never used (PART 1.5
+    fix: attribution errors die at the verifier, not in the report)."""
+    rows, log = [], []
+    for d in docs:
+        if d.get("kind") not in ("citation-abstract", "fulltext"):
+            continue
+        text = d.get("text") or ""
+        if not text.strip():
+            continue
+        cl = claims.extract_claims(text, doc_cid=d["doc_cid"],
+                                   level=d.get("kind"),
+                                   known_names=known_names)
+        verd = claimverify.verify_claims(text, cl, known_names)
+        ctx = claims.extract_context(text)
+        cite = d.get("citation") or {"title": d["doc_cid"]}
+        author = ("author-reported" if name.lower()
+                  in str(cite.get("title") or "").lower()
+                  else "independent")
+        for c, v in zip(cl, verd):
+            for m, mv in zip(c.get("measurements", []),
+                             v["measurement_verdicts"]):
+                subj = c.get("subject")
+                metric = m.get("metric")
+                if mv["verdict"] == "correct":
+                    subj = mv.get("found_subject") or subj
+                    metric = mv.get("found_metric") or metric
+                base = {
+                    "metric": metric, "value": m.get("value"),
+                    "ci": m.get("ci"), "quote": c.get("quote"),
+                    "quote_span": c.get("quote_span"),
+                    "value_span": m.get("value_span"),
+                    "doc_cid": c.get("doc_cid"),
+                    "binding": m.get("binding"),
+                    "verified": mv["verdict"],
+                    "verify_note": mv.get("note", ""),
+                    "subject": subj, "citation": cite,
+                    "context": dict(ctx),
+                    "dataset": "not stated by source",
+                    "tested_version": "not stated by source",
+                    "evidence_level": f"{d['kind']}: {author} claim, "
+                                      f"{mv['verdict']}"}
+                if mv["verdict"] == "reject":
+                    base["excluded"] = True
+                    log.append(base)
+                    continue
+                if metric is None:
+                    base["excluded"] = True
+                    base["verify_note"] = ((base["verify_note"] + "; ")
+                                           if base["verify_note"] else
+                                           "") + ("metric unresolved - "
+                                                  "ambiguous binding, "
+                                                  "excluded from every "
+                                                  "comparison")
+                    log.append(base)
+                    continue
+                if not _same_subject(subj, name):
+                    base["excluded"] = True
+                    base["verify_note"] = (f"measurement belongs to "
+                                           f"{subj!r}, not this "
+                                           f"candidate")
+                    log.append(base)
+                    continue
+                base["context_established"] = bool(
+                    ctx.get("ground_truth") or ctx.get("modality")
+                    or ctx.get("sample_design"))
+                rows.append(base)
+    return rows, log
+
+
+def _evidence_rows(docs, verified):
+    """Merge per-document verified measurements with honest
+    mention-only placeholder rows: a document naming the tool but
+    yielding no surviving measurement is recorded AS a mention -
+    never silently empty, never dressed up as data."""
+    ev = []
+    for d in docs:
+        if d.get("kind") not in ("citation-abstract", "fulltext"):
+            continue
+        cite = d.get("citation") or {"title": d["doc_cid"]}
+        got = [r for r in verified if r["doc_cid"] == d["doc_cid"]]
+        for r in got:
+            r["from_fulltext"] = d["kind"] == "fulltext"
+            r["quoted_metrics"] = [f"{r['metric']} {r['value']}"]
+        ev.extend(got)
+        if not got:
+            ev.append({"metric": None, "value": None,
+                       "quote": "names the tool; no measurement claim "
+                                "survived the independent "
+                                "verification pass",
+                       "citation": cite, "doc_cid": d["doc_cid"],
+                       "from_fulltext": d["kind"] == "fulltext",
+                       "evidence_level": f"{d['kind']}: mention only",
+                       "context_established": False,
+                       "tested_version": "not stated by source",
+                       "quoted_metrics": ["no surviving metric"],
+                       "extracted_at": now()})
+    return ev
+
+
+def _mv_summary(verified, vlog):
+    return {"confirmed": len([r for r in verified
+                              if r["verified"] == "confirm"]),
+            "corrected": len([r for r in verified
+                              if r["verified"] == "correct"]),
+            "rejected": len([x for x in vlog
+                             if x.get("verified") == "reject"]),
+            "foreign_or_unbound": len([
+                x for x in vlog if x.get("verified") != "reject"]),
+            "items": vlog[:24]}
+
+
 def _verify_candidate(n, target, citations, per_source, failures,
                       queries_log, done, store, publish, rid,
-                      vcache=None, budget=None, ft=None, profile=None):
-    """Standardized candidate schema (D5, extended by M5 PART 4).
-    Unverifiable fields say 'Not verified' - they are never filled with
-    plausible estimates. New in PART 4: the version verification chain
-    (4.2), full-context performance evidence (4.3) and artifact
-    classification (4.4)."""
+                      vcache=None, budget=None, ft=None, task=None,
+                      known_names=(), baseline_names=(), icache=None):
+    """Standardized candidate schema (D5; M8 scientific overhaul).
+    Unverifiable fields say 'Not verified' - never a plausible
+    estimate. M8 adds: an IDENTITY record (S3 - projects never merge
+    on a name alone), the full document set for the relevance layer
+    (S4 - positive evidence only), per-document claim extraction plus
+    an INDEPENDENT verification pass (S6/S7), and version/license
+    attribution gated on the identity verdict with domain-agreement
+    screening of name-colliding records (PART 1.1/1.3/1.4/1.5 fixes)."""
     tid = target["id"]
+    task = task or ontology.task_for(tid)
     # Probe registry name: for GitHub-derived "owner/repo" candidates use
     # the repo part; otherwise the first word of the candidate name.
     base = (n["name"].split("/")[-1].split() or [""])[0]
@@ -521,42 +734,35 @@ def _verify_candidate(n, target, citations, per_source, failures,
                   ((c.get("title") or "") + " " +
                    (c.get("abstract") or "")).lower()]
 
-    # ---- 4.2 version verification chain ----
-    vchain = versions.resolve(
-        n["name"], repo=(gh[0]["id"] if gh else None),
-        citations=named_cits,
-        probes={"pypi": lambda _s: (q_py, e_py, {})},
-        budget=budget, cache=vcache)
-    stable_val = (vchain["values"].get("latest_stable") or {}).get("value")
-    if stable_val and str(stable_val).startswith("commit"):
-        stable_val = None  # a dev commit is not a stable to compare to
-
-    # ---- 4.3 performance evidence WITH context ----
-    ev = []
-    for c in named_cits:
-        cite = {"title": c["title"], "year": c.get("year"),
+    # ---- S4 document set: EVERY piece of text this run retrieved
+    # about this candidate (registry blurbs, naming-citation titles +
+    # abstracts, full text). The relevance layer never sees less than
+    # what exists (PART 1.1/1.2 fix: a thin blurb is not an
+    # investigation; a well-documented tool no longer collapses to
+    # one under-read description) ----
+    docs = []
+    if gh:
+        docs.append({"doc_cid": f"github:{gh[0].get('id')}",
+                     "kind": "registry-description",
+                     "text": str(gh[0].get("description") or "")})
+    if bt:
+        docs.append({"doc_cid": f"biotools:{bt[0].get('id')}",
+                     "kind": "registry-summary",
+                     "text": str(bt[0].get("summary") or "")})
+    if py:
+        docs.append({"doc_cid": f"pypi:{py[0].get('id')}",
+                     "kind": "registry-summary",
+                     "text": str(py[0].get("summary") or "")})
+    for c in named_cits[:6]:
+        cite = {"title": c.get("title"), "year": c.get("year"),
                 "url": c.get("url"), "id": c.get("id"),
                 "source": c.get("source")}
-        rows = evidence.metric_rows(n["name"], c.get("abstract") or "",
-                                    citation=cite, level="abstract")
-        if not rows:
-            rows = [{"metric": None, "value": None,
-                     "quote": "names the tool; no explicit metric in "
-                              "the retrieved abstract",
-                     "citation": cite,
-                     "evidence_level": (
-                         "abstract: author-reported"
-                         if name_l in (c.get("title") or "").lower()
-                         else "abstract: contextual mention"),
-                     "context_established": False,
-                     "tested_version": "not stated by source",
-                     "extracted_at": now()}]
-        for r in rows:
-            r.setdefault("citation", cite)
-            r["quoted_metrics"] = ([f"{r['metric']} {r['value']}"]
-                                   if r.get("metric")
-                                   else ["no explicit metric in abstract"])
-        ev.extend(rows[:3])
+        text = (((c.get("title") or "") + ". " +
+                 (c.get("abstract") or "")).strip())
+        if text.strip(" ."):
+            docs.append({"doc_cid": c.get("cid") or _canon_cid(c),
+                         "kind": "citation-abstract",
+                         "text": text, "citation": cite})
     # one full-text attempt per candidate (bounded run budget): the
     # efetch route works for open-access PMC deposits; Europe PMC's
     # fullTextXML sub-endpoint is unreachable from this host (measured)
@@ -568,74 +774,149 @@ def _verify_candidate(n, target, citations, per_source, failures,
             ft["n"] -= 1
             xml, err = sources.pmc_fulltext(pcid)
             if xml:
-                ftxt = evidence.xml_to_text(xml)
-                for r in evidence.metric_rows(
-                        n["name"], ftxt,
-                        citation={"title": "full text via efetch db=pmc "
-                                  f"(PMCID:{pcid})", "id": f"PMC:{pcid}",
-                                  "url": f"https://pmc.ncbi.nlm.nih.gov"
-                                         f"/articles/{pcid}/",
-                                  "source": "ncbi-pmc"},
-                        level="full text", max_rows=3):
-                    r["from_fulltext"] = True
-                    r["citation"] = {"id": f"PMC:{pcid}",
-                                     "url": f"https://pmc.ncbi.nlm.nih"
-                                            f".gov/articles/{pcid}/",
-                                     "title": "full text (efetch)",
-                                     "year": None,
-                                     "source": "ncbi-pmc"}
-                    r["quoted_metrics"] = ([f"{r['metric']} "
-                                            f"{r['value']}"]
-                                           if r.get("metric") else
-                                           ["no metric sentence"])
-                    ev.append(r)
+                docs.append({"doc_cid": f"pmc:{pcid.lower()}",
+                             "kind": "fulltext",
+                             "text": evidence.xml_to_text(xml),
+                             "citation": {
+                                 "id": f"PMC:{pcid}",
+                                 "url": "https://pmc.ncbi.nlm.nih.gov"
+                                        f"/articles/{pcid}/",
+                                 "title": "full text (efetch db=pmc)",
+                                 "year": None, "source": "ncbi-pmc"}})
             else:
                 ft_note = f"full-text attempt failed: {err}"
+
+    # ---- S3 identity: WHICH PROJECT does this name denote? Axes are
+    # corroborating evidence axes (naming paper, registry record,
+    # repository description in the task's domain, component
+    # recognition); resolved needs >=2. A name collision ends up
+    # contested/unresolved and is NEVER merged (PART 1.3/1.4). ----
+    extra_ev = []
+    for c in named_cits[:4]:
+        tl = str(c.get("title") or "")
+        if name_l in tl.lower():
+            extra_ev.append({"axis": "naming-paper",
+                             "source": "literature",
+                             "detail": f"paper title names it: "
+                                       f"{tl[:80]} "
+                                       f"({c.get('id') or c.get('cid')})"})
+    reg_hits = ([dict(r, source="bio.tools") for r in bt] +
+                [dict(r, source="bioconda") for r in bc] +
+                [dict(r, source="pypi") for r in py])
+
+    def _probe(project, tool):
+        full = str(project).replace("github.com/", "", 1)
+        res = sources.github_repo_top_level(full)
+        if res.get("error"):
+            return None
+        return any(str(e).lower() == tool.lower() or
+                   str(e).lower().startswith(tool.lower() + "-") or
+                   str(e).lower().startswith(tool.lower() + "_")
+                   for e in res.get("entries", []))
+
+    ident = identity.resolve_identity(
+        n["name"], task, named_cits, registry_hits=reg_hits,
+        github_hits=gh, extra_evidence=extra_ev,
+        component_probe=(_probe if budget is not None else None),
+        budget=budget, cache=icache)
+    attr_block = identity.blocks_attribution(ident)
+    # attribution filter: project-scoped claims (version, license,
+    # availability) may only ride on records that BOTH survived the
+    # identity verdict and agree with the task's domain - a name-exact
+    # record for a different project is excluded (its existence stays
+    # visible in identity.considered)
+    def _attr(hits):
+        if attr_block:
+            return []
+        return [r for r in hits if _record_agrees_domain(task, r)]
+    gh_a, py_a = _attr(gh), _attr(py)
+    bc_a, bt_a = _attr(bc), _attr(bt)
+
+    # ---- 4.2 version verification chain - the repo and registry
+    # records feeding it are chosen ONLY among attributable ones, so
+    # a colliding package's version can never become this candidate's
+    # "latest stable" ----
+    vchain = versions.resolve(
+        n["name"], repo=(gh_a[0]["id"] if gh_a else None),
+        citations=named_cits,
+        probes={"pypi": lambda _s: (py_a, e_py, {})},
+        budget=budget, cache=vcache,
+        # root-cause 1.4: this deployment installs from bioconda, so a
+        # baseline tool's "stable" is its DEPLOYMENT-CHANNEL version -
+        # another distribution's number must not become the verdict
+        prefer=("bioconda" if n.get("baseline") else None))
+    stable_val = (vchain["values"].get("latest_stable") or {}).get("value")
+    if stable_val and str(stable_val).startswith("commit"):
+        stable_val = None  # a dev commit is not a stable to compare to
+
+    # ---- S6 + S7: per-document claim extraction (grammar with exact
+    # spans) followed by an INDEPENDENT verification pass re-parsing
+    # those spans; only surviving measurements become evidence rows
+    # (PART 1.5 fix: the PureCN 16.9/95.5-class misbinding is caught
+    # by the verifier, and corrections/rejections are recorded) ----
+    verified, vlog = _verified_measurements(n["name"], docs,
+                                            known_names)
+    ev = _evidence_rows(docs, verified)
     # cross-version guard: a number never transfers across versions
     for r in ev:
         if r.get("tested_version") or r.get("metric"):
             r["version_caveat"] = evidence.cross_version_caveat(
                 r, stable_val)
     perf_summary = evidence.comparability_note(ev)
-    # 4.4 what KIND of artifact is this?
+    # 4.4 what KIND of artifact is this? - classification inputs
+    # prefer records attributable to the resolved project
+    _g1 = ((gh_a or gh)[:1] or [{}])[0]
+    _b1 = ((bt_a or bt)[:1] or [{}])[0]
+    _p1 = ((py_a or py)[:1] or [{}])[0]
     cls = versions.classify(
-        [(gh[0].get("description") if gh else ""),
-         (bt[0].get("summary") if bt else ""),
-         (py[0].get("summary") if py else "")],
-        archived=bool(gh and gh[0].get("archived")))
-    # M6 A2: scientific eligibility screen (backend/science.py). The
-    # text screened is ONLY what this run retrieved about THIS
-    # candidate: registry blurbs + the titles of naming citations.
-    blurb = " ".join(str(x or "") for x in [
-        (gh[0].get("description") if gh else ""),
-        (bt[0].get("summary") if bt else ""),
-        (py[0].get("summary") if py else ""),
-        " ".join((c.get("title") or "") for c in named_cits[:4])])
+        [str(_g1.get("description") or ""),
+         str(_b1.get("summary") or ""),
+         str(_p1.get("summary") or "")],
+        archived=bool(_g1.get("archived")))
+    # ---- S4 relevance by POSITIVE evidence only (assess_relevance).
+    # The screened text is EVERYTHING retrieved about this candidate.
+    # The M6 self-reference guard is kept: a literature-extracted name
+    # WITHOUT an intro cue gets citation abstracts removed from the
+    # relevance documents (an abstract that introduced a different
+    # tool is not evidence about this one - the DQA101/CoV-2
+    # fixture), while they still feed claim extraction. Absence of
+    # vocabulary leaves the row UNRESOLVED with follow-up queries -
+    # never "irrelevant" (PART 1.1 fix). ----
+    lit_origin = (n.get("origin") or "").startswith(
+        "named in retrieved literature")
+    self_ref_only = (lit_origin and not n.get("method_context"))
+    s4_docs = [d for d in docs
+               if not (self_ref_only and
+                       d.get("kind") == "citation-abstract")]
+    rd = None
     if n.get("baseline"):
         elig = {"eligibility": "current baseline (not an alternative)",
                 "reasons": [n["origin"]],
                 "comparable_for_replacement": False,
                 "confidence": "n/a"}
+        relationship = "baseline"
+        rstate = {"research_state": "n/a (current baseline tool)",
+                  "state_transitions": [],
+                  "research_states_remaining":
+                      list(science.RESEARCH_STATES), "followups": []}
     else:
-        # A literature-extracted candidate was ITSELF pulled out of
-        # these citations' text, so a substring hit there is
-        # self-reference, not corroboration - "named in retrieved
-        # literature" only counts when the extractor's intro cue
-        # actually introduced this name (method_context). For GitHub-
-        # or registry-derived candidates, any naming citation is
-        # independent evidence. (2026-11-17 negative fixture: "DQA101"
-        # and "CoV-2" were mis-extracted from the same abstract that
-        # introduced the real tool and would otherwise inherit its
-        # naming-publication privilege.)
-        lit_origin = (n.get("origin") or "").startswith(
-            "named in retrieved literature")
-        elig = science.screen_candidate(
-            n["name"], blurb,
-            profile=profile or science.GENERIC_PROFILE,
-            origin=n.get("origin", ""),
-            has_naming_source=bool(named_cits) and (
-                not lit_origin or bool(n.get("method_context"))),
-            artifact_class=cls["class"])
+        rd = science.assess_relevance(
+            n["name"], s4_docs, task=task, task_id=tid,
+            identity=ident, artifact_class=cls["class"],
+            lit_introduced=bool(n.get("method_context")),
+            availability={"GitHub": gh_a, "PyPI": py_a,
+                          "bio.tools": bt_a, "bioconda": bc_a},
+            verified_claims=len(verified),
+            baseline_name=(list(baseline_names) or [""])[0])
+        relationship = rd["relationship"]
+        elig = {"eligibility": RELATIONSHIP_ELIGIBILITY.get(
+                    relationship,
+                    "insufficient information to classify"),
+                "reasons": rd["reasons"],
+                "comparable_for_replacement":
+                    rd["comparable_for_replacement"],
+                "confidence": rd["confidence"]}
+        rstate = rd
     # installed version: only meaningful for tools THIS deployment runs
     if "configured NeoAG workflow" in (n.get("origin") or ""):
         iv = versions.installed_version(base)
@@ -647,17 +928,33 @@ def _verify_candidate(n, target, citations, per_source, failures,
                     "under consideration)"
     # None-coalescing through the `or` chain: a registry record that
     # exists but carries a null/blank field must print "Not verified",
-    # never None and never an empty cell.
+    # never None and never an empty cell. M8: the records feeding the
+    # claim are the ATTRIBUTABLE ones only - a name-colliding package
+    # or an unresolved identity carries no version/license string
+    # (PART 1.3/1.4 fix; raw queries stay in version_chain and
+    # verification_hits as provenance, not as claims).
     verified_version = vchain["display"]
-    license_ = (gh[0].get("license") if gh and
-                gh[0].get("license") not in (None, "NOASSERTION") else
-                (py[0].get("license") if py else
-                 (bc[0].get("license") if bc else
-                  (bt[0].get("license") if bt else "Not verified"))))
+    license_ = (gh_a[0].get("license") if gh_a and
+                gh_a[0].get("license") not in (None, "NOASSERTION") else
+                (py_a[0].get("license") if py_a else
+                 (bc_a[0].get("license") if bc_a else
+                  (bt_a[0].get("license") if bt_a else
+                   "Not verified"))))
+    if attr_block and not n.get("baseline"):
+        verified_version = (f"Not verified - {attr_block} (raw "
+                            "registry queries retained in "
+                            "version_chain/verification_hits)")
+        license_ = "Not verified - " + attr_block
+    version_claimed = (verified_version if verified_version and
+                       not str(verified_version).startswith(
+                           "Not verified") else None)
+    license_claimed = (license_ if license_ and
+                       not str(license_).startswith("Not verified")
+                       else None)
     maintenance = "Not verified"
-    if gh:
-        pushed = str(gh[0].get("pushed_at") or "")[:10]
-        if gh[0].get("archived"):
+    if gh_a:
+        pushed = str(gh_a[0].get("pushed_at") or "")[:10]
+        if gh_a[0].get("archived"):
             maintenance = "archived"
         elif pushed and pushed >= "2025-05-01":
             maintenance = f"active (last push {pushed})"
@@ -676,12 +973,34 @@ def _verify_candidate(n, target, citations, per_source, failures,
     ) if miss]
     if ft_note:
         gaps.append(ft_note[:120])
+    if attr_block and not n.get("baseline"):
+        gaps.append(f"identity: {attr_block}")
+    if relationship == "unresolved":
+        gaps.append("relevance: no positive evidence of relevance or "
+                    "irrelevance retrieved yet - follow-up queries "
+                    "recorded, investigation stays open")
     return {
         "name": n["name"],
         "eligibility": elig["eligibility"],
         "eligibility_reasons": elig["reasons"],
         "comparable_for_replacement": elig["comparable_for_replacement"],
         "screen_confidence": elig["confidence"],
+        # ---- M8 scientific-stage outputs (S3/S4/S6/S7) ----
+        "relationship": relationship,
+        "identity": ident,
+        "identity_status": ident["status"],
+        "relevance_basis": (rd or {}).get("basis") or [],
+        "research_state": rstate["research_state"],
+        "state_transitions": rstate.get("state_transitions") or [],
+        "research_states_remaining":
+            rstate.get("research_states_remaining") or [],
+        "followups": rstate.get("followups") or [],
+        "followups_open": bool(rstate.get("followups")),
+        "version_claimed": version_claimed,
+        "license_claimed": license_claimed,
+        "rejected_measurements_used": 0,
+        "measurement_verification": _mv_summary(verified, vlog),
+        "method_context": bool(n.get("method_context")),
         "is_baseline": bool(n.get("baseline")),
         "baseline_evidence": n.get("baseline_evidence"),
         "verified_version": verified_version,
@@ -691,25 +1010,34 @@ def _verify_candidate(n, target, citations, per_source, failures,
         "task": target["label"],
         "role_in_neoag": n["origin"],
         "category": ("software (registry-verified)"
-                     if (gh or py or bt or bc)
-                     else "mentioned in literature only"),
+                     if (gh_a or py_a or bt_a or bc_a) else
+                     ("software (name-exact registry records exist; "
+                      "identity unresolved)"
+                      if (gh or py or bt or bc) else
+                      "mentioned in literature only")),
         "artifact_class": cls["class"],
         "io_formats": "Not verified",
         "dependencies": "Not verified",
-        "availability": ("found on " + ", ".join(
-            s for s, ok in (("GitHub", gh), ("PyPI", py),
-                            ("bio.tools", bt), ("bioconda", bc))
-            if ok) if (gh or py or bt or bc) else "Not verified"),
+        "availability": (
+            "found on " + ", ".join(
+                s for s, ok in (("GitHub", gh_a), ("PyPI", py_a),
+                                ("bio.tools", bt_a), ("bioconda", bc_a))
+                if ok) if (gh_a or py_a or bt_a or bc_a) else
+            (f"Not verified - {attr_block}" if attr_block else
+             ("Not verified - name-exact registry records exist but "
+              "none is attributable to a corroborated project (see "
+              "identity.considered)"
+              if (gh or py or bt or bc) else "Not verified"))),
         "license": license_ or "Not verified",
         "latest_release": ((vchain["values"].get("latest_release")
                             or {}).get("value")
-                           or (py[0].get("version") if py else None)
-                           or (bc[0].get("version") if bc else None)
+                           or (py_a[0].get("version") if py_a else None)
+                           or (bc_a[0].get("version") if bc_a else None)
                            or "Not verified"),
         "maintenance": maintenance,
         "primary_references": [e["citation"] for e in ev][:4] or
         "Not verified (no retrieved citation naming this tool)",
-        "published_benchmark_evidence": ev or "Not verified",
+        "published_benchmark_evidence": ev,
         "performance_summary": perf_summary,
         "benchmark_versions": vchain["values"]["benchmark_versions"],
         "independent_validation": bool(
@@ -731,14 +1059,193 @@ def _verify_candidate(n, target, citations, per_source, failures,
             "pypi": [h.get("url") for h in py][:1],
             "biotools": [h.get("url") for h in bt][:2],
             "bioconda": [h.get("url") for h in bc][:1]},
+        # run-scope only (popped by the caller before the row is
+        # stored in the report): documents the deepening pass may
+        # grow without re-fetching
+        "_docs": docs,
     }
 
 
+def _deepen_candidate(c, target, citations, per_source, failures,
+                      queries_log, done, cid_keys, store, publish, rid,
+                      budget=None, fb=None, task=None, prof=None,
+                      known_names=(), baseline_names=(),
+                      docs_by_name=None):
+    """M8 investigation loop: execute one row's RECORDED follow-up
+    queries (bounded per run). New literature naming the candidate
+    grows its document set; claims are re-extracted and RE-VERIFIED;
+    the relevance verdict and research-state ladder are re-derived
+    from the grown evidence. Honest accounting: executed, duplicate
+    and budget-skipped queries all land in provenance and on the
+    row - a skip is recorded, never silently dropped."""
+    tid = target["id"]
+    task = task or ontology.task_for(tid)
+    name = c["name"]
+    key_l = name.lower()
+    still_open, executed, new_recs_all = [], [], []
+    for q in c.get("followups") or []:
+        src = q.get("source") or "europepmc"
+        qtext = str(q.get("query") or "")
+        qkey = f"{src}|{qtext}"
+        if fb is not None and fb.get("n", 0) <= 0:
+            still_open.append({**q, "status": "not executed - run "
+                                            "follow-up budget "
+                                            "exhausted"})
+            continue
+        if qkey in done:
+            still_open.append({**q, "status": "identical query already "
+                                           "run this run - no new "
+                                           "records"})
+            continue
+        recs, err = [], None
+        if src == "github":
+            left = (budget or {}).get("core")
+            if left is not None and left < 1:
+                still_open.append({**q, "status": "not executed - "
+                                             "GitHub budget exhausted "
+                                             "this hour"})
+                continue
+            term = (qtext.split('"')[1] if '"' in qtext
+                    else (qtext.replace("official implementation", "")
+                          .strip() or name))
+            recs, err, _ = sources.github_repo_search(term, 3)
+            if err is None and budget is not None and left is not None:
+                budget["core"] = left - 1
+        else:
+            adapter = sources.ALL_ADAPTERS.get(src)
+            if adapter is None:
+                still_open.append({**q,
+                                   "status": f"source {src!r} not "
+                                             f"available this run"})
+                continue
+            try:
+                recs, err, _ = adapter(qtext, 5)
+            except Exception as e:
+                recs, err = [], f"{type(e).__name__}: {str(e)[:120]}"
+        _record(per_source, failures, queries_log, src,
+                f"followup:{qtext[:70]}", len(recs), err, tid,
+                purpose="investigation follow-up")
+        executed.append({"query": qtext, "source": src,
+                         "records": len(recs or []), "error": err})
+        if err is None:
+            done.add(qkey)
+            if fb is not None:
+                fb["n"] = fb.get("n", 0) - 1
+        for rec in recs or []:
+            if not (rec.get("id") or rec.get("url")):
+                continue
+            cid = _canon_cid(rec)
+            if cid in cid_keys:
+                continue
+            cid_keys.add(cid)
+            cc = {**rec, "targets": [tid], "cid": cid}
+            citations.append(cc)
+            new_recs_all.append(cc)
+            blob = ((cc.get("title") or "") + " " +
+                    (cc.get("abstract") or "")).lower()
+            if key_l in blob:
+                docs = (docs_by_name or {}).setdefault(key_l, [])
+                text = (((cc.get("title") or "") + ". " +
+                         (cc.get("abstract") or "")).strip())
+                if text.strip(" ."):
+                    docs.append({"doc_cid": cid,
+                                 "kind": "citation-abstract",
+                                 "text": text,
+                                 "citation": {
+                                     "title": cc.get("title"),
+                                     "year": cc.get("year"),
+                                     "url": cc.get("url"),
+                                     "id": cc.get("id"),
+                                     "source": cc.get("source")}})
+    # did NEW literature introduce this name as a method? (the cue
+    # grammar decides, not a count)
+    mi = {}
+    if prof and new_recs_all:
+        try:
+            mi = {m["name"].lower(): bool(m.get("method_context"))
+                  for m in science.extract_tool_mentions(new_recs_all,
+                                                         prof)}
+        except Exception:
+            mi = {}
+    lit_now = (bool(c.get("method_context")) or
+               bool(mi.get(key_l)))
+    # re-extract + re-verify over the GROWN document set
+    docs = (docs_by_name or {}).get(key_l) or []
+    verified, vlog = _verified_measurements(name, docs, known_names)
+    prev_ident = c.get("identity") or {}
+    if prev_ident.get("status") == "resolved":
+        ident = prev_ident
+    else:
+        named_now = [x for x in citations
+                     if key_l in ((x.get("title") or "") + " " +
+                                  (x.get("abstract") or "")).lower()]
+        extra_now = [{"axis": "naming-paper", "source": "literature",
+                      "detail": f"paper title names it: "
+                                f"{str(x.get('title') or '')[:80]} "
+                                f"({x.get('id') or x.get('cid')})"}
+                     for x in named_now[:4]
+                     if key_l in str(x.get("title") or "").lower()]
+        id_lit = identity.resolve_identity(
+            name, task, named_now, extra_evidence=extra_now,
+            component_probe=None, budget=None, cache=None)
+        ident = (id_lit if (id_lit.get("n_axes") or 0) >=
+                 (prev_ident.get("n_axes") or 0)
+                 else (prev_ident or id_lit))
+    lit_origin = (c.get("role_in_neoag") or "").startswith(
+        "named in retrieved literature")
+    s4_docs = [d for d in docs
+               if not (lit_origin and not lit_now and
+                       d.get("kind") == "citation-abstract")]
+    rd = science.assess_relevance(
+        name, s4_docs, task=task, task_id=tid, identity=ident,
+        artifact_class=c.get("artifact_class") or "",
+        lit_introduced=lit_now,
+        availability={k: bool(c.get("verification_hits", {})
+                              .get(v))
+                      for k, v in (("GitHub", "github"),
+                                   ("PyPI", "pypi"),
+                                   ("bio.tools", "biotools"),
+                                   ("bioconda", "bioconda"))},
+        verified_claims=len(verified),
+        baseline_name=(list(baseline_names) or [""])[0])
+    c["relationship"] = rd["relationship"]
+    c["eligibility"] = RELATIONSHIP_ELIGIBILITY.get(
+        rd["relationship"], "insufficient information to classify")
+    c["eligibility_reasons"] = rd["reasons"]
+    c["comparable_for_replacement"] = rd["comparable_for_replacement"]
+    c["screen_confidence"] = rd["confidence"]
+    c["relevance_basis"] = rd["basis"]
+    c["research_state"] = rd["research_state"]
+    c["state_transitions"] = rd["state_transitions"]
+    c["research_states_remaining"] = rd["research_states_remaining"]
+    c["followups"] = still_open + list(rd["followups"])
+    c["followups_open"] = bool(c["followups"])
+    c["method_context"] = lit_now
+    c["identity"] = ident
+    c["identity_status"] = ident.get("status", "not attempted")
+    if ident.get("status") == "resolved":
+        c["evidence_gaps"] = [g for g in (c.get("evidence_gaps") or [])
+                              if not str(g).startswith("identity")]
+        if not c.get("version_claimed"):
+            c["deepening_note"] = (
+                "identity resolved during deepening; the version "
+                "chain was NOT re-run (no budget spent) - version "
+                "stays 'Not verified' until a re-run")
+    c["published_benchmark_evidence"] = _evidence_rows(docs, verified)
+    c["measurement_verification"] = _mv_summary(verified, vlog)
+    c["deepening"] = executed
+    _step(store, publish, rid,
+          f"[{tid}] {name}: deepening executed {len(executed)} "
+          f"follow-up query(ies), {len(new_recs_all)} new records -> "
+          f"{c['eligibility']} ({c['research_state']})",
+          store.research_progress(rid), {})
+
+
 def _record(per_source, failures, queries_log, source, query, count, err,
-            tid, skip_ok_error=None):
+            tid, skip_ok_error=None, purpose="candidate verification"):
     per_source.setdefault(source, {"ok": 0, "fail": 0})
     entry = {"source": source, "query": query, "target": tid,
-             "purpose": "candidate verification", "count": count,
+             "purpose": purpose, "count": count,
              "error": err, "ts": now()}
     if err and skip_ok_error and skip_ok_error in str(err):
         # the registry gave a DEFINITE answer (e.g. "not on PyPI"):
@@ -756,78 +1263,33 @@ def _record(per_source, failures, queries_log, source, query, count, err,
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# M6 A6/A7: within-task comparison + A9 evidence-derived decisions
+# M6 A6/A7 within-task comparison; M8 re-implements the evidence feed on
+# the verified-measurement pipeline (S6/S7) + comparability classes (S8)
 # ---------------------------------------------------------------------------
 
-def _val(x):
-    """Parse a reported metric value (0-1 or percent) for paired
-    comparisons; None when not numeric."""
-    s = str(x or "").strip().rstrip("%")
-    try:
-        v = float(s)
-    except ValueError:
-        return None
-    return v / 100.0 if "%" in str(x) or v > 1.5 else v
+def _fmt_mrow(r):
+    return (f"{r.get('metric')}={r.get('value')}"
+            + (f" (CI {r['ci']})" if r.get("ci") else "")
+            + ("" if r.get("context_established")
+               else " [conditions not stated]")
+            + f" [{r.get('doc_cid')}]")
 
 
-def _usable_rows(c):
-    ev = c.get("published_benchmark_evidence")
-    return ([r for r in ev if isinstance(r, dict)
-             and r.get("context_established")]
-            if isinstance(ev, list) else [])
-
-
-def _fmt_row(r):
-    return (f"{r.get('metric')}={r.get('value')} on {r.get('dataset')}"
-            f" [{r.get('tested_version') or 'version not stated'}]"
-            + (" (author-reported)"
-               if r.get("author_reported")
-               or "author-reported" in r.get("evidence_level", "")
-               else " (independent)"
-               if r.get("independent")
-               or "independent" in r.get("evidence_level", "") else ""))
-
-
-def _superiority_rows(direct, baseline_cands):
-    """A 'better' claim is licensed ONLY by a same-metric, same-dataset
-    number on both sides - retrieval almost never produces that, which
-    is exactly the point."""
-    base_map = {}
-    for bc in baseline_cands:
-        for r in _usable_rows(bc):
-            ds = (r.get("dataset") or "").lower()
-            if ds in ("", "not stated by source"):
-                continue
-            key = (str(r.get("metric") or "").lower(), ds)
-            v = _val(r.get("value"))
-            if v is not None:
-                base_map.setdefault(key, []).append(v)
-    sup = []
-    for c in direct:
-        for r in _usable_rows(c):
-            ds = (r.get("dataset") or "").lower()
-            key = (str(r.get("metric") or "").lower(), ds)
-            v = _val(r.get("value"))
-            if v is None or key not in base_map:
-                continue
-            if all(v > b for b in base_map[key]):
-                sup.append({"tool": c["name"], "row": r,
-                            "beats": f"current tool {key[0]}="
-                                     f"{max(base_map[key])} on {key[1]}"})
-    return sup
-
-
-def _task_comparisons(resolved_targets, candidates, stages_by_id):
+def _task_comparisons(resolved_targets, candidates, stages_by_id,
+                      decisions=None, baseline_ctx=None):
     """One comparison block PER scientific module (M6 B2 section 3).
     Comparison rows contain ONLY direct alternatives; complementary
-    methods, wrappers and screened-out hits are named WITH their reason
-    but never dressed up as comparison rows."""
+    methods, wrappers and unclassified hits are named WITH their reason
+    but never dressed up as comparison rows. Rows show the VERIFIED
+    measurements (S6/S7) and the best comparability class of a baseline
+    pair (S8) - an unverified quote never appears as data."""
     out = []
     for t in resolved_targets:
         tid = t["id"]
         stage = stages_by_id.get(tid) or {}
         base = stage.get("baseline") or {}
         prof = science.profile_for(tid, t["label"])
+        comps = ((decisions or {}).get(tid) or {}).get("comparisons") or []
         mine = [c for c in candidates if c["task"] == t["label"]]
         groups = {"complementary method": [],
                   "wrapper/integration (not an independent algorithm)": [],
@@ -840,15 +1302,33 @@ def _task_comparisons(resolved_targets, candidates, stages_by_id):
             if e == "current baseline (not an alternative)":
                 continue
             if e == "direct alternative":
-                usable = _usable_rows(c)
+                meas = [r for r in c["published_benchmark_evidence"] or []
+                        if isinstance(r, dict) and r.get("metric")
+                        and r.get("verified") in ("confirm", "correct")]
+                rank = {"direct": 3, "indirect": 2, "descriptive": 1,
+                        "unverified": 0}
+                best = max((x for x in comps
+                            if x.get("candidate") == c["name"]),
+                           key=lambda x: rank.get(x.get("class"), -1),
+                           default=None)
                 rows.append({
                     "tool": c["name"],
                     "version": c["verified_version"],
-                    "evidence": ("; ".join(_fmt_row(r) for r in usable[:3])
-                                 if usable else
-                                 "relevant method; no performance number "
-                                 "with established experimental context "
-                                 "was retrieved for it"),
+                    "identity": c.get("identity_status",
+                                      "not attempted"),
+                    "research_state": c.get("research_state"),
+                    "evidence": (
+                        "; ".join(_fmt_mrow(r) for r in meas[:3])
+                        if meas else
+                        "relevant method; no measurement claim survived "
+                        "the independent verification pass for it"),
+                    "comparability": (
+                        f"best pair vs {best.get('baseline_name')}: "
+                        f"{best.get('class')} - "
+                        f"{str(best.get('note'))[:140]}"
+                        if best else
+                        "no baseline measurement shares this "
+                        "candidate's metric"),
                     "license": c["license"],
                     "maintenance": c["maintenance"],
                     "why_comparable": "; ".join(c["eligibility_reasons"])
@@ -865,6 +1345,7 @@ def _task_comparisons(resolved_targets, candidates, stages_by_id):
                            "evidence": "; ".join(b["evidence"])[:220],
                            "pinned_version": b.get("pinned_version")}
                           for b in base.get("tools") or []],
+                "context": (baseline_ctx or {}).get(tid),
                 "note": base.get("note", "")},
             "rows": rows,
             "complementary": groups["complementary method"],
@@ -882,35 +1363,111 @@ def _task_comparisons(resolved_targets, candidates, stages_by_id):
 
 
 def _module_decision(target, candidates, stage, reached_fully=True):
-    """M6 A9: a recommendation from the six-category fixed vocabulary,
-    DERIVED from facts about the retrieved rows - the category cannot
-    contradict the evidence, because it is computed from it."""
+    """M8 S8+S9: the module's stage outputs assembled into comparability
+    pairs and the five-label synthesis. The recommendation is a PURE
+    function of the facts (label_facts); the recommendation gate
+    re-derives the label from the very same dict, so a stored label can
+    never drift from the evidence."""
     tid = target["id"]
-    prof = science.profile_for(tid, target["label"])
+    task = ontology.task_for(tid)
     base = stage.get("baseline") or {}
     mine = [c for c in candidates if c["task"] == target["label"]]
     baseline_cands = [c for c in mine if c.get("is_baseline")]
-    direct = [c for c in mine if c["eligibility"] == "direct alternative"]
-    comparable = [r for c in direct for r in _usable_rows(c)]
-    independent = [r for r in comparable
-                   if "independent" in r.get("evidence_level", "")]
-    superiority = _superiority_rows(direct, baseline_cands)
-    rec = science.recommend(
-        baseline_identified=bool(base.get("identified")),
-        direct_alts=direct, comparable_rows=comparable,
-        independent_rows=independent, superiority_rows=superiority,
-        profile=prof, coverage_partial=not reached_fully,
-        gates_passed=True)
-    return {"recommendation": rec["recommendation"],
-            "conclusion": rec["recommendation"],  # legacy key
-            "rationale": rec["rationale"],
-            "action": rec["action"],
+    direct = [c for c in mine
+              if c.get("relationship") == "direct-alternative"]
+
+    def _meas(c):
+        # comparison-grade measurements: survived the independent
+        # verification pass AND (for alternatives) sit on a resolved
+        # project identity - a contested name's numbers could belong
+        # to either project, so they enter no comparison
+        if not c.get("is_baseline") and \
+                c.get("identity_status") != "resolved":
+            return []
+        return [r for r in c.get("published_benchmark_evidence") or []
+                if isinstance(r, dict) and r.get("metric")
+                and r.get("verified") in ("confirm", "correct")]
+
+    base_meas = [(c["name"], r) for c in baseline_cands
+                 for r in _meas(c)]
+    comparisons = []
+    for c in direct:
+        for r in _meas(c):
+            pair = next(
+                ((bn, br) for bn, br in base_meas
+                 if str(br.get("metric") or "").lower()
+                 == str(r.get("metric") or "").lower()), None)
+            if pair is None:
+                continue
+            cmp_ = science.compare_measurements(
+                {"metric": pair[1].get("metric"),
+                 "value": pair[1].get("value"), "verified": True,
+                 "context": pair[1].get("context") or {},
+                 "name": pair[0]},
+                {"metric": r.get("metric"), "value": r.get("value"),
+                 "verified": True, "context": r.get("context") or {},
+                 "name": c["name"]})
+            cmp_["candidate"] = c["name"]
+            cmp_["baseline_name"] = pair[0]
+            cmp_["values"] = {"baseline": pair[1].get("value"),
+                              "alternative": r.get("value")}
+            comparisons.append(cmp_)
+
+    def _flag(name, pred):
+        return any(x.get("candidate") == name and pred(x)
+                   for x in comparisons)
+
+    gate_rows = [{
+        "name": c["name"],
+        "is_baseline": bool(c.get("is_baseline")),
+        "relationship": c.get("relationship") or "unresolved",
+        "basis": c.get("relevance_basis") or [],
+        "reasons": c.get("eligibility_reasons") or [],
+        "identity_status": c.get("identity_status", "not attempted"),
+        "version_claimed": c.get("version_claimed"),
+        "license_claimed": c.get("license_claimed"),
+        "rejected_measurements_used": 0,
+        "superiority_claim": _flag(
+            c["name"], lambda x: x.get("winner") == "alternative"),
+        "direct_verified_pair": _flag(
+            c["name"], lambda x: x.get("class") == "direct"),
+        "followups_open": bool(c.get("followups_open")),
+    } for c in mine]
+    relevance_rows = [{
+        "name": c["name"],
+        "relationship": c.get("relationship") or "unresolved",
+        "followups_open": bool(c.get("followups_open")),
+    } for c in mine if not c.get("is_baseline")]
+    qtys = ontology.quantities(task) or []
+    label_facts = {
+        "baseline_identified": bool(base.get("identified")),
+        "coverage_partial": not reached_fully,
+        "relevance_rows": relevance_rows,
+        "comparisons": comparisons,
+        "endpoint_defined": bool(qtys),
+        "endpoint": ", ".join(qtys)}
+    prov = science.recommend_v2(**label_facts)
+    base_ev = "; ".join(str(e) for b in (base.get("tools") or [])
+                        for e in (b.get("evidence") or []))[:300]
+    return {"recommendation": prov["label"],
+            "conclusion": prov["label"],  # legacy key
+            "rationale": prov["rationale"],
+            "action": prov["action"],
+            "conditions_met": prov["conditions_met"],
+            "conditions_unmet": prov["conditions_unmet"],
+            "label_facts": label_facts,
+            "comparisons": comparisons,
+            "gate_rows": gate_rows,
+            "baseline_evidence": base_ev,
             "evidence_facts": {
                 "candidates": len(mine),
                 "direct_alternatives": len(direct),
-                "comparable_rows": len(comparable),
-                "independent_rows": len(independent),
-                "superiority_rows": len(superiority),
+                "verified_measurement_pairs": len(comparisons),
+                "direct_comparable_pairs": len(
+                    [x for x in comparisons if x.get("class")
+                     == "direct"]),
+                "open_followups": len(
+                    [r for r in relevance_rows if r["followups_open"]]),
                 "baseline_identified": bool(base.get("identified")),
                 "baseline_tools": [b["name"]
                                    for b in (base.get("tools") or [])]}}
@@ -987,22 +1544,22 @@ def _coverage_accounting(inv, resolved_targets, module_conclusions,
 
 
 def _next_actions(module_conclusions, coverage):
-    """M6 B2 section 4: actions in decision-priority order, each tied to
-    ONE module decision. Generic benchmark plans for irrelevant tools or
-    modules without a defined endpoint are not produced (A9/B6):
-    recommend() only emits a benchmark action when the module has
-    relevant direct alternatives AND a published-metric endpoint."""
-    prio = {"Candidate supported by comparative evidence": 0,
-            "Recommend independent benchmark": 1,
-            "Promising candidate - evaluate": 2,
-            "Research incomplete": 3,
-            "Insufficient evidence": 4,
-            "Retain current tool": 5}
+    """M6 B2 section 4 (labels updated to the M8 five-label vocabulary
+    by recommend_v2): actions in decision-priority order, each tied to
+    ONE module decision. A benchmark action exists only where
+    recommend_v2 derived one - the module has relevant alternatives, a
+    defined endpoint and no verified comparable numbers - never for
+    irrelevant or unclassified tools."""
+    prio = {"Promising candidate for further evaluation": 0,
+            "Recommend targeted benchmark": 1,
+            "Review incomplete": 2,
+            "No justified change identified": 3,
+            "Evidence supports retaining current method": 4}
     acts = []
     for tid, mc in module_conclusions.items():
         rec = mc.get("recommendation") or mc.get("conclusion") or ""
-        if rec == "Retain current tool":
-            acts.append((5, f"[{tid}] Keep current tool - "
+        if rec == "Evidence supports retaining current method":
+            acts.append((4, f"[{tid}] Keep current method - "
                             f"{mc['rationale'][:150]}"))
             continue
         if mc.get("action"):
@@ -1067,13 +1624,105 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
                          and not _recorded_outcome(q)}
     hard_failures = [f for f in failures if not _rate_only(
         f.get("error"))]
+    # ---- M8 S5 baseline context per module: conda pins, installed
+    # versions (read-only deployment probe) and intended-vs-achieved
+    # consensus kept as SEPARATE fields - a literature review never
+    # claims execution happened. ----
+    baseline_ctx = {}
+    try:
+        pins = baselines.repo_conda_pins(Path(inv.get("repo") or "/"))
+    except Exception:
+        pins = {}
+    _probe_cache = {}
+    for t in reached:
+        stg = stages_by_id.get(t["id"]) or {}
+        for b in (stg.get("baseline") or {}).get("tools") or []:
+            bn = str(b["name"]).lower()
+            if bn not in _probe_cache and not bn.startswith(
+                    "neoag internal"):
+                try:
+                    _probe_cache[bn] = baselines.probe_installed(
+                        b["name"])
+                except Exception as e:
+                    _probe_cache[bn] = {
+                        "reason": f"probe failed: {type(e).__name__}"}
+        try:
+            baseline_ctx[t["id"]] = {
+                "levels": baselines.level_for_stage(stg, pins,
+                                                    _probe_cache),
+                "consensus": baselines.consensus_context(stg)}
+        except Exception as e:
+            baseline_ctx[t["id"]] = {
+                "error": f"baseline context unavailable: "
+                         f"{type(e).__name__}"}
+    # ---- M8 S9: module synthesis + per-module SCIENTIFIC gates.
+    # Pass 1 derives the label from the stage facts; the gates then
+    # check all eight dimensions INCLUDING label consistency. If any
+    # non-recommendation gate fails, the label is re-synthesised with
+    # those failures as input ("Review incomplete") and the gates are
+    # re-run against the final label so pass 2 is the authoritative
+    # record. No constant True anywhere. ----
+    module_conclusions = {}
+    gates_flat = []
+    for t in reached:
+        tid = t["id"]
+        mc = _module_decision(t, candidates,
+                              stages_by_id.get(tid) or {},
+                              reached_fully=(tid not in
+                                             hard_fail_targets))
+        tqs = [q for q in (prog.get("queries") or [])
+               if q.get("target") == tid]
+        t_cids = [(c.get("cid") or _canon_cid(c)) for c in citations
+                  if tid in (c.get("targets") or [])]
+        state = {
+            "target": tid,
+            "baseline": {
+                "identified": mc["label_facts"]["baseline_identified"],
+                "evidence": mc["baseline_evidence"]},
+            "candidates": mc["gate_rows"],
+            "coverage": {
+                "attempted": len(tqs),
+                "accounted": len([q for q in tqs
+                                  if "count" in q or "error" in q]),
+                "outages": len([q for q in tqs if q.get("error")
+                                and not _recorded_outcome(q)])},
+            "citation_ids": t_cids,
+            "citation_ids_unique": len(set(t_cids)),
+            "engine_version": LIVE_ENGINE_VERSION,
+            "label_proposed": mc["recommendation"],
+            "label_facts": mc["label_facts"]}
+        g = science.scientific_gates(state)
+        failing = [x for x in g if not x["passed"]
+                   and x["dimension"] != "recommendation"]
+        if failing:
+            facts2 = dict(mc["label_facts"],
+                          gate_failures=[
+                              f"{x['dimension']}: "
+                              + ("; ".join(str(v) for v in
+                                           x["violations"])
+                                 if x["violations"]
+                                 else str(x["detail"])[:90])
+                              for x in failing])
+            final = science.recommend_v2(**facts2)
+            mc.update(recommendation=final["label"],
+                      conclusion=final["label"],
+                      rationale=final["rationale"],
+                      action=final["action"],
+                      conditions_met=final["conditions_met"],
+                      conditions_unmet=final["conditions_unmet"])
+            mc["label_facts"] = facts2
+            g = science.scientific_gates({**state,
+                                          "label_proposed":
+                                              final["label"],
+                                          "label_facts": facts2})
+        mc["gates"] = [{**x, "target": tid, "check": x["dimension"]}
+                       for x in g]
+        gates_flat.extend(mc["gates"])
+        module_conclusions[tid] = mc
     task_comparisons = _task_comparisons(reached, candidates,
-                                         stages_by_id)
-    module_conclusions = {
-        t["id"]: _module_decision(
-            t, candidates, stages_by_id.get(t["id"]) or {},
-            reached_fully=(t["id"] not in hard_fail_targets))
-        for t in reached}
+                                         stages_by_id,
+                                         decisions=module_conclusions,
+                                         baseline_ctx=baseline_ctx)
     coverage = _coverage_accounting(
         inv, reached, module_conclusions, candidates, status,
         scope_ids={t["id"] for t in resolved_targets})
@@ -1088,38 +1737,32 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
         for c in candidates
         if c["eligibility"] in ("irrelevant",
                                 "insufficient information to classify")]
-    # ---- M6 A10 quality gates: preliminary vs decision-ready ----
-    gates = science.quality_gates(
-        targets=[t["id"] for t in reached],
-        baselines={tc["target_id"]:
-                   {"identified": tc["baseline"]["identified"]}
-                   for tc in task_comparisons},
-        candidates=candidates, excluded=excluded,
-        citations_count=len(citations), failures=failures,
-        coverage=coverage)
+    # ---- M8: decision-ready ONLY when every scientific gate actually
+    # passed (per-module, flattened here); the old constant-True
+    # quality gates are gone ----
     in_run_gaps = [m for m in coverage["not_researched"]
                    if "scope" not in m["reason"]]
-    ready = (science.decision_ready(gates) and not in_run_gaps
+    ready = (science.decision_ready_v2(gates_flat) and not in_run_gaps
              and not hard_failures)
     rate_gaps = [f for f in failures if _rate_only(f.get("error"))]
     # ---- M6 B1: conclusion-first assessment (one minute to read) ----
     by_rec = Counter(m["recommendation"]
                      for m in module_conclusions.values())
     adv = {k: v for k, v in by_rec.items()
-           if k in ("Candidate supported by comparative evidence",
-                    "Promising candidate - evaluate",
-                    "Recommend independent benchmark")}
-    if adv.get("Candidate supported by comparative evidence"):
-        headline = ("Directly comparable published evidence supports at "
-                    "least one alternative - adoption still requires "
-                    "validation on this deployment (see module table).")
+           if k in ("Promising candidate for further evaluation",
+                    "Recommend targeted benchmark")}
+    if adv.get("Promising candidate for further evaluation"):
+        headline = ("Independently verified, directly comparable "
+                    "published evidence favours at least one "
+                    "candidate - adoption still requires validation "
+                    "on this deployment (see module table).")
     elif adv:
         headline = ("NO tool replacement is justified today. "
                     + ", ".join(f"{v}x {k}" for k, v in adv.items())
                     + f" - relevant candidates exist for {len(adv)} "
-                      "outcome type(s) but no comparable performance "
-                      "numbers were retrieved. The current tools stay "
-                      "in place.")
+                      "module(s) but no verified comparable numbers "
+                      "were retrieved. The current tools stay in "
+                      "place.")
     else:
         parts = ", ".join(f"{v}x {k}" for k, v in sorted(
             by_rec.items(), key=lambda kv: -kv[1]))
@@ -1130,7 +1773,9 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
     findings = [
         f"[{tid}] {mc['recommendation']} - {mc['rationale'][:170]}"
         for tid, mc in module_conclusions.items()
-        if mc["recommendation"] != "Retain current tool"][:6]
+        if mc["recommendation"] not in (
+            "No justified change identified",
+            "Evidence supports retaining current method")][:6]
     assessment = {
         "headline": headline,
         "scope": (f"{len(reached)} module(s) researched this run "
@@ -1215,7 +1860,12 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
         "module_table": module_table,
         "decision_ready": ready,
         "review_class": assessment["review_class"],
-        "quality_gates": gates,
+        # M8: per-module eight-dimension scientific gates, flattened;
+        # each row keeps its module + a "check" alias of the dimension
+        # for existing renderers
+        "quality_gates": gates_flat,
+        "gate_dimensions": science.GATE_DIMENSIONS,
+        "recommendation_vocabulary": science.RECOMMENDATION_LABELS_V2,
         "executive_summary": [
             assessment["headline"],
             assessment["scope"],
@@ -1248,10 +1898,14 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
              "verified_version": c["verified_version"],
              "license": c["license"], "maintenance": c["maintenance"],
              "benchmark_evidence": (
-                 f"{len(c['published_benchmark_evidence'])} retrieved "
-                 f"mention(s)" if isinstance(
-                     c["published_benchmark_evidence"], list) else
-                 "Not verified"),
+                 f"{len(c['published_benchmark_evidence'])} "
+                 f"document row(s), "
+                 f"{(c.get('measurement_verification') or {}).get('confirmed', 0)}"
+                 f" confirmed / "
+                 f"{(c.get('measurement_verification') or {}).get('corrected', 0)}"
+                 f" corrected / "
+                 f"{(c.get('measurement_verification') or {}).get('rejected', 0)}"
+                 f" rejected measurement(s)"),
              "performance_summary": c["performance_summary"],
              "independently_validated": c["independent_validation"],
              "evidence_gaps": "; ".join(c["evidence_gaps"])}
@@ -1259,7 +1913,8 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
         "literature_citations": [
             {"title": c["title"], "year": c.get("year"),
              "url": c.get("url"), "source": c.get("source"),
-             "id": c.get("id"), "targets": c.get("targets")}
+             "id": c.get("id"), "cid": c.get("cid"),
+             "targets": c.get("targets")}
             for c in citations[:60]],
         "license_constraints": sorted({c["license"] for c in candidates
                                        if c["license"] != "Not verified"}),
@@ -1272,7 +1927,7 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
         "recommended_benchmarks": {
             tid: benchmarks[tid] for tid in benchmarks
             if (module_conclusions.get(tid) or {}).get("recommendation")
-            == "Recommend independent benchmark"},
+            == "Recommend targeted benchmark"},
         "provenance": {
             "queries": (prog.get("queries") or [])[:400],
             "sources_consulted": sorted(per_source),
@@ -1289,39 +1944,57 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
                                   "from tool names extracted from "
                                   "retrieved papers; GitHub hits are "
                                   "identity suggestions only; EVERY "
-                                  "candidate passes the fixed eligibility "
-                                  "screen (science.screen_candidate) "
-                                  "before entering any comparison; "
+                                  "candidate then passes the M8 chain - "
+                                  "identity resolution (>=2 corroborating "
+                                  "axes, never merged on a name), "
+                                  "relevance by POSITIVE evidence only "
+                                  "(keyword absence never means "
+                                  "irrelevance), per-document claim "
+                                  "extraction with exact spans, an "
+                                  "INDEPENDENT verification pass, and "
+                                  "comparability classification before "
+                                  "any pair may support a decision; "
                                   "citations deduped by DOI/PMCID then "
                                   "normalised title",
+            "citation_id_scheme": "DOI > PMCID > PMID > arXiv > record "
+                                  "id > normalised title (canonical cid "
+                                  "on every citation)",
             "failures": failures},
         "methodology": (
-            "Scope -> BASELINE identification from the deployed NeoAG "
-            "repo (workflow TOML stage+run-level groups, planner code "
-            "wiring, runner scripts, conda envs, module dirs - each tool "
-            "with file evidence) -> task-question-driven literature "
-            "retrieval (Europe PMC, PubMed, OpenAlex; benchmark/review/"
-            "method/benchmark-dataset query families) -> tool-identity "
-            "extraction from titles/abstracts -> registry verification "
-            "(GitHub, PyPI, bio.tools, bioconda) with a per-candidate "
-            "VERSION CHAIN (official releases -> git tags -> registries "
-            "-> repo version file -> papers; budget-skipped steps keep "
-            "their reason) -> ELIGIBILITY SCREEN (direct alternative / "
-            "complementary / wrapper / related-not-comparable / "
-            "irrelevant / insufficient - from the candidate's own "
-            "retrieved description, reasons persisted) -> performance "
-            "evidence extraction with a context gate (abstracts plus "
-            "bounded open-access full texts via NCBI efetch) -> "
-            "evidence-derived six-category recommendations -> research "
-            "quality gates deciding preliminary vs decision-ready. "
-            "Full query log persisted in provenance.queries."),
+            "M8 scientific workflow (docs/SCIENTIFIC_ARCHITECTURE_"
+            "2026-11-17.md): S1 scope + code-grounded baseline + "
+            "question-driven retrieval -> S2 task ontology (what each "
+            "module's endpoint quantities are) -> S3 IDENTITY "
+            "RESOLUTION per candidate name (>=2 corroborating evidence "
+            "axes; contested/unresolved names carry no version/"
+            "license/performance claim) -> S4 RELEVANCE by positive "
+            "evidence only, with a research-state ladder and recorded "
+            "follow-up queries; a bounded deepening pass EXECUTES "
+            "those follow-ups within the run budget -> S5 baseline "
+            "levels (declared pins, installed probe, intended-vs-"
+            "achieved consensus as separate fields) -> S6 per-document "
+            "claim extraction (grammar, exact spans, CI/range/p-value "
+            "masking) -> S7 INDEPENDENT verification pass over the "
+            "same spans (confirm / correct / reject) -> S8 "
+            "COMPARABILITY classes (direct requires same metric + "
+            "matched documented conditions incl. modality; indirect "
+            "never licenses superiority) -> S9 five-label synthesis "
+            "as a pure function of the stage facts + eight scientific "
+            "gate dimensions (identity, relevance, baseline, evidence, "
+            "comparability, recommendation consistency, coverage, "
+            "provenance integrity); DECISION-READY only when every one "
+            "actually passes. Full query log persisted in provenance."
+            "queries."),
         "limitations": [
             "abstracts/metadata are the evidence floor; full texts were "
             "attempted ONLY for open-access PMC deposits via efetch "
             "(Europe PMC's fullTextXML sub-endpoint is unreachable from "
-            "this host - measured 2026-11-16); metrics without an "
-            "established dataset/ground-truth context are quoted but "
-            "excluded from comparisons",
+            "this host - measured 2026-11-16); every metric shown was "
+            "re-parsed independently from its quoted span - rejected "
+            "attributions are recorded but enter NO comparison, and a "
+            "DIRECT pair additionally requires matched documented "
+            "conditions (silence about sequencing modality alone keeps "
+            "a pair indirect)",
             "NOT an exhaustive search of the literature",
             "no tool was executed: NO independent benchmark numbers exist "
             "in this report ('our own experiments' column is empty by "
