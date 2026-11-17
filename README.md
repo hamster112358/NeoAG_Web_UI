@@ -378,6 +378,17 @@ what that report got wrong is what this milestone changed.
   errors get concise answers per the workspace rules instead of
   minutes of tool churn.
 
+Milestone 6 verification (2026-11-17): battery 138/138; discovery
+E2E 34/34 including a full live targeted run (honest GitHub
+rate-limit pacing made it ~20 min - suites wait for terminal
+status, never pre-empt it); real-mode agent E2E 35/35. Final live
+study res-20261117-120638-dcdab1: 8/8 quality gates,
+decision-ready, "Insufficient evidence" for presentation (relevant
+candidates found, no performance number with established context)
+and "Retain current tool" for HLA typing (nothing passed the
+eligibility screen) - no junk alternatives, no false
+"Research incomplete" demotions.
+
 ## Architecture
 
 ```
@@ -502,8 +513,8 @@ Fixes (verified: live 12/12 + battery 64-68 + real-mode R7/R8):
 
 | Feature | Status |
 | --- | --- |
-| Conversation persistence (new/list/rename/soft-delete/switch/restore) | **works** (verified 91-check battery + restart E2E) |
-| Real-agent chat with execution (gated) | **works** - default-mode job + PreToolUse gate; 31/31 E2E incl. block/card/grant/retry loop, stop, terminal states |
+| Conversation persistence (new/list/rename/soft-delete/switch/restore) | **works** (verified 138-check battery + restart E2E) |
+| Real-agent chat with execution (gated) | **works** - default-mode job + PreToolUse gate; 35/35 E2E incl. block/card/grant/retry loop, stop, terminal states |
 | Confirmation cards (six-item explanation, single-use grant) | **works** (E2E-verified) |
 | Parameter inventory, manifests, job kinds, decision history, modes | **works** (unchanged engine + battery) |
 | Artifact manifest + outcome taxonomy + drift detection | **works** (battery 69-78, incl. forced-downgrade scenario) |
@@ -518,7 +529,7 @@ Fixes (verified: live 12/12 + battery 64-68 + real-mode R7/R8):
 | Native engine adapter (probe/plan/preview; approved-profile runs) | **works on synthetic demo inputs**; real-data execution out of scope; plan preview executes nothing (HTTP smoke) |
 | Four-concern scientific config + control-panel isolation | **works** (battery 96, 127; requested/effective split per run) |
 | Dataset consent enforced at the gate + at benchmark submit | **works** (battery 101-102, 118; bounded 72 h scope, dataset-name-matched consent) |
-| Discovery decision system + compatibility / adoption-plan actions | **works** (battery 103-108, 119; discovery E2E on live reports) |
+| Discovery decision system: eligibility screen, recommendation ladder, quality gates, compatibility / adoption-plan actions | **works** (battery 103-108, 119, 128-138; discovery E2E 34/34 on live reports) |
 | Benchmark jobs: brief card, consent, real paired metrics / plan-only arms, reproducibility | **works on the mock fixture** (battery 116-121 + dedicated E2E; external tools = honest run plans, never simulated numbers) |
 | Downloadable exports (HTML/JSON/TSV/PDF) + scoped results bundles | **works** - content-hash-pinned, versioned, access-controlled, raw reads excluded with recorded reasons (battery 109-115, 120) |
 | Real pipeline execution | **not implemented** (by design; the native adapter plans/previews for real but executes only on synthetic demo inputs, always as an approved formal job) |
@@ -540,6 +551,20 @@ Fixes (verified: live 12/12 + battery 64-68 + real-mode R7/R8):
 
 ## Verification performed
 
+- 2026-11-17 (milestone 6): `tests/verify_battery.py` **138/138
+  PASS** (rewrote 105-108 against the new decision contract, fixed
+  two fixtures that silently discarded 4xx bodies, 136-137 cover
+  the pin/archive flags endpoint - which exposed a real SQL bug in
+  `store.conv_set_flags` - and the in-flight mode-switch refusal,
+  138 pins the candidate-identity contract offline);
+  `tests/verify_discovery.py` **34/34 PASS** against the LIVE
+  engine (adds eligibility-fixture checks 31-32 and check 34:
+  every not-on-registry row is a tagged recorded outcome and no
+  module is demoted without a genuine hard failure; live targeted
+  run ~20 min under honest GitHub rate-limit pacing);
+  `tests/verify_real_agent.py` **35/35**; final live study
+  res-20261117-120638-dcdab1 decision-ready with 8/8 gates and no
+  junk alternatives (see milestone 6 section).
 - 2026-11-16 (milestone 5): `tests/verify_battery.py` **127/127
   PASS** (adds 103-108 discovery-decision shape on a real live
   report incl. context-gating + coverage accounting + fixed
