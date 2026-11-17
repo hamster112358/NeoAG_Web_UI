@@ -397,6 +397,8 @@ RELATIONSHIPS = [
 # task (or of any task) appears in the same text.
 GENERIC_NON_METHOD = [
     "visualisation library", "visualization library", "data visuali",
+    "visualisation system", "visualization system",
+    "visualisation toolkit", "visualization toolkit",
     "interactive html", "html bindings", "html widgets", "widgets for",
     "javascript library", "web framework", "web application",
     "dashboard", "notebook extension", "jupyter widget",
@@ -409,6 +411,27 @@ _GENERIC_NON_RX = re.compile(
 _LIT_CUE_RX = re.compile(
     r"\b(?:we (?:present|introduce|develop|describe|propose)|"
     r"here(?:,| we)|called|named|titled)\b", re.I)
+
+# ---- capability-claim grammar (independent-corpus errors 2026-11-17) ----
+# Two general frames in which a paper/document states that the NAMED
+# SUBJECT performs the task's function, without any intro cue:
+#   A  "<Name>: <capability> <function noun> of Y ..."   (method-paper
+#      title frame: "Arriba: fast and accurate detection of ...")
+#   B  "<Name> provides|delivers|enables|... <function noun> ..."
+#      ("HLA-LA provides ultrafast and accurate HLA ... typing")
+# Both are sentence-frame grammars - never name lists. A review
+# sentence ("methods that estimate ...", "detection of X was
+# benchmarked") matches neither frame, so domain vocabulary alone
+# still stays non-promoting.
+_FUNC_NOUN = (r"(?:detection|detecting|typing|genotyping|quantification"
+              r"|segmentation|prediction|inference|identification"
+              r"|scoring|ranking|prioriti[sz]ation|normali[sz]ation"
+              r"|assembl(?:y|ing)|variant calling)")
+_FUNC_CLAIM_RX = re.compile(
+    r"^[A-Za-z][\w+.-]{1,20}\s*[:\u2013-]\s*[^.]{0,80}?\b"
+    + _FUNC_NOUN + r"\b"
+    + r"|\b(?:provides?|delivers?|enables?|permits?|allows?|performs?"
+      r"|achieves?)\b[^.;]{0,90}?\b" + _FUNC_NOUN + r"\b", re.I)
 
 _STATE_GLOSS = {
     "discovered": "a candidate name was retrieved",
@@ -446,6 +469,10 @@ def _doc_probe(task, text):
     comp = ontology.match_complement(task, low)
     non = [m.group(0) for m in _GENERIC_NON_RX.finditer(low)]
     meth = [t for t in METHOD_SIGNAL if t in low]
+    if _FUNC_CLAIM_RX.search(low):
+        # the named subject is documented as PERFORMING the function
+        # (title/predicate capability frame) - a positive method claim
+        meth = meth + ["documented capability claim"]
     wrap = [t for t in WRAPPER_SIGNAL if t in low]
     strong_wrap = any(t in low for t in STRONG_WRAPPER)
     # an independent-algorithm claim: a method signal that is not
@@ -813,7 +840,16 @@ def extract_tool_mentions(records, profile) -> list[dict]:
                 introduced = (introduced or "").strip(".,;:()\"'")
                 if not introduced:
                     nxt = _TOOL_SHAPE.search(sent, cue_m.end())
-                    introduced = nxt.group(0) if nxt else ""
+                    # the introduced name sits GRAMMATICALLY ADJACENT
+                    # to the cue ("we present X", "named X"). A shape
+                    # token further into the sentence is not the cue's
+                    # object: "we present pViz, a shiny app ...
+                    # visualisation of genomic HTML reports" must not
+                    # crown HTML as the introduced method (measured
+                    # smoke case - acronym reached through a 24-char
+                    # gap because pViz itself is not tool-shaped)
+                    if nxt and nxt.start() - cue_m.end() <= 12:
+                        introduced = nxt.group(0)
             for m in _TOOL_SHAPE.findall(sent):
                 if m.lower() in _STOP or len(m) < 4:
                     continue
@@ -831,10 +867,12 @@ def extract_tool_mentions(records, profile) -> list[dict]:
                     continue
                 cue = bool(introduced and m.lower() == introduced.lower())
                 if not cue:
-                    if not re.search(r"[a-z][A-Z]|\d", m):
-                        # only tool-shaped internal caps or digits
-                        # pass for mere mentions - pure Title-Case
-                        # words stay out
+                    if not re.search(r"[a-z][A-Z]|\d|[A-Z]{2,}[a-z]",
+                                     m):
+                        # tool-shaped tokens only for mere mentions:
+                        # internal caps (HapASeg), digits, or an
+                        # ACRONYM+suffix hybrid (CNVkit, RNAseq) -
+                        # pure Title-Case words stay out
                         continue
                     if not in_domain:
                         continue

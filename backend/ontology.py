@@ -127,7 +127,11 @@ TASK_DEFS = {
             r"somatic copy[ -]number alteration",
         ],
         complement_terms=[
-            r"variant allele frequency", r"\bvaf\b", r"clonal deconvolution",
+            # frequenc(y|ies): the plural drops the 'y' - a literal
+            # "frequency" pattern silently misses "frequencies"
+            # (independent-corpus case pyclone-purity, 2026-11-17)
+            r"variant allele frequenc(?:y|ies)", r"\bvaf\b",
+            r"clonal deconvolution",
             r"subclone\w*", r"mutational burden", r"\btmb\b",
             r"genom\w* instability", r"loss of heterozygosity detection "  # LOH-only tools
             r"from (?:hla|expression)",
