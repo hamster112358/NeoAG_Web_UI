@@ -446,6 +446,48 @@ chk("S3 registry home URL keyed on project, not the registry page "
     ident_home["status"] == "resolved" and ident_home.get("n_axes") == 2,
     (ident_home["status"], ident_home.get("n_axes"),
      [c.get("project") for c in ident_home.get("considered") or []]))
+_AB_STG = ("STGBench: a benchmark for somatic copy number detection. "
+           "The suite is available at https://github.com/Icarus200110/"
+           "STGBench. It evaluates callers on CNVs in simulated "
+           "cohorts.")
+_stg_cit = [{"id": "pmc:stg", "title": "", "abstract": _AB_STG}]
+stg = identity.resolve_identity(
+    "STGBench", TASK, citations=_stg_cit,
+    extra_evidence=[{"axis": "naming-paper",
+                     "detail": "paper presents STGBench"}],
+    github_hits=[{"id": "Icarus200110/STGBench", "description": "",
+                  "stars": 1, "archived": False}])
+_stg_merged = [c for c in (stg.get("considered") or [])
+               if {"literature-url", "github-name-hit"}
+               <= set(c.get("axes") or {})]
+chk("S3 sentence-final period trimmed from paper URL so it merges "
+    "with the github hit (2026-11-17: 'STGBench.' split the project)",
+    stg["status"] == "resolved" and bool(_stg_merged),
+    (stg["status"], [c.get("project") for c in
+                     stg.get("considered") or []]))
+cnvs = identity.resolve_identity(
+    "CNVs", TASK, citations=_stg_cit,
+    component_probe=lambda proj, name: True)
+chk("S3 generic plural acronym must NOT inherit another tool's "
+    "availability URL or get component-probed through it",
+    cnvs["status"] != "resolved" and "component" not in
+    "".join("".join((c.get("axes") or {}).keys())
+            for c in cnvs.get("considered") or []),
+    (cnvs["status"], [c.get("project") for c in
+                      cnvs.get("considered") or []]))
+hm = identity.resolve_identity(
+    "PURPLE", TASK,
+    citations=[{"id": "doi:hm", "title": "",
+                "abstract": "PURPLE is part of the hmftools suite, "
+                            "available at https://github.com/hmftools/"
+                            "solutions for purity and ploidy."}],
+    extra_evidence=[{"axis": "naming-paper",
+                     "detail": "paper presents PURPLE/hmftools"}])
+chk("S3 org-style mention stays valid when name and URL share the "
+    "sentence (PURPLE-inside-hmftools class)",
+    hm["status"] == "resolved" and "hmftools" in
+    str(hm.get("resolved_project")),
+    (hm["status"], hm.get("resolved_project")))
 coll = identity.resolve_identity(
     "PURPLE", TASK,
     registry_hits=[{"id": "purple", "title": "purple",

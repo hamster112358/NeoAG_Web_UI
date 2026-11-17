@@ -60,7 +60,7 @@ def _norm_key(kind: str, ident: str) -> str:
     """Stable project key so the same project found via several routes
     (literature URL 'github.com/x/y', registry link, github search)
     merges into ONE considered entry."""
-    ident = (ident or "").strip().rstrip("/").lower()
+    ident = (ident or "").strip().rstrip("/.,;:").lower()
     if ident.startswith("github.com/"):
         return "gh:" + ident[len("github.com/"):].split("#")[0]
     if re.fullmatch(r"[a-z0-9-]+/[a-z0-9._~+-]+", ident):
@@ -136,18 +136,31 @@ def resolve_identity(name: str, task: dict, citations=(),
 
     # ---- axis: literature URLs inside naming citations ----
     lit_projects: set[str] = set()
+    name_rx = (re.compile(r"\b" + re.escape(name_l) + r"\b")
+               if name_l else None)
     for c in citations or ():
         blob = f"{c.get('title') or ''} {c.get('abstract') or ''}"
         if name_l and name_l not in blob.lower():
             continue
-        for m in _URL_RE.finditer(blob):
-            u = m.group(1)
-            cnd = _get(u, f"URL in naming paper "
-                          f"{c.get('id') or c.get('title', '')[:40]}")
-            cnd.url = cnd.url or f"https://{u}"
-            cnd.add("literature-url", f"{c.get('id') or 'paper'} links "
-                                      f"{u}")
-            lit_projects.add(cnd.project)
+        # a URL corroborates THIS tool only when the SENTENCE carrying
+        # it also names the tool: an abstract that merely contains the
+        # name-like word (the plural acronym "CNVs" occurs in most CNV
+        # abstracts) or discusses other tools must not graft its
+        # availability link onto this candidate (measured 2026-11-17:
+        # candidates "CNVs"/"AneuFinder" resolved to STGBench's repo
+        # through STGBench's own availability sentence)
+        for sent in re.split(r"(?<=[.!?;])\s+|\n+", blob.lower()):
+            if not sent or (name_rx and not name_rx.search(sent)):
+                continue
+            for m in _URL_RE.finditer(sent):
+                # sentence-final punctuation is not part of the URL
+                u = m.group(1).rstrip(".,;:!?")
+                cnd = _get(u, f"URL in naming paper "
+                              f"{c.get('id') or c.get('title', '')[:40]}")
+                cnd.url = cnd.url or f"https://{u}"
+                cnd.add("literature-url", f"{c.get('id') or 'paper'} "
+                                          f"links {u}")
+                lit_projects.add(cnd.project)
         # org-style mentions: "available at github.com/org/repo"
     # ---- axis: naming paper ----
     for e in extra_evidence or ():
@@ -169,7 +182,8 @@ def resolve_identity(name: str, task: dict, citations=(),
             det = str(e.get("detail") or "")
             hit = None
             for m in _URL_RE.finditer(det):
-                hit = _get(m.group(1), e.get("source", "deployment"))
+                hit = _get(m.group(1).rstrip(".,;:!?"),
+                           e.get("source", "deployment"))
                 break
             if hit is None:
                 hit = _get(f"name:{name_l}",
