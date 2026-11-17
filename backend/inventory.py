@@ -83,18 +83,21 @@ _SCRIPT_TOKEN = re.compile(
 
 
 def _conda_pins(repo: Path) -> dict:
-    """tool -> (version|None, env file) from the repo's env yml files."""
+    """tool -> (version|None, env file) from the repo's env yml files.
+
+    M8 fix (root-cause 1.4): the old regex accepted only 'name==ver'
+    while conda ymls write 'name=ver', silently dropping every pin
+    (facets/sequenza/ascat all parsed to None against the real repo).
+    Parsing is delegated to baselines.parse_conda_env, which handles
+    name=X.Y, name==X.Y and unpinned forms; the tuple shape is kept
+    for existing call sites."""
+    from .baselines import repo_conda_pins
     pins = {}
-    for env in sorted((repo / "conda").glob("*.y*ml")):
-        try:
-            for line in env.read_text(errors="replace").splitlines():
-                m = re.match(r"\s+-\s+([A-Za-z0-9_.\-]+)(?:==([\w.\-]+))?$",
-                             line)
-                if m and re.search(r"[a-z]", m.group(1)):
-                    pins.setdefault(m.group(1).lower(),
-                                    (m.group(2), env.name))
-        except OSError:
-            continue
+    for tool, entries in repo_conda_pins(repo).items():
+        first = next((e for e in entries if e.get("version")),
+                     entries[0] if entries else None)
+        if first:
+            pins.setdefault(tool, (first.get("version"), first["file"]))
     return pins
 
 

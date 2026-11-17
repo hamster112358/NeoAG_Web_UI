@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import re
 
+from . import ontology
+
 ELIGIBILITY_VOCABULARY = [
     "direct alternative",
     "complementary method",
@@ -55,6 +57,18 @@ WRAPPER_SIGNAL = ["wraps", "wrapper", "interface to", "interface for",
                   "encapsulates", "container for", "snakemake", "nextflow",
                   "galaxy", "cwl", "api server", "web server for",
                   "web interface", "shiny app", "gui"]
+
+# A wrapper that SAYS it wraps is a wrapper whatever else its blurb
+# mentions; a bare workflow-engine word only means wrapper when there
+# is no independent-algorithm claim (a tool may legitimately ship a
+# pipeline runner alongside a real algorithm).
+STRONG_WRAPPER = ["wraps", "wrapper", "encapsulates", "interface to",
+                  "interface for", "container for", "web server for",
+                  "web interface", "shiny app", "gui"]
+# method words that do NOT by themselves assert an independent
+# algorithm (they name integration, packaging or execution):
+_INTEGRATION_WORDS = {"pipeline", "workflow", "program", "platform",
+                      "framework", "package", "library"}
 
 
 def _hit(terms, blob):
@@ -337,9 +351,389 @@ def screen_candidate(name: str, blurb: str, *, profile: dict,
 
 
 # ---------------------------------------------------------------------------
+# M8 S4: assess_relevance - positive-evidence-only relevance (PART 2.4)
+# ---------------------------------------------------------------------------
+#
+# Root-cause 1.1 (PureCN declared "irrelevant" with "none of this
+# module's domain vocabulary" while its 2.0 Bioinformatics paper was
+# in the retrieved set) came from an absence rule: no keyword ->
+# excluded, high confidence. Absence of a keyword is not positive
+# evidence of irrelevance - it is missing information. This function
+# implements the S4 contract (docs/SCIENTIFIC_ARCHITECTURE_2026-11-17):
+#
+#   * 'unrelated' requires a POSITIVE mismatch, from exactly three
+#     sources, each recorded as a basis item with its document:
+#       (a) the candidate's own retrieved text matches the task's
+#           off-domain vocabulary (cybersecurity, recommendation...);
+#       (b) it matches the generic non-method-artifact vocabulary
+#           (visualisation / notebook widget / web framework - an
+#           artifact whose documented function produces no
+#           measurement of any task quantity) - the class of error
+#           that once mapped "facets" to Google's visualisation
+#           library while claiming irrelevance "by vocabulary";
+#       (c) it positively matches ANOTHER research task's domain
+#           while matching none of this task's (function documented
+#           elsewhere).
+#   * every other non-match yields 'unresolved' + concrete followup
+#     queries - never a terminal exclusion;
+#   * a research_state ladder records how far the investigation got,
+#     each transition licensed by the evidence object that enabled
+#     it (a naming method-paper counts as function evidence - fix
+#     1.2).
+
+RESEARCH_STATES = [
+    "discovered", "identity-verified", "relevance-established",
+    "function-characterized", "availability-verified",
+    "performance-retrieved", "evidence-compared",
+    "compatibility-assessed"]
+
+RELATIONSHIPS = [
+    "direct-alternative", "partial-overlap", "complementary",
+    "upstream", "downstream", "wrapper", "alternative-implementation",
+    "unrelated", "unresolved"]
+
+# Artifact kinds that cannot produce a measurement of anything:
+# name-independent vocabulary, applied only when NO domain term of the
+# task (or of any task) appears in the same text.
+GENERIC_NON_METHOD = [
+    "visualisation library", "visualization library", "data visuali",
+    "interactive html", "html bindings", "html widgets", "widgets for",
+    "javascript library", "web framework", "web application",
+    "dashboard", "notebook extension", "jupyter widget",
+    "plotting library", "for plotting", "plot library",
+    "recommendation system", "chatbot", "static site",
+    "chrome extension", "browser extension"]
+_GENERIC_NON_RX = re.compile(
+    "|".join(re.escape(t) for t in GENERIC_NON_METHOD), re.I)
+
+_LIT_CUE_RX = re.compile(
+    r"\b(?:we (?:present|introduce|develop|describe|propose)|"
+    r"here(?:,| we)|called|named|titled)\b", re.I)
+
+_STATE_GLOSS = {
+    "discovered": "a candidate name was retrieved",
+    "identity-verified": ("the project behind the name is corroborated "
+                          "by >=2 independent evidence axes"),
+    "relevance-established": ("its documented function is positively "
+                              "related to this task"),
+    "function-characterized": ("a naming paper or method description "
+                               "characterises what it computes"),
+    "availability-verified": "found on a registry NeoAG could install "
+                             "from",
+    "performance-retrieved": ("at least one measurement was extracted "
+                              "and independently verified"),
+    "evidence-compared": "verified measurements were compared on a "
+                         "shared comparison class",
+    "compatibility-assessed": ("the integration surface in NeoAG's code "
+                               "was inspected"),
+}
+
+
+def _basis(claim, doc_cid, text, term):
+    span = None
+    if term:
+        i = (text or "").lower().find(term.lower())
+        if i >= 0:
+            span = [i, i + len(term)]
+    return {"claim": claim, "doc_cid": doc_cid, "term": term,
+            "text_span": span}
+
+
+def _doc_probe(task, text):
+    low = text or ""
+    dom = ontology.match_domain(task, low)
+    off = ontology.match_off_domain(task, low)
+    comp = ontology.match_complement(task, low)
+    non = [m.group(0) for m in _GENERIC_NON_RX.finditer(low)]
+    meth = [t for t in METHOD_SIGNAL if t in low]
+    wrap = [t for t in WRAPPER_SIGNAL if t in low]
+    strong_wrap = any(t in low for t in STRONG_WRAPPER)
+    # an independent-algorithm claim: a method signal that is not
+    # merely an integration/packaging word, or an intro cue
+    algo = [m for m in meth if m not in _INTEGRATION_WORDS]
+    cue = bool(_LIT_CUE_RX.search(low))
+    return {"domain": dom, "off_domain": off, "complement": comp,
+            "non_method_artifact": non, "method": meth,
+            "algo": algo, "wrapper": wrap, "strong_wrapper": strong_wrap,
+            "intro_cue": cue}
+
+
+def _foreign_domain_hit(task_id, texts):
+    """Positive mismatch (c): the text belongs to ANOTHER defined
+    research task - matched by that task's own domain regexes, never
+    by a name list. Returns (other_task_id, terms) or None."""
+    for tid in ontology.TASK_DEFS:
+        if tid == task_id:
+            continue
+        other = ontology.task_for(tid)
+        for text in texts:
+            hits = ontology.match_domain(other, text)
+            if len(hits) >= 2:
+                return tid, hits[:3]
+    return None
+
+
+def assess_relevance(name, docs, *, task, task_id="", identity=None,
+                     artifact_class="", lit_introduced=False,
+                     availability=None, verified_claims=0,
+                     compared=False, baseline_name="") -> dict:
+    """S4: RelevanceDecision for one candidate.
+
+    docs: [{"doc_cid": str, "kind": str, "text": str}] - EVERY piece
+    of text this run retrieved about this candidate (registry blurbs,
+    citation titles/abstracts, full text). identity: IdentityRecord
+    (identity.resolve_identity) or None.
+    """
+    docs = [d for d in docs if (d.get("text") or "").strip()]
+    q0 = (ontology.quantities(task) or ["this task's endpoint quantity"])[0]
+    m0 = (ontology.metrics(task) or ["benchmark"])[0]
+    probes = [(d, _doc_probe(task, d.get("text") or "")) for d in docs]
+    dom_docs = [(d, p) for d, p in probes if p["domain"]]
+    all_text = [d.get("text") or "" for d in docs]
+    transitions = [{"state": "discovered",
+                    "evidence": f"name {name!r} retrieved"}]
+    followups = []
+    basis: list[dict] = []
+    reasons: list[str] = []
+    relationship = "unresolved"
+    confidence = "low"
+    comparable = False
+
+    id_status = (identity or {}).get("status") or "not attempted"
+    if id_status == "resolved":
+        transitions.append({
+            "state": "identity-verified",
+            "evidence": f"identity resolved to "
+                        f"{(identity or {}).get('resolved_project')} "
+                        f"via {identity.get('n_axes')} axes"})
+    elif id_status == "contested":
+        reasons.append("identity contested between corroborated "
+                       "projects - version/performance attribution "
+                       "blocked until disambiguated")
+
+    if not docs:
+        followups += [
+            {"query": f'"{name}" official implementation',
+             "source": "github", "purpose": "find the project behind "
+                                            "the name"},
+            {"query": f"{name} {q0}",
+             "source": "europepmc", "purpose": "find literature naming "
+                                               "the tool"}]
+        return _relevance_out(
+            relationship, "n/a", False, [], transitions, followups,
+            ["no text of any kind was retrieved about this candidate "
+             "- unclassified, NOT irrelevant"], verified_claims,
+            compared, task)
+
+    # ---- positive-mismatch paths --------------------------------
+    dom_any = bool(dom_docs)
+    off_doc = next(((d, p) for d, p in probes
+                    if p["off_domain"] and not p["domain"]), None)
+    non_doc = next(((d, p) for d, p in probes
+                    if p["non_method_artifact"] and not p["domain"]),
+                   None)
+    foreign = None if dom_any else _foreign_domain_hit(task_id, all_text)
+    if not dom_any and off_doc:
+        d, p = off_doc
+        relationship = "unrelated"
+        confidence = "high"
+        for t in p["off_domain"][:3]:
+            basis.append(_basis("retrieved text about this candidate "
+                                "belongs to an unrelated field",
+                                d["doc_cid"], d.get("text"), t))
+        reasons.append(
+            "positive mismatch: its own retrieved description uses the "
+            f"vocabulary of an unrelated field ({', '.join(p['off_domain'][:3])}) "
+            "while showing no connection to any quantity this task "
+            "measures")
+    elif not dom_any and non_doc:
+        d, p = non_doc
+        relationship = "unrelated"
+        confidence = "high"
+        for t in p["non_method_artifact"][:3]:
+            basis.append(_basis("documented function is a "
+                                "visualisation/UI artifact, which "
+                                "produces no measurement",
+                                d["doc_cid"], d.get("text"), t))
+        reasons.append(
+            "positive mismatch: the retrieved description documents a "
+            f"non-measurement artifact ({', '.join(p['non_method_artifact'][:2])}); "
+            "no retrieved text connects it to any endpoint quantity "
+            "of this task")
+    elif not dom_any and foreign:
+        relationship = "unrelated"
+        confidence = "medium"
+        reasons.append(
+            "positive mismatch: its retrieved text is squarely about "
+            f"the '{foreign[0]}' task ({', '.join(foreign[1])}) and "
+            "shows none of this task's domain")
+        basis.append({"claim": f"text matches task '{foreign[0]}' "
+                               "domain vocabulary",
+                      "doc_cid": "any", "term": foreign[1][0],
+                      "text_span": None})
+    elif not dom_any and any(p["complement"] for _, p in probes):
+        d, p = next((d, p) for d, p in probes if p["complement"])
+        relationship = "complementary"
+        confidence = "medium"
+        for t in p["complement"][:3]:
+            basis.append(_basis("retrieved text names an adjacent "
+                                "role of this stage", d["doc_cid"],
+                                d.get("text"), t))
+        transitions.append({
+            "state": "relevance-established",
+            "evidence": f"complement terms: "
+                        f"{', '.join(p['complement'][:3])}"})
+        reasons.append(
+            "its retrieved text documents an adjacent role of this "
+            f"task ({', '.join(p['complement'][:2])}) rather than the "
+            "task's own endpoint measurement - discuss alongside the "
+            "baseline, never as its replacement")
+    elif not dom_any:
+        # ABSENCE of vocabulary = missing information, not irrelevance
+        relationship = "unresolved"
+        confidence = "low"
+        followups += [
+            {"query": f'"{name}" {q0}', "source": "europepmc",
+             "purpose": "does any paper tie this name to the task's "
+                        "measured quantity?"},
+            {"query": f'"{name}" official implementation',
+             "source": "github",
+             "purpose": "documentation of what the project does"},
+            {"query": f'"{name}" {m0} benchmark',
+             "source": "europepmc",
+             "purpose": "third-party evaluation naming it"}]
+        if id_status == "resolved":
+            reasons.append(
+                "identity is verified but no retrieved text yet "
+                "relates the project to this task's quantities - "
+                "investigation continues (deeper retrieval), not "
+                "exclusion")
+        else:
+            reasons.append(
+                "no positive evidence of relevance OR irrelevance was "
+                "retrieved - the candidate stays open for follow-up")
+    else:
+        # ---- domain evidence exists: classify the relationship ----
+        d0, p0 = dom_docs[0]
+        for d, p in dom_docs[:3]:
+            for t in p["domain"][:2]:
+                basis.append(_basis("retrieved text names this task's "
+                                    "domain", d["doc_cid"],
+                                    d.get("text"), t))
+        meth_any = any(p["method"] for _, p in probes)
+        algo_any = any(p["algo"] for _, p in probes)
+        cue_any = lit_introduced or any(p["intro_cue"] for _, p in probes)
+        comp_any = any(p["complement"] for _, p in probes)
+        strong_wrap = any(p["strong_wrapper"] for _, p in probes) or \
+            artifact_class == "workflow wrapper"
+        wrap_any = strong_wrap or any(p["wrapper"] for _, p in probes) or \
+            artifact_class in ("tool collection",
+                               "pipeline (multi-stage workflow)")
+        if strong_wrap or (wrap_any and not algo_any and not cue_any):
+            relationship = "wrapper"
+            confidence = "medium"
+            transitions.append({
+                "state": "relevance-established",
+                "evidence": f"domain terms: "
+                            f"{', '.join(p0['domain'][:3])} "
+                            f"(wrapper)"})
+            reasons.append("domain-relevant, but presented as an "
+                           "integration of existing methods rather "
+                           "than an independent algorithm")
+        elif algo_any or cue_any or id_status == "resolved":
+            relationship = "direct-alternative"
+            confidence = ("high" if len(dom_docs) >= 2
+                          or id_status == "resolved" else "medium")
+            transitions.append({
+                "state": "relevance-established",
+                "evidence": f"domain terms: "
+                            f"{', '.join(p0['domain'][:3])}"})
+            why = ("method/software signal in its retrieved "
+                   "description" if meth_any else
+                   "introduced as a method by a retrieved paper"
+                   if cue_any else
+                   "identity resolved to the project the literature "
+                   "describes as a method")
+            reasons.append(
+                f"domain evidence ({', '.join(p0['domain'][:2])}) plus "
+                f"a positive method claim ({why})")
+        else:
+            relationship = "unresolved"
+            confidence = "low"
+            followups.append(
+                {"query": f'"{name}" software OR tool OR package {q0}',
+                 "source": "europepmc",
+                 "purpose": "is there a runnable method behind this "
+                            "domain mention?"})
+            reasons.append(
+                "domain vocabulary present, but nothing retrieved so "
+                "far shows whether an actual method exists - kept "
+                "open, not promoted")
+        if comp_any and relationship == "direct-alternative":
+            comp0 = next((t for _, p in probes if p["complement"]
+                          for t in p["complement"]), "")
+            reasons.append(f"also touches complementary roles of this "
+                           f"stage ({comp0})")
+        comparable = relationship == "direct-alternative"
+
+    # ---- state ladder tail ---------------------------------------
+    if relationship == "direct-alternative" or lit_introduced:
+        fn_doc = next((d for d, p in probes
+                       if p["domain"] and (p["algo"]
+                                           or p["intro_cue"])), None)
+        if fn_doc is not None or lit_introduced:
+            transitions.append({
+                "state": "function-characterized",
+                "evidence": "naming/method text in "
+                            f"{fn_doc['doc_cid'] if fn_doc else 'naming paper'}"})
+    if availability and any(availability.values()):
+        transitions.append({
+            "state": "availability-verified",
+            "evidence": "found on: " + ", ".join(k for k, v in
+                                                 availability.items()
+                                                 if v)})
+    if verified_claims:
+        transitions.append({
+            "state": "performance-retrieved",
+            "evidence": f"{verified_claims} verified measurement(s)"})
+    if compared:
+        transitions.append({"state": "evidence-compared",
+                            "evidence": "shared comparison class found"})
+    if baseline_name and relationship == "unresolved":
+        followups.append(
+            {"query": f'"{name}" vs {baseline_name}',
+             "source": "europepmc",
+             "purpose": "head-to-head evaluation against the current "
+                        "baseline"})
+    return _relevance_out(relationship, confidence, comparable, basis,
+                          transitions, followups, reasons,
+                          verified_claims, compared, task)
+
+
+def _relevance_out(relationship, confidence, comparable, basis,
+                   transitions, followups, reasons, verified_claims,
+                   compared, task):
+    reached = [t["state"] for t in transitions]
+    if verified_claims and "performance-retrieved" not in reached:
+        reached.append("performance-retrieved")
+    if compared and "evidence-compared" not in reached:
+        reached.append("evidence-compared")
+    state = reached[-1] if reached else "discovered"
+    return {"relationship": relationship,
+            "confidence": confidence,
+            "comparable_for_replacement": bool(comparable),
+            "basis": basis,
+            "research_state": state,
+            "state_transitions": transitions,
+            "research_states_remaining":
+                [s for s in RESEARCH_STATES if s not in reached],
+            "followups": followups,
+            "reasons": reasons}
+
+
+# ---------------------------------------------------------------------------
 # A4: tool-identity extraction from retrieved literature (not from memory)
 # ---------------------------------------------------------------------------
-
 _INTRO_CUE = re.compile(
     r"(?:we (?:present|introduce|develop|describe|propose)|here (?:we|"
     r"call)|called|named|known as|the (?:tool|software|algorithm|method|"

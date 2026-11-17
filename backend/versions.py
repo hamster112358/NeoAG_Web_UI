@@ -61,7 +61,7 @@ def _is_pre(text: str, gh_prerelease=False) -> bool:
 # ---------------------------------------------------------------------------
 
 def resolve(name: str, *, repo: str | None = None, citations=(),
-            probes=None, budget=None, cache=None) -> dict:
+            probes=None, budget=None, cache=None, prefer=None) -> dict:
     """Run the version chain for one candidate.
 
     probes  : optional dict {releases_tags, pypi, bioconda, version_file,
@@ -72,12 +72,19 @@ def resolve(name: str, *, repo: str | None = None, citations=(),
               it is exhausted.
     cache   : optional dict keyed by lower(name) - one chain per tool per
               run (registry + GitHub state do not change mid-run).
+    prefer  : the registry channel this deployment actually installs
+              from (root-cause 1.4: picking PyPI's 2.8.1 while the
+              deployment pins bioconda 3.2.0 stated the wrong
+              distribution's version as THE stable). When set, the
+              registry fallback consults that channel first and the
+              verdict names the channel explicitly; other channels'
+              values stay recorded in the chain.
     """
     key = (name or "").lower()
     if cache is not None and key in cache:
         return cache[key]
     P = dict(releases_tags=None, pypi=None, bioconda=None,
-             version_file=None, head_commit=None)
+             bioconductor=None, version_file=None, head_commit=None)
     if probes:
         P.update({k: v for k, v in probes.items() if v})
     if not all(P.values()):
@@ -85,6 +92,7 @@ def resolve(name: str, *, repo: str | None = None, citations=(),
         for k, fn in (("releases_tags", sources.github_releases_tags),
                       ("pypi", sources.pypi_package),
                       ("bioconda", sources.anaconda_bioconda),
+                      ("bioconductor", sources.bioconductor_package),
                       ("version_file", sources.github_version_file),
                       ("head_commit", sources.github_head_commit)):
             if not P[k]:
@@ -162,11 +170,26 @@ def resolve(name: str, *, repo: str | None = None, citations=(),
           bc_rec.get("versions") or bc_rec.get("version"),
           "" if bc_rec else str(bc[1] if bc else "not probed")[:120],
           bc_rec.get("url") or "")
+    # Bioconductor: the release repository is the authoritative
+    # channel for R/Bioconductor tools (many have NO PyPI/bioconda
+    # record at all - m8 root-cause 1.1/1.4)
+    bcd = P["bioconductor"]((name.split("/")[-1]).split()[0]) \
+        if P.get("bioconductor") else ([], "not probed", {})
+    bcd_rec = (bcd[0] or [{}])[0] if bcd and bcd[0] else {}
+    _step("registry: Bioconductor (release bioc)",
+          "found" if bcd_rec.get("version") else
+          ("not on Bioconductor bioc repo"
+           if bcd and "not-on-bioconductor" in str(bcd[1])
+           else "no version returned"),
+          bcd_rec.get("version"),
+          "" if bcd_rec else str(bcd[1] if bcd else "not probed")[:140],
+          bcd_rec.get("url") or "")
 
     # -- 4. version file inside the repo (only when budget allows and
     #       the higher links came up without a stable version) --
     vf = {}
-    stable_candidate = _pick_stable(rels, tags, py_rec, bc_rec)
+    stable_candidate = _pick_stable(rels, tags, py_rec, bc_rec,
+                                    bcd_rec, prefer)
     if repo and not stable_candidate and _core_spend(1):
         vf = P["version_file"](repo) or {}
         _step("version file in repository",
@@ -248,7 +271,8 @@ def resolve(name: str, *, repo: str | None = None, citations=(),
         if head.get("sha") else None)
     values["registries"] = {k: v for k, v in (
         ("pypi", py_rec.get("version")),
-        ("bioconda", bc_rec.get("version"))) if v}
+        ("bioconda", bc_rec.get("version")),
+        ("bioconductor", (bcd_rec or {}).get("version"))) if v}
     values["benchmark_versions"] = bench_versions
 
     out = {"candidate": name, "github_repo": repo,
@@ -262,7 +286,7 @@ def resolve(name: str, *, repo: str | None = None, citations=(),
     return out
 
 
-def _pick_stable(rels, tags, py_rec, bc_rec):
+def _pick_stable(rels, tags, py_rec, bc_rec, bcd_rec=None, prefer=None):
     for r in sorted((x for x in rels if not x.get("prerelease")
                      and _vkey(x.get("tag", ""))),
                     key=lambda x: _vkey(x.get("tag", "")), reverse=True):
@@ -275,8 +299,18 @@ def _pick_stable(rels, tags, py_rec, bc_rec):
         best = max(tagvers, key=_vkey)
         return {"value": best, "source": "git tag (no formal release "
                 "page entry)", "pre": False}
-    for rec, src in ((py_rec, "PyPI current version"),
-                     (bc_rec, "bioconda current version")):
+    # registry fallback ORDER is deployment-aware (m8): the channel the
+    # deployment installs from wins; without that knowledge PyPI keeps
+    # its historical first look, and ALL channel values remain visible
+    # in the chain either way.
+    chans = [
+        ("pypi", py_rec, "PyPI current version"),
+        ("bioconda", bc_rec, "bioconda current version"),
+        ("bioconductor", bcd_rec, "Bioconductor release current "
+                                  "version")]
+    if prefer:
+        chans.sort(key=lambda c: 0 if c[0] == prefer else 1)
+    for _, rec, src in chans:
         v = (rec or {}).get("version")
         if v and _vkey(v) and not _is_pre(v):
             return {"value": v, "source": src, "pre": False}

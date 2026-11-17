@@ -378,6 +378,61 @@ def pypi_package(name: str, max_results: int = 1):
         return [], f"{type(e).__name__}: {str(e)[:180]}", {}
 
 
+def github_repo_top_level(full_name: str) -> dict:
+    """Top-level contents listing of a repository (component
+    recognition: PURPLE-inside-hmftools class). One GitHub CORE
+    request - the caller spends budget and records skips honestly."""
+    try:
+        j = _http_json(f"https://api.github.com/repos/{full_name}/"
+                       "contents", timeout=12)
+        names = [e.get("name") for e in (j if isinstance(j, list) else [])
+                 if e.get("name")]
+        return {"entries": names, "error": None}
+    except Exception as e:
+        return {"entries": [], "error": f"{type(e).__name__}"}
+
+
+def bioconductor_package(name: str, max_results: int = 1):
+    """Bioconductor package page (machine-readable via the stable
+    landing page): current RELEASE version + any GitHub/Bitbucket
+    project link. bioconductor.org is intermittently slow from this
+    host (measured 2026-11-17: quick small fetches succeed, larger
+    ones hang) - retries are bounded and the final answer is either
+    a real record or an honest error, never a fabricated version."""
+    pkg = (name or "").strip()
+    if not re.match(r"^[\w.\-]+$", pkg):
+        return [], "not a valid Bioconductor package name", {}
+    seen_any = False
+    last_err = "not found on bioconductor (release or devel)"
+    for repo in ("release", "devel"):
+        url = (f"https://bioconductor.org/packages/{repo}/bioc/html/"
+               f"{pkg}.html")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                raw = r.read(40000).decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                last_err = "not-on-bioconductor"
+                continue
+            return [], f"HTTP {e.code}", {}
+        except Exception as e:
+            return [], f"{type(e).__name__}: {str(e)[:150]}", {}
+        seen_any = True
+        # landing page carries e.g. "<b>Version:</b> 2.26.0"
+        m = re.search(r"Version:\s*(?:</?(?:b|strong|span|em)[^>]*>\s*)"
+                      r"*([0-9][\w.]+)", raw)
+        links = re.findall(r"https?://github\.com/[\w.\-]+/[\w.\-]+",
+                           raw)
+        return [_rec("bioconductor", pkg, url, pkg, None,
+                     version=(m.group(1) if m else None),
+                     repo_url=(links[0] if links else None),
+                     channel=repo)], None, {}
+    if not seen_any and last_err == "not-on-bioconductor":
+        return [], "not-on-bioconductor", {}
+    return [], last_err, {}
+
+
 def biotools_search(name: str, max_results: int = 3):
     """bio.tools registry search: existence + official link + license."""
     try:
@@ -415,6 +470,7 @@ ALL_ADAPTERS = {
     "github": github_repo_search,
     "pypi": pypi_package,
     "biotools": biotools_search,
+    "bioconductor": bioconductor_package,
 }
 
 _PROBE_QUERY = {
@@ -424,6 +480,7 @@ _PROBE_QUERY = {
     "github": "MHCflurry",
     "pypi": "mhcnuggets",
     "biotools": "netmhcpan",
+    "bioconductor": "DESeq2",
 }
 
 
