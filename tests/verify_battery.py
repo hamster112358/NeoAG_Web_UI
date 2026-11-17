@@ -1250,9 +1250,14 @@ def _cand4(nm, role="named in retrieved title (pubmed)",
     elig = eligibility or (
         "current baseline (not an alternative)" if baseline
         else "direct alternative")
+    rel = ("direct-alternative" if elig == "direct alternative"
+           else "wrapper" if elig.startswith("wrapper") else "unresolved")
     return {"name": nm, "task": "Presentation & APPM Scoring",
             "role_in_neoag": role, "category": cat,
             "eligibility": elig,
+            "relationship": rel,
+            "identity_status": "resolved",
+            "relevance_basis": [],
             "eligibility_reasons": ["battery fixture"],
             "is_baseline": baseline,
             "comparable_for_replacement":
@@ -1270,8 +1275,10 @@ def _cand4(nm, role="named in retrieved title (pubmed)",
 _cur4 = _cand4("mhcflurry", role="configured NeoAG workflow TOML",
                baseline=True)
 _row4 = {"metric": "AUROC", "value": "0.9", "dataset": "ICBC",
-         "context_established": True, "tested_version": "v1.0",
-         "evidence_level": "abstract: independent comparative text"}
+         "verified": "confirm", "doc_cid": "DOI:fixture4",
+         "context": {}, "context_established": False,
+         "tested_version": "v1.0",
+         "evidence_level": "abstract: author-reported"}
 _t4 = {"id": "presentation", "label": "Presentation & APPM Scoring"}
 _st4 = {"baseline": {"identified": True, "consensus": False,
                      "tools": [{"name": "mhcflurry",
@@ -1294,6 +1301,11 @@ def _cnd155(nm, task, role, ev=(), cat="software (registry-verified)",
     return {"name": nm, "task": task, "role_in_neoag": role,
             "category": cat,
             "eligibility": elig,
+            "relationship": "direct-alternative" if not baseline
+            else "unrelated",
+            "identity_status": "resolved", "relevance_basis": [],
+            "version_claimed": None, "license_claimed": None,
+            "followups_open": False,
             "eligibility_reasons": ["battery fixture"],
             "is_baseline": baseline,
             "comparable_for_replacement":
@@ -1323,13 +1335,25 @@ _inv155 = {"stages": [{"id": "presentation", "name": "P",
            "git_commit": "x", "captured_at": "t"}
 _rt155 = [{"id": "presentation", "label": "Presentation & APPM Scoring"},
           {"id": "sv", "label": "Sv"}]
+_CTX155 = {"modality": "eluted-ligand benchmark",
+           "sample_design": "held-out peptides",
+           "ground_truth": "mass-spectrometry",
+           "coverage": "117k peptides"}
 _row155 = {"metric": "AUROC", "value": "0.9", "dataset": "ICBC",
-           "context_established": True, "tested_version": "v1.0",
-           "evidence_level": "abstract: independent comparative text"}
+           "verified": "confirm", "doc_cid": "DOI:alt155",
+           "context": dict(_CTX155), "context_established": True,
+           "tested_version": "v1.0",
+           "evidence_level": "abstract: independent claim, confirmed"}
+_rowb155 = {"metric": "AUROC", "value": "0.85", "dataset": "ICBC",
+            "verified": "confirm", "doc_cid": "DOI:base155",
+            "context": dict(_CTX155), "context_established": True,
+            "tested_version": "v1.0",
+            "evidence_level": "abstract: independent claim, confirmed"}
 _rep155 = _res4._live_report(
     "res_t", {"targets": _rt155}, _inv155, {}, "completed",
     candidates=[_cnd155("mhcflurry", "Presentation & APPM Scoring",
-                        "configured NeoAG workflow TOML", baseline=True),
+                        "configured NeoAG workflow TOML",
+                        ev=[_rowb155], baseline=True),
                 _cnd155("ALT", "Presentation & APPM Scoring",
                         "named in title", ev=[_row155])],
     citations=[], resolved_targets=_rt155)
@@ -1351,21 +1375,27 @@ check("105 evidence COVERAGE is accounted per inventory module "
       str(_cov155)[:150])
 check("106 every researched module gets a recommendation + an "
       "evidence-derived rationale + a concrete action, computed FROM "
-      "stated evidence facts (A9: the vocabulary entry cannot "
-      "contradict the numbers it is derived from); a module without a "
-      "code-grounded baseline is honestly 'Research incomplete'; Open "
-      "Questions are gone",
-      _mc155["recommendation"] == "Promising candidate - evaluate"
+      "stated evidence facts (M8 S9: the label is a pure function of "
+      "the recorded facts - a verified direct pair whose alternative "
+      "wins licenses 'Promising', and the label cannot contradict the "
+      "numbers next to it); a module whose baseline was never "
+      "established is honestly 'Review incomplete'; Open Questions are "
+      "gone",
+      _mc155["recommendation"] == "Promising candidate for further "
+      "evaluation"
       and _mc155["conclusion"] == _mc155["recommendation"]
       and _mc155["evidence_facts"]["direct_alternatives"] == 1
-      and _mc155["evidence_facts"]["independent_rows"] == 1
-      and _mc155["evidence_facts"]["superiority_rows"] == 0
-      and _mc155["rationale"] and "evaluate" in _mc155["action"]
+      and _mc155["evidence_facts"]["verified_measurement_pairs"] == 1
+      and _mc155["evidence_facts"]["direct_comparable_pairs"] == 1
+      and any(x.get("winner") == "alternative" and x.get("class")
+              == "direct" for x in _mc155["comparisons"])
+      and _mc155["rationale"] and "validate" in _mc155["action"].lower()
       and _rep155["module_conclusions"]["sv"]["recommendation"]
-      == "Research incomplete"
+      == "Review incomplete"
       and "open_questions" not in _rep155
       and _rep155["recommended_next_actions"]
-      and _rep155["recommended_next_actions"][0].startswith("[presentation]"))
+      and _rep155["recommended_next_actions"][0].startswith("[presentation]"),
+      str(_mc155)[:300])
 _rep155b = _res4._live_report(
     "res_t2", {"targets": _rt155}, _inv155, {}, "cancelled",
     candidates=[], resolved_targets=_rt155, reached_ids=set())
@@ -1381,27 +1411,31 @@ check("107 a run stopped mid-way publishes NO premature conclusions: "
               for m in _rep155b["coverage_accounting"]["not_researched"])
       and _rep155b["coverage_accounting"]["completeness"] == "partial")
 
-check("108 recommendations use ONLY the fixed vocabulary and never "
-      "invent a winner from one-sided evidence (a candidate number "
-      "without a same-label baseline number never licenses 'Candidate "
-      "supported by comparative evidence'); task comparisons put ONLY "
-      "direct alternatives in rows, name wrappers separately, and gate "
-      "every row's performance by context",
-      all(c["conclusion"] in _res4.CONCLUSION_VOCABULARY
+_rowB4 = [r for r in _tc4[0]["rows"] if r["tool"] == "B"][0]
+_rowA4 = [r for r in _tc4[0]["rows"] if r["tool"] == "A"][0]
+check("108 recommendations use ONLY the fixed M8 five-label vocabulary "
+      "and never invent a winner from one-sided evidence (a candidate "
+      "number with no matched baseline number yields 'Recommend "
+      "targeted benchmark', never 'Promising'); task comparisons put "
+      "ONLY direct alternatives in rows, name wrappers separately, and "
+      "flag every row whose measurement conditions are not stated",
+      all(c["recommendation"] in _res4.CONCLUSION_VOCABULARY
           for c in _concl4)
-      and all(c["conclusion"] !=
-              "Candidate supported by comparative evidence"
-              for c in _concl4)
+      and [c["recommendation"] for c in _concl4] == [
+          "No justified change identified",
+          "No justified change identified",
+          "Recommend targeted benchmark",
+          "Recommend targeted benchmark",
+          "Recommend targeted benchmark"]
       and [r["tool"] for r in _tc4[0]["rows"]] == ["A", "B"]
-      and "0.9" in [r for r in _tc4[0]["rows"] if r["tool"] == "B"][0]
-      ["evidence"]
-      and "ICBC" in [r for r in _tc4[0]["rows"] if r["tool"] == "B"][0]
-      ["evidence"]
-      and "no performance number with established" in [
-          r for r in _tc4[0]["rows"] if r["tool"] == "A"][0]["evidence"]
+      and "AUROC=0.9" in _rowB4["evidence"]
+      and "[conditions not stated]" in _rowB4["evidence"]
+      and "[DOI:fixture4]" in _rowB4["evidence"]
+      and "no measurement claim survived" in _rowA4["evidence"]
       and _tc4[0]["wrappers_integrations"] == ["W"]
       and _tc4[0]["baseline"]["identified"],
-      str([c["conclusion"] for c in _concl4])[:150])
+      str([(c["recommendation"],
+            r["evidence"][:60]) for c, r in zip(_concl4, _tc4[0]["rows"])])[:220])
 
 # ---------- 109-115 M5 PART 7: downloadable exports -----------------------
 import io as _io4                                                # noqa: E402
