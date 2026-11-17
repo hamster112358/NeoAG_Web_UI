@@ -316,6 +316,12 @@ def anaconda_bioconda(name: str, max_results: int = 1):
                      version=j.get("latest_version") or
                              (versions[0] if versions else None),
                      versions=versions[:5],
+                     # the recipe's project home (github URL for most
+                     # bioconda uploads) - lets identity merge the
+                     # registry axis with the same project seen on
+                     # GitHub instead of treating anaconda.org as a
+                     # separate one-axis project
+                     home=(j.get("home") or None),
                      license=j.get("license") or "Not verified")], \
             None, {}
     except urllib.error.HTTPError as e:
@@ -363,10 +369,17 @@ def pypi_package(name: str, max_results: int = 1):
                         for c in info.get("classifiers", [])
                         if c.startswith("License ::")), "")
         rels = sorted((j.get("releases") or {}).keys(), reverse=True)
+        _pu = {str(k).lower(): v for k, v in
+               (info.get("project_urls") or {}).items() if v}
+        home = (_pu.get("homepage") or _pu.get("home") or
+                _pu.get("source") or _pu.get("source code") or
+                _pu.get("repository") or _pu.get("code") or
+                _pu.get("github") or info.get("home_page") or None)
         return [_rec("pypi", slug, f"https://pypi.org/project/{slug}/",
                      info.get("name"), None,
                      version=info.get("version"),
                      license=lic or "Not verified",
+                     home=home,
                      requires_python=info.get("requires_python"),
                      summary=(info.get("summary") or "")[:300],
                      releases=len(rels))], None, {}

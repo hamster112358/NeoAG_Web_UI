@@ -183,9 +183,17 @@ def resolve_identity(name: str, task: dict, citations=(),
             if not (slug == name_l or name_l == title.lower()):
                 continue  # not an exact-name record: not corroboration
             url = str(r.get("url") or "")
-            cnd = _get(url.replace("https://", "").replace(
-                "http://", "") or f"registry:{slug}", src)
-            cnd.url = cnd.url or url
+            # key on the record's PROJECT HOME when it has one: a
+            # bioconda/PyPI package and its GitHub repository are ONE
+            # project seen on two independent axes. Without this the
+            # anaconda.org/pypi.org URL forms its own one-axis project
+            # and genuine two-axis corroboration never merges
+            # (measured 2026-11-17: CNVkit, PureCN stuck unresolved).
+            home = str(r.get("home") or "")
+            key_src = (home or url).replace("https://", "").replace(
+                "http://", "")
+            cnd = _get(key_src or f"registry:{slug}", src)
+            cnd.url = cnd.url or home or url
             cnd.description = cnd.description or str(
                 r.get("summary") or "")
             if r.get("license"):

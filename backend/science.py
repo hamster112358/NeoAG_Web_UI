@@ -430,8 +430,10 @@ _FUNC_NOUN = (r"(?:detection|detecting|typing|genotyping|quantification"
 _FUNC_CLAIM_RX = re.compile(
     r"^[A-Za-z][\w+.-]{1,20}\s*[:\u2013-]\s*[^.]{0,80}?\b"
     + _FUNC_NOUN + r"\b"
-    + r"|\b(?:provides?|delivers?|enables?|permits?|allows?|performs?"
-      r"|achieves?)\b[^.;]{0,90}?\b" + _FUNC_NOUN + r"\b", re.I)
+    +     r"|\b(?:provid(?:e|es|ed|ing)|deliver(?:s|d)?|enabl(?:e|es|ed|ing)"
+      r"|perm(?:it|its|ted|ting)|allow(?:s|ed|ing)?"
+      r"|perform(?:s|ed|ing)?|achiev(?:e|es|ed|ing))\b"
+      r"[^.;]{0,90}?\b" + _FUNC_NOUN + r"\b", re.I)
 
 _STATE_GLOSS = {
     "discovered": "a candidate name was retrieved",
@@ -462,7 +464,47 @@ def _basis(claim, doc_cid, text, term):
             "text_span": span}
 
 
-def _doc_probe(task, text):
+_SENT_SPLIT_RX = re.compile(r"(?<=[.!?;])\s+|\n+")
+
+
+_SENT_SPLIT_RX = re.compile(r"(?<=[.!?;])\s+|\n+")
+# anaphoric continuations: a sentence beginning with a pronoun or
+# "the tool"-style reference right after a sentence naming the tool
+# still describes THAT tool ("Xyz is a method. It wraps A and B.")
+_PRONOUN_RX = re.compile(
+    r"^(?:it|its|they|this|that|these|those|the\s+(?:tool|software|"
+    r"package|program|application|implementation|wrapper|pipeline))\b",
+    re.I)
+
+
+def _name_anchored_text(low, name):
+    """Sentences of the text that mention the tool name, plus directly
+    following pronoun-continuation sentences. Wrapper vocabulary must
+    be predicated of THIS tool:
+    a multi-tool benchmark full text saying "executed within the
+    Galaxy/Nextflow pipeline" in a sentence about some OTHER tool
+    must not contaminate this candidate's row (measured 2026-11-17:
+    PureCN/CNVkit demoted to "wrapper/integration" purely because
+    they shared a benchmark paper with workflow-engine vocabulary).
+    Empty when the name never occurs in the text - a registry blurb
+    about the tool may not repeat its name - and the caller then
+    falls back to the whole text."""
+    if not name:
+        return ""
+    rx = re.compile(r"\b" + re.escape(name) + r"\b", re.I)
+    out, after = [], False
+    for s in _SENT_SPLIT_RX.split(low):
+        if not s:
+            continue
+        if rx.search(s) or (_PRONOUN_RX.match(s) and after):
+            out.append(s)
+            after = True
+        else:
+            after = False
+    return "\n".join(out)
+
+
+def _doc_probe(task, text, name=None):
     low = text or ""
     dom = ontology.match_domain(task, low)
     off = ontology.match_off_domain(task, low)
@@ -473,8 +515,12 @@ def _doc_probe(task, text):
         # the named subject is documented as PERFORMING the function
         # (title/predicate capability frame) - a positive method claim
         meth = meth + ["documented capability claim"]
-    wrap = [t for t in WRAPPER_SIGNAL if t in low]
-    strong_wrap = any(t in low for t in STRONG_WRAPPER)
+    # wrapper words only count where the tool's own name is stated in
+    # the same sentence (whole text if the name never occurs - see
+    # _name_anchored_text)
+    wrap_region = _name_anchored_text(low, name) or low
+    wrap = [t for t in WRAPPER_SIGNAL if t in wrap_region]
+    strong_wrap = any(t in wrap_region for t in STRONG_WRAPPER)
     # an independent-algorithm claim: a method signal that is not
     # merely an integration/packaging word, or an intro cue
     algo = [m for m in meth if m not in _INTEGRATION_WORDS]
@@ -514,7 +560,8 @@ def assess_relevance(name, docs, *, task, task_id="", identity=None,
     docs = [d for d in docs if (d.get("text") or "").strip()]
     q0 = (ontology.quantities(task) or ["this task's endpoint quantity"])[0]
     m0 = (ontology.metrics(task) or ["benchmark"])[0]
-    probes = [(d, _doc_probe(task, d.get("text") or "")) for d in docs]
+    probes = [(d, _doc_probe(task, d.get("text") or "", name=name))
+              for d in docs]
     dom_docs = [(d, p) for d, p in probes if p["domain"]]
     all_text = [d.get("text") or "" for d in docs]
     transitions = [{"state": "discovered",

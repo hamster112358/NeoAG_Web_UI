@@ -1742,8 +1742,17 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
     # quality gates are gone ----
     in_run_gaps = [m for m in coverage["not_researched"]
                    if "scope" not in m["reason"]]
+    # A module whose own verdict is "Review incomplete" says the
+    # evaluation could not be completed - that is NOT a decision-ready
+    # state however many gates pass (non-negotiable 6: absence of
+    # evidence is never decision-readiness; measured 2026-11-17:
+    # run res-20261117-190518 shipped decision_ready=true with the
+    # purity_cnv module labelled "Review incomplete").
+    _incomplete_modules = [
+        t for t, m in module_conclusions.items()
+        if m.get("recommendation") == "Review incomplete"]
     ready = (science.decision_ready_v2(gates_flat) and not in_run_gaps
-             and not hard_failures)
+             and not hard_failures and not _incomplete_modules)
     rate_gaps = [f for f in failures if _rate_only(f.get("error"))]
     # ---- M6 B1: conclusion-first assessment (one minute to read) ----
     by_rec = Counter(m["recommendation"]

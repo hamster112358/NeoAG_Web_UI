@@ -219,12 +219,48 @@ CASES = [
      lambda r: r["relationship"] == "direct-alternative"
      and r["research_state"] == "function-characterized",
      {"lit_introduced": True}),
+    ("shared-paper wrapper vocabulary does NOT contaminate this row",
+     ("PureCN", [{"doc_cid": "P1", "kind": "fulltext",
+       "text": "Benchmarking copy number callers. PureCN estimates "
+               "purity and copy number from targeted sequencing. "
+               "ToolX was executed within the Galaxy pipeline using a "
+               "Snakemake wrapper around its web interface. All "
+               "methods called copy number variants on the same "
+               "samples."}]),
+     lambda r: r["relationship"] != "wrapper"
+     and r["relationship"] == "direct-alternative"),
+    ("the SAME paper's wrapper row still reads wrapper (no over-sweep)",
+     ("ToolX", [{"doc_cid": "P1", "kind": "fulltext",
+       "text": "Benchmarking copy number callers. PureCN estimates "
+               "purity and copy number from targeted sequencing. "
+               "ToolX was executed within the Galaxy pipeline using a "
+               "Snakemake wrapper around its web interface. All "
+               "methods called copy number variants on the same "
+               "samples."}]),
+     lambda r: r["relationship"] == "wrapper"),
+    ("pronoun continuation describes the tool (it wraps ...)",
+     ("SegFlowCNV", [{"doc_cid": "G7", "kind": "github-description",
+       "text": "SegFlowCNV: copy number segmentation for exomes. It "
+               "wraps existing callers behind a Nextflow web "
+               "interface."}]),
+     lambda r: r["relationship"] == "wrapper"),
 ]
 for item in CASES:
     label, args, pred = item[0], item[1], item[2]
     kw = item[3] if len(item) > 3 else {}
     r = rel(*args, **kw)
     chk("S4 " + label, pred(r), r)
+
+chk("S6 capability frame covers predicate inflections",
+    bool(science._FUNC_CLAIM_RX.search(
+        "Xyz achieved accurate segmentation of tumor genomes."))
+    and bool(science._FUNC_CLAIM_RX.search(
+        "Xyz provides copy number segmentation."))
+    and bool(science._FUNC_CLAIM_RX.search(
+        "Xyz enabled detection of focal deletions at scale."))
+    and bool(science._FUNC_CLAIM_RX.search(
+        "Xyz: inference of allele-specific copy number profiles.")),
+    "inflection gap (2026-11-17: 'achieved' missed)")
 
 # --------------------------------------------------------- 4. comparability S8
 mk = lambda m_, v, ver, ctx, name="x": {  # noqa: E731
@@ -393,6 +429,23 @@ chk("S3 registry link + github hit merge -> resolved",
     and not identity.blocks_attribution(ident),
     (ident["status"], [c.get("project") for c in
                        ident.get("considered") or []]))
+ident_home = identity.resolve_identity(
+    "CNVkit", TASK,
+    registry_hits=[{"id": "cnvkit", "title": "cnvkit",
+                    "url": "https://anaconda.org/bioconda/cnvkit",
+                    "home": "https://github.com/etal/cnvkit",
+                    "summary": "Copy number variant detection",
+                    "version": "0.9.14", "source": "bioconda"}],
+    github_hits=[{"id": "etal/cnvkit",
+                  "url": "https://github.com/etal/cnvkit",
+                  "description": "DNA copy number profiling for "
+                                 "research exomes and targeted panels",
+                  "stars": 600, "archived": False}])
+chk("S3 registry home URL keyed on project, not the registry page "
+    "(anaconda.org record corroborates the github project)",
+    ident_home["status"] == "resolved" and ident_home.get("n_axes") == 2,
+    (ident_home["status"], ident_home.get("n_axes"),
+     [c.get("project") for c in ident_home.get("considered") or []]))
 coll = identity.resolve_identity(
     "PURPLE", TASK,
     registry_hits=[{"id": "purple", "title": "purple",
@@ -634,9 +687,15 @@ if rep is not None:
     chk("E2E eight gates recorded per module",
         len(gates) == 8 and all("target" in g and "check" in g
                                 for g in gates), gates)
-    chk("E2E decision_ready iff all gates pass",
-        all(g["passed"] for g in gates) == rep["decision_ready"],
-        [(g["dimension"], g["passed"]) for g in gates])
+    chk("E2E decision_ready iff all gates pass AND no module is "
+        "Review incomplete (non-negotiable 6)",
+        (all(g["passed"] for g in gates)
+         and not [m for m in rep["module_conclusions"].values()
+                  if m["recommendation"] == LBL["incomplete"]])
+        == rep["decision_ready"],
+        [(g["dimension"], g["passed"]) for g in gates]
+        + [("label", m["recommendation"])
+           for m in rep["module_conclusions"].values()])
     chk("E2E baseline context block present",
         rep["task_comparisons"][0]["baseline"].get("context") is not None)
     chk("E2E published_benchmark_evidence is always a list",
