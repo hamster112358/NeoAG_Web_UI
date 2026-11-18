@@ -90,15 +90,53 @@ jobs = JobManager(store, publish)
 agent = DemoAgent(store, jobs)
 
 
+def task_name_parts(kind: str, spec: dict, sample_id: str,
+                    scope: str = "", target: str = "") -> dict:
+    """M9 §8: the pieces of a human-readable title, DERIVED from stored
+    metadata only (sample/case, kind, scope/target). Nothing is invented;
+    with thin metadata the UI falls back to a concise generic name. The
+    localized type label lives in the frontend dictionary (name_type is
+    a key), so a stored title never freezes one language. The internal
+    id stays the authoritative identity everywhere else."""
+    subj, ntype = "", "task"
+    if kind == "neoag-native-run":
+        nparams = spec.get("native_params") or {}
+        subj = str(nparams.get("sample_id") or nparams.get("case_id")
+                   or sample_id or "")
+        ntype = "analysis"
+    elif kind in ("analysis", "discovery", "diagnostic", "benchmark"):
+        subj, ntype = str(sample_id or ""), kind
+    elif scope or target:
+        # a job row whose only identity is its scope/target text
+        subj, ntype = str(target or "")[:48], (scope or "task")
+    return {"name_subject": subj, "name_type": ntype}
+
+
 def job_public(job: dict) -> dict:
     j = {k: job[k] for k in ("id", "created_at", "updated_at", "started_at",
                              "finished_at", "state", "kind", "sample_id",
                              "stage", "progress", "error", "approval_id",
                              "conv_id", "outcome")}
     j["spec"] = json.loads(job.get("spec_json") or "{}")
+    # M9 §8 presentation fields (derived; id/sample_id stay canonical)
+    j["display_title"] = str(job.get("display_title") or "")
+    j.update(task_name_parts(job.get("kind") or "task", j["spec"],
+                             job.get("sample_id") or ""))
     return j
 
 
+
+
+def research_public_rows(store) -> list[dict]:
+    """Research rows for the ordinary UI: the stored row plus the same
+    derived display parts job rows get (M9 §8). The manual
+    display_title always wins; derived parts never invent metadata."""
+    out = []
+    for r in store.research_list():
+        out.append({**r,
+                    "name_subject": str(r.get("target") or "")[:48],
+                    "name_type": "review"})
+    return out
 
 
 def research_task_rows(store) -> list[dict]:
@@ -147,7 +185,12 @@ def research_task_rows(store) -> list[dict]:
                     "progress": pct, "error": err,
                     "approval_id": None,
                     "conv_id": r.get("conv_id") or "",
-                    "outcome": outcome, "spec": {}})
+                    "outcome": outcome, "spec": {},
+                    # M9 §8: research rows carry their scope/target as
+                    # the display metadata (engine names stay internal)
+                    "display_title": str(r.get("display_title") or ""),
+                    "name_subject": str(r.get("target") or "")[:48],
+                    "name_type": "review"})
     return out
 
 
@@ -460,7 +503,7 @@ class Handler(BaseHTTPRequestHandler):
                 "jobs": unified_tasks(store, 50),
                 "approvals": store.approval_list(),
                 "decisions": store.decision_list(),
-                "research": store.research_list(),
+                "research": research_public_rows(store),
                 "manifests": store.manifest_list(),
                 "agent_mode": store.setting("agent_mode", "mock"),
                 "params_meta": [
@@ -656,6 +699,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, task_detail(store, job))
         if path == "/api/inventory":
             return self._json(200, load_inventory())
+        if path == "/api/native/tree":
+            # M9 §5.3: real one-level directory listing for the
+            # input-review tree (sizes from stat, roles from the native
+            # detector only). Confined to authorized input directories.
+            ddir = (q.get("data_dir") or [""])[0]
+            sub = (q.get("sub") or [""])[0]
+            res = native_mod.native_tree(ddir, sub)
+            if not res.get("ok"):
+                return self._json(400, res)
+            return self._json(200, res)
         if path == "/api/native/capability":
             return self._json(200, native_mod.probe(force=True))
         if path == "/api/native/gateway":
@@ -683,7 +736,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, s)
         # ---------- research ----------
         if path == "/api/research":
-            return self._json(200, {"research": store.research_list()})
+            return self._json(200, {"research": research_public_rows(store)})
         if path.startswith("/api/research/"):
             parts = path.strip("/").split("/")
             rid = parts[2]
@@ -1146,6 +1199,22 @@ class Handler(BaseHTTPRequestHandler):
                 if not res:
                     return self._json(409, {"error": "mode switch not possible"})
                 return self._json(200, res)
+            if path.startswith("/api/jobs/") and path.endswith("/title"):
+                # M9 §8: rename the DISPLAY title only. The job id,
+                # sample_id, spec and audit trail are untouched - this
+                # is presentation metadata, stored beside the record.
+                jid = path.split("/")[3]
+                title = str(body.get("title") or "").strip()
+                if not title:
+                    return self._json(400, {"error": "title required"})
+                if not store.job_get(jid):
+                    return self._json(404, {"error": "no such job"})
+                store.job_set(jid, display_title=title[:200])
+                store.audit("user", "task.title.set", jid,
+                            {"title": title[:200]})
+                publish({"type": "job", "id": jid})
+                return self._json(200, {"ok": True, "id": jid,
+                                        "display_title": title[:200]})
             if path.startswith("/api/approvals/"):
                 aid = path.split("/")[3]
                 # M6 PART C: consent cards may be answered four ways -
@@ -1202,7 +1271,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/settings":
                 cur = store.setting("ui", {})
                 cur.update({k: v for k, v in body.items()
-                            if k in ("mode", "stages", "simulate_failure", "top_n")})
+                            if k in ("mode", "stages", "simulate_failure",
+                                     "top_n",
+                                     # M9 §3: the chosen UI language
+                                     # persists server-side too, so a
+                                     # new browser sees the same default
+                                     "language")})
                 store.setting_set("ui", cur)
                 store.audit("user", "settings.update", "ui", cur)
                 return self._json(200, cur)
@@ -1232,6 +1306,22 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(400, {"error": str(e)})
                 publish({"type": "research_changed"})
                 return self._json(202, res)
+            if path.startswith("/api/research/") and \
+                    path.endswith("/title"):
+                # M9 §8: display title for a research run (see the job
+                # route above - same presentation-only contract).
+                rid = path.split("/")[3]
+                title = str(body.get("title") or "").strip()
+                if not title:
+                    return self._json(400, {"error": "title required"})
+                if not store.research_get(rid):
+                    return self._json(404, {"error": "no such report"})
+                store.research_set_title(rid, title)
+                store.audit("user", "task.title.set", rid,
+                            {"title": title[:200]})
+                publish({"type": "research_changed"})
+                return self._json(200, {"ok": True, "id": rid,
+                                        "display_title": title[:200]})
             if path.startswith("/api/research/") and \
                     path.endswith("/cancel"):
                 rid = path.split("/")[3]

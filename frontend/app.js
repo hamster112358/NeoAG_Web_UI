@@ -1,4 +1,6 @@
-/* NeoAG Workspace - frontend logic (vanilla JS, no build step).
+/* NeoAG - frontend logic (vanilla JS, no build step). Milestone 9:
+   bilingual (zh default), design-system rendering, real preparation
+   workflow, human-readable task naming, preserved view state.
    Data comes from /api/bootstrap + per-conversation fetches + SSE.
    All writes go through the API; the browser only renders
    server-persisted state. Layout contract: nothing at page level
@@ -9,6 +11,544 @@
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
   (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+/* ---------------- i18n (M9 §3) ----------------
+   Centralized resources. zh is the default; the language persists in
+   localStorage AND on the server (settings), so a new browser starts
+   where the user left off. English literals are the static markup's
+   fallback, so a missing key can never blank out a control.
+   Filenames, scientific identifiers and server-generated records are
+   deliberately NOT translated. */
+const I18N = {
+  en: {
+    "brand.tag": "Neoantigen scientific workspace",
+    "chat.new": "New chat", "chat.stop": "Stop",
+    "chat.ph": "Describe your goal - e.g. analyze a sample, or tell the agent where your sequencing data are stored",
+    "chat.send": "Send",
+    "chat.emptyTitle": "Start a conversation",
+    "chat.emptySub": "Ask anything about NeoAG, or describe a sample and where its data live.",
+    "chat.example": "Load example - walk through a synthetic case",
+    "chat.agentWorking": "agent working", "chat.awaiting": "awaiting confirmation",
+    "chat.deleteQ": "Delete this chat? It disappears from this list; the saved messages stay on the server for audit.",
+    "menu.rename": "Rename", "menu.pin": "Pin to top", "menu.unpin": "Unpin",
+    "menu.archive": "Archive", "menu.unarchive": "Unarchive", "menu.delete": "Delete",
+    "menu.archived": "Archived", "menu.noChats": "No chats yet.",
+    "conv.msg": "msg",
+    "tab.tasks": "Tasks", "tab.results": "Results", "tab.discovery": "Discovery",
+    "tab.skills": "Skills", "tab.help": "Help",
+    "filter.all": "All", "filter.analysis": "Analyses",
+    "filter.discovery": "Discovery", "filter.diagnostic": "Diagnostics",
+    "conn.live": "connected", "conn.off": "reconnecting",
+    "ago.now": "just now", "ago.m": "m ago", "ago.h": "h ago", "ago.d": "d ago",
+    "type.analysis": "Full neoantigen analysis",
+    "type.discovery": "Partial analysis",
+    "type.diagnostic": "Diagnostic check",
+    "type.benchmark": "Benchmark experiment",
+    "type.review": "Scientific review",
+    "type.tooling": "Tool discovery",
+    "type.task": "Task",
+    "st.queued": "Queued", "st.running": "Running", "st.paused": "Paused",
+    "st.blocked": "Waiting for approval", "st.completed": "Completed",
+    "st.failed": "Failed", "st.cancelled": "Cancelled",
+    "concl.decision_ready": "Scientific conclusion: review complete",
+    "concl.preliminary": "Scientific conclusion: review incomplete",
+    "attn.waiting": "waiting for you",
+    "attn.execute": "Execute approval",
+    "attn.bench": "Benchmark consent",
+    "attn.decision": "Decision",
+    "attn.approve": "Approve", "attn.deny": "Deny", "attn.reject": "Reject",
+    "attn.limit": "Limit scope…", "attn.lit": "Literature only",
+    "attn.scopePrompt": "What scope will you allow? (e.g. 'subsample 5 of 200 samples; CPU only; no GPU')",
+    "attn.policyDefault": "(policy default)",
+    "gate.q": "Confirm destructive operation",
+    "gate.sub": "The execution gate blocked this before it ran. Approving unlocks exactly this one operation; nothing else. It is also recorded in the audit trail.",
+    "gate.approve": "Approve once", "gate.deny": "Deny",
+    "act.waitappr": "Waiting for your approval",
+    "act.reconnect": "Reconnecting - the last recorded state is shown below",
+    "act.tools": "Running tools", "act.think": "Thinking",
+    "act.lastturn": "Last turn",
+    "act.tools1": "Agent activity - 1 tool call",
+    "act.toolsN": "Agent activity - {n} tool calls",
+    "act.done": "done", "act.failed": "failed", "act.running": "running",
+    "role.user": "You", "role.agent": "Assistant", "role.system": "System",
+    "role.policy": "Notice", "role.tool": "Tool",
+    "tool.done": "done", "tool.failed": "failed", "tool.running": "...",
+    "prep.title": "Prepare an analysis",
+    "prep.dirlabel": "Sequencing data directory",
+    "prep.dirhint": "Enter the folder that holds this case's data; NeoAG recognizes the files inside it.",
+    "prep.discover": "Discover inputs",
+    "prep.discovering": "Scanning {dir}",
+    "prep.elapsed": "{s}s",
+    "prep.needDir": "Enter the sequencing data directory first",
+    "prep.scanning": "The NeoAG detector is reading the directory (nothing is modified).",
+    "prep.failTitle": "Discovery failed",
+    "prep.failFix": "Nothing was proposed from this directory and nothing was substituted. Check the path and permissions, then try again.",
+    "prep.timeout": "The scan took too long and was closed. The directory may be very large or on slow storage - start a fresh scan when ready.",
+    "prep.caseName": "Analysis name",
+    "prep.caseFrom": "derived from the directory name",
+    "prep.caseEdit": "Rename",
+    "prep.confirm": "Confirm these inputs",
+    "prep.confirmedBtn": "Confirmed",
+    "prep.rescan": "Scan a different folder",
+    "prep.submit": "Start analysis",
+    "prep.approval": "Your approval is always required before anything runs. After you approve, the pipeline runs in the background.",
+    "prep.submitted": "Task {id} created - approve the card above to let it run.",
+    "prep.needConfirm": "First discover the inputs and confirm them.",
+    "inv.title": "Detected inputs",
+    "inv.files": "{n} files", "inv.dirs": "{d} directories",
+    "inv.recognized": "{n} recognized analysis inputs",
+    "inv.excluded": "{n} files are not analysis inputs",
+    "inv.ambiguous": "{n} items need your decision",
+    "inv.blocked": "{n} blocking problem(s)",
+    "inv.ok": "This directory is ready for analysis",
+    "inv.needPick": "Choose the intended file for each highlighted item",
+    "inv.tree": "Folder contents",
+    "inv.notInput": "not an input",
+    "inv.role": "Role", "inv.file": "File", "inv.state": "State",
+    "inv.bamIndex": "alignment index {v}",
+    "inv.sampleId": "Sample identifier",
+    "inv.relFromVcf": "read from the data: {v}",
+    "inv.noRel": "the directory name is used as the case name",
+    "inv.dna": "DNA sequencing", "inv.rna": "RNA sequencing",
+    "inv.ev": "Existing evidence", "inv.none": "none found",
+    "blk.title": "Cannot start yet",
+    "warn.title": "Needs attention",
+    "info.title": "Note",
+    "pick.q": "Which file should be used for {label}?",
+    "pick.need": "Choose one file before confirming.",
+    "sci.summary": "Scientific configuration:",
+    "sci.defaults": "NeoAG defaults",
+    "sci.n1": "1 change - recorded in the run",
+    "sci.nn": "{n} changes - recorded in the run",
+    "sci.reset": "Restore defaults",
+    "sci.unavail": "The parameter inventory is unavailable right now - nothing is shown rather than guessed.",
+    "sci.unchecked": "Run normally (recommended)",
+    "plan.summary": "Stage plan",
+    "plan.loading": "The NeoAG planner is checking the confirmed inputs - this can take a minute.",
+    "plan.fail": "The plan preview failed: {e}",
+    "plan.failFix": "You can retry; nothing runs during planning.",
+    "plan.retry": "Retry plan review",
+    "plan.unavail": "Native execution is not available on this host, so a plan cannot be produced and submission is disabled. This is reported honestly instead of being substituted.",
+    "plan.blocked": "The planner found blocking problems:",
+    "plan.status": "Plan:",
+    "ps.PASS": "will run", "ps.DRY_RUN": "will run (validated)",
+    "ps.SKIPPED": "not applicable", "ps.BLOCKED": "blocked",
+    "ps.FAILED": "problem",
+    "ps.PLANNED_IN_PRODUCTION_DAG": "planned in the production run",
+    "plan.runplan": "Generated plan (technical)",
+    "run.title": "Running & recent", "run.history": "Task history",
+    "run.none": "Nothing is running yet. Prepare an analysis above, or ask the agent in chat.",
+    "run.histnone": "No finished tasks yet.",
+    "dr.close": "Close", "dr.rename": "Rename", "dr.renameSave": "Save",
+    "dr.renameCancel": "Cancel", "dr.renamed": "Title updated",
+    "dr.id": "Task ID", "dr.created": "Created", "dr.finished": "Finished",
+    "dr.exec": "Execution status", "dr.concl": "Scientific conclusion",
+    "dr.controls": "Controls", "dr.pause": "Pause", "dr.resume": "Resume",
+    "dr.cancel": "Cancel",
+    "dr.noPause": "This run type has no safe pause point.",
+    "dr.cancelNote": "Cancelling stops the task here; a native gateway job cannot be recalled once submitted (verified limitation).",
+    "dr.tech": "Technical details (audit)", "dr.decisions": "Decision history",
+    "dr.artifacts": "Output artifacts", "dr.reqcfg": "Requested configuration",
+    "dr.effcfg": "Effective configuration (what this run really applied)",
+    "dr.versions": "Versions",
+    "dr.snapshot": "Run snapshot", "dr.events": "Live events",
+    "dr.snapFull": "full recorded snapshot",
+    "dr.snapNote": "Written once when the run started; never updated.",
+    "dr.noDec": "No decisions recorded", "dr.defOnly": "defaults only",
+    "dr.noArt": "No artifacts registered yet",
+    "res.title": "Results", "res.pick": "Completed run", "res.none": "No completed runs yet.",
+    "res.prov": "Output manifest, decisions and provenance",
+    "res.bundle": "Download results bundle (.zip)",
+    "res.download": "built from the persisted run state; raw FASTQ/BAM-class inputs are never included and exclusions are listed with reasons; re-download serves the same pinned bytes",
+    "res.artH": "Output artifacts ({n})",
+    "res.noArtReg": "No artifacts are registered for this run - nothing from it can be described as delivered.",
+    "res.ranking": "Ranking", "res.empty0": "0 rows - an empty candidate table is a legitimate result; the artifact status and the run outcome above both say so.",
+    "res.unavail": "Results unavailable: {e}",
+    "disc.title": "Tool discovery & benchmarking",
+    "disc.intro": "Searches public scientific sources and your configured NeoAG inventory to review analysis tools. It reports what it verified and marks the rest as not verified.",
+    "disc.scope": "Scope", "disc.scopeT": "Targeted review",
+    "disc.scopeF": "Full pipeline review",
+    "disc.engine": "Evidence source", "disc.engL": "Live sources",
+    "disc.engE": "Example data (testing)",
+    "disc.run": "Start review", "disc.targets": "Targets",
+    "disc.targetsT": "(one or more; from the configured repository's real stage inventory)",
+    "disc.targetsF": "- full pipeline review covers every inventoried stage",
+    "disc.custom": "Custom target", "disc.customPh": "e.g. neoantigen clonality scoring",
+    "disc.none": "No research runs yet.",
+    "disc.needTarget": "Pick at least one target (or a custom one) for a targeted review",
+    "disc.started": "Research {id} started",
+    "disc.docsStage": "docs-level stage", "disc.uses": "uses:",
+    "disc.reportFail": "report failed: {e}",
+    "disc.cancelBtn": "Cancel run", "disc.cancelNote": "stops after the current query; progress is kept",
+    "disc.resumeBtn": "Resume (persisted queries skipped)",
+    "disc.partNote": "This run did not finish; nothing here is a complete review. Resume or accept the partial result.",
+    "disc.noRep": "No research runs yet.",
+    "skill.title": "Agent skills",
+    "skill.intro": "Skills are advisory instructions the agent reads when a chat starts. They guide wording and style; they cannot change approvals, safety gates or scientific settings. Changes apply to new chats.",
+    "skill.new": "New skill", "skill.none": "No skills yet.",
+    "skill.edit": "Edit", "skill.enable": "Enable", "skill.disable": "Disable",
+    "skill.enabled": "enabled", "skill.disabled": "disabled",
+    "skill.loaded": "not loaded", "skill.applies": "applies to new chats",
+    "skill.savedNot": "saved - not applied yet",
+    "skill.adv": "Advanced (version history, raw text)",
+    "sk.editTitle": "Edit skill", "sk.newTitle": "New skill",
+    "sk.name": "Name", "sk.namePh": "What is this skill called?",
+    "sk.body": "Instructions",
+    "sk.bodyPh": "What should the agent know or do differently? Write it in plain language - the agent reads this at the start of each new chat.",
+    "sk.save": "Save", "sk.cancel": "Cancel",
+    "sk.note": "Changes apply to new chats.",
+    "help.title": "Help", "help.unavail": "unavailable",
+    "st.incomplete": "incomplete",
+    "res.noCand": "No candidate rows to display.",
+    "disc.dl": "Download {f}", "disc.dlTsv": "Download TSV tables",
+    "disc.dlNote": "persisted per report version - re-download never re-runs retrieval",
+    "disc.compat": "Check compatibility", "disc.plan": "Adoption plan",
+    "disc.bench": "Propose benchmark",
+    "disc.actNote": "read-only checks; a proposed benchmark is a FORMAL job that waits for your approval before anything runs",
+    "disc.benchDone": "Benchmark PROPOSED: job {id} is blocked on approval {a} - it runs only if you approve the card.",
+    "disc.compatT": "Compatibility check (read-only): {t}",
+    "disc.planT": "Adoption plan - {t} ({tg})",
+    "disc.notApplied": "not applied",
+    "disc.noDirect": "No retrieved candidate passed the scientific relevance screen as a direct alternative for this module.",
+    "disc.noProg": "no persisted progress yet",
+    "disc.ignored": " - ignored unknown targets: {u}",
+    "disc.engineL": "live", "disc.engineE": "example",
+    "disc.h1": "1. Executive assessment",
+    "disc.h2": "2. Module-level recommendations",
+    "disc.h3": "3. Scientific comparison",
+    "disc.h4": "4. Recommended actions (scientific priority)",
+    "disc.h5": "5. Technical appendix (exclusions, full candidates, version chains, evidence records, coverage, gates, citations, provenance)",
+    "disc.qReady": "decision-ready review", "disc.qPre": "PRELIMINARY RESEARCH",
+    "disc.whatIs": "What this report is (and is not)",
+    "disc.questionL": "Question:", "disc.curMethod": "Current NeoAG method:",
+    "disc.exclL": "Excluded candidates - every retrieval that failed the scientific eligibility screen, with its reason",
+    "disc.fullTbl": "Full candidate comparison table",
+    "disc.verChains": "Version verification chains",
+    "disc.coverageL": "Coverage accounting",
+    "disc.gatesL": "Research quality gates",
+    "disc.citesL": "Sources and citations",
+    "disc.methL": "Methodology / limitations / provenance",
+    "sk.hist": "Version history", "sk.raw": "Raw SKILL.md",
+    "sk.restore": "restore",
+    "attn.resolvedNote": "resolved in Tasks panel",
+    "toast.actFail": "action failed: {e}",
+    "toast.researchFail": "research failed: {e}",
+    "toast.cancelFail": "cancel failed: {e}",
+    "toast.resumeFail": "resume failed: {e}",
+    "toast.apprFail": "approval failed: {e}",
+    "toast.decFail": "resolve failed: {e}",
+    "toast.togFail": "toggle failed: {e}",
+    "toast.verFail": "versions failed: {e}",
+    "toast.rawFail": "cannot load raw text: {e}",
+    "toast.restoreFail": "restore failed: {e}",
+    "toast.restoreOk": "restored v{v} as a new version - applies to new chats",
+    "toast.skillLoadFail": "cannot load skill: {e}",
+    "toast.saveApplyFail": "saved, but applying failed: {st} {err}",
+    "toast.boot": "boot failed: {e}",
+    "toast.sendFail": "send failed: {e}",
+    "toast.newChatFail": "new chat failed: {e}",
+    "toast.stopFail": "stop failed: {e}",
+    "toast.renamed": "Title updated",
+    "toast.renameFail": "rename failed: {e}",
+    "toast.openFail": "cannot open task: {e}",
+    "toast.confirmFail": "Could not record the confirmed inputs: {e}",
+    "toast.confirmed": "Inputs confirmed - planning starts now",
+    "toast.pickFirst": "Choose the intended file for: {items}",
+  },
+  zh: {
+    "brand.tag": "新抗原科学工作台",
+    "chat.new": "新建对话", "chat.stop": "停止",
+    "chat.ph": "描述你的目标——例如分析一个样本，或告诉智能体测序数据存放的位置",
+    "chat.send": "发送",
+    "chat.emptyTitle": "开始对话",
+    "chat.emptySub": "可以询问任何关于 NeoAG 的问题，或描述一个样本及其数据所在的位置。",
+    "chat.example": "载入示例——演示一个合成病例的完整流程",
+    "chat.agentWorking": "智能体工作中", "chat.awaiting": "等待确认",
+    "chat.deleteQ": "删除这个对话？它会从列表中消失；已保存的消息仍留在服务器上以备审计。",
+    "menu.rename": "重命名", "menu.pin": "置顶", "menu.unpin": "取消置顶",
+    "menu.archive": "归档", "menu.unarchive": "取消归档", "menu.delete": "删除",
+    "menu.archived": "已归档", "menu.noChats": "暂无对话。",
+    "conv.msg": "条消息",
+    "tab.tasks": "任务", "tab.results": "结果", "tab.discovery": "研究",
+    "tab.skills": "技能", "tab.help": "帮助",
+    "filter.all": "全部", "filter.analysis": "分析",
+    "filter.discovery": "研究", "filter.diagnostic": "诊断",
+    "conn.live": "已连接", "conn.off": "重连中",
+    "ago.now": "刚刚", "ago.m": "分钟前", "ago.h": "小时前", "ago.d": "天前",
+    "type.analysis": "完整新抗原分析",
+    "type.discovery": "部分分析",
+    "type.diagnostic": "诊断检查",
+    "type.benchmark": "基准测试实验",
+    "type.review": "科学研究评估",
+    "type.tooling": "工具发现",
+    "type.task": "任务",
+    "st.queued": "排队中", "st.running": "进行中", "st.paused": "已暂停",
+    "st.blocked": "等待批准", "st.completed": "已完成",
+    "st.failed": "失败", "st.cancelled": "已取消",
+    "concl.decision_ready": "科学结论：评估完成",
+    "concl.preliminary": "科学结论：评估未完成",
+    "attn.waiting": "等待你的处理",
+    "attn.execute": "执行批准",
+    "attn.bench": "基准测试授权",
+    "attn.decision": "决策",
+    "attn.approve": "批准", "attn.deny": "拒绝", "attn.reject": "拒绝",
+    "attn.limit": "限定范围…", "attn.lit": "仅文献",
+    "attn.scopePrompt": "你允许的范围是什么？（例如“抽样 200 例中的 5 例；仅 CPU；不用 GPU”）",
+    "attn.policyDefault": "（策略默认）",
+    "gate.q": "确认危险操作",
+    "gate.sub": "执行门禁已在其运行前拦截。批准只会放开这一项操作，且会记录在审计日志中。",
+    "gate.approve": "批准一次", "gate.deny": "拒绝",
+    "act.waitappr": "等待你的批准",
+    "act.reconnect": "连接中断，正在重连——以下显示最后记录的状态",
+    "act.tools": "正在执行工具", "act.think": "思考中",
+    "act.lastturn": "上一轮：",
+    "act.tools1": "智能体活动——1 次工具调用",
+    "act.toolsN": "智能体活动——{n} 次工具调用",
+    "act.done": "完成", "act.failed": "失败", "act.running": "运行中",
+    "role.user": "我", "role.agent": "助手", "role.system": "系统",
+    "role.policy": "提示", "role.tool": "工具",
+    "tool.done": "完成", "tool.failed": "失败", "tool.running": "...",
+    "prep.title": "准备新分析",
+    "prep.dirlabel": "测序数据目录",
+    "prep.dirhint": "输入存放本病例数据的文件夹；NeoAG 会识别其中的文件。",
+    "prep.discover": "开始识别",
+    "prep.discovering": "正在扫描 {dir}",
+    "prep.elapsed": "{s} 秒",
+    "prep.needDir": "请先输入测序数据目录",
+    "prep.scanning": "NeoAG 识别器正在读取目录（不会修改任何文件）。",
+    "prep.failTitle": "识别失败",
+    "prep.failFix": "该目录未被生成任何提案，也没有用其他数据替代。请检查路径与读取权限后重试。",
+    "prep.timeout": "扫描超时已关闭。目录可能很大或存储较慢——准备好后可重新扫描。",
+    "prep.caseName": "分析名称",
+    "prep.caseFrom": "由目录名推导",
+    "prep.caseEdit": "重命名",
+    "prep.confirm": "确认这些输入",
+    "prep.confirmedBtn": "已确认",
+    "prep.rescan": "扫描其他文件夹",
+    "prep.submit": "开始分析",
+    "prep.approval": "任何运行开始前都必须由你批准。批准后流程将在后台执行。",
+    "prep.submitted": "任务 {id} 已创建——请在上方批准卡片中批准后才会运行。",
+    "prep.needConfirm": "请先识别并确认输入数据。",
+    "inv.title": "识别到的输入",
+    "inv.files": "{n} 个文件", "inv.dirs": "{d} 个文件夹",
+    "inv.recognized": "{n} 个被识别的分析输入",
+    "inv.excluded": "{n} 个文件不是分析输入",
+    "inv.ambiguous": "{n} 项需要你决定",
+    "inv.blocked": "{n} 个阻断问题",
+    "inv.ok": "该目录已满足分析条件",
+    "inv.needPick": "请为每个高亮项选择要使用的文件",
+    "inv.tree": "文件夹内容",
+    "inv.notInput": "非输入文件",
+    "inv.role": "角色", "inv.file": "文件", "inv.state": "状态",
+    "inv.bamIndex": "比对索引 {v}",
+    "inv.sampleId": "样本标识",
+    "inv.relFromVcf": "从数据中读出：{v}",
+    "inv.noRel": "以目录名作为病例名",
+    "inv.dna": "DNA 测序", "inv.rna": "RNA 测序",
+    "inv.ev": "既有证据", "inv.none": "未找到",
+    "blk.title": "暂时无法开始",
+    "warn.title": "需要注意",
+    "info.title": "说明",
+    "pick.q": "{label} 应使用哪个文件？",
+    "pick.need": "请先选择一个文件，再确认。",
+    "sci.summary": "科学配置：",
+    "sci.defaults": "NeoAG 默认",
+    "sci.n1": "已修改 1 项——将记录在本次运行中",
+    "sci.nn": "已修改 {n} 项——将记录在本次运行中",
+    "sci.reset": "恢复默认",
+    "sci.unavail": "暂时取不到参数清单——宁可不显示，也不猜测选项。",
+    "sci.unchecked": "正常运行（推荐）",
+    "plan.summary": "阶段计划",
+    "plan.loading": "NeoAG 规划器正在核查已确认的输入——可能需要一分钟。",
+    "plan.fail": "计划预览失败：{e}",
+    "plan.failFix": "可以重试；规划期间不会运行任何计算。",
+    "plan.retry": "重新查看计划",
+    "plan.unavail": "本机当前无法进行原生执行，因此无法生成计划，提交已停用。系统如实报告，而不会用其他方式替代。",
+    "plan.blocked": "规划器发现以下阻断问题：",
+    "plan.status": "计划：",
+    "ps.PASS": "将执行", "ps.DRY_RUN": "将执行（已校验）",
+    "ps.SKIPPED": "不适用", "ps.BLOCKED": "被阻断",
+    "ps.FAILED": "存在问题",
+    "ps.PLANNED_IN_PRODUCTION_DAG": "将纳入正式运行流程",
+    "plan.runplan": "生成的计划（技术细节）",
+    "run.title": "进行中与最近", "run.history": "任务历史",
+    "run.none": "目前没有进行中的任务。可在上方准备新分析，或在对话中询问智能体。",
+    "run.histnone": "暂无已完成的任务。",
+    "dr.close": "关闭", "dr.rename": "重命名", "dr.renameSave": "保存",
+    "dr.renameCancel": "取消", "dr.renamed": "标题已更新",
+    "dr.id": "任务 ID", "dr.created": "创建于", "dr.finished": "完成于",
+    "dr.exec": "执行状态", "dr.concl": "科学结论",
+    "dr.controls": "操作", "dr.pause": "暂停", "dr.resume": "继续",
+    "dr.cancel": "取消",
+    "dr.noPause": "此类运行没有安全的暂停点。",
+    "dr.cancelNote": "取消将在此处停止任务；原生网关任务一旦提交便无法召回（已验证的限制）。",
+    "dr.tech": "技术详情（审计）", "dr.decisions": "决策历史",
+    "dr.artifacts": "输出产物", "dr.reqcfg": "请求的配置",
+    "dr.effcfg": "实际生效的配置（本次运行真正应用的）",
+    "dr.versions": "版本",
+    "dr.snapshot": "运行快照", "dr.events": "实时事件",
+    "dr.snapFull": "完整的运行快照",
+    "dr.snapNote": "运行开始时写入一次，之后不再更新。",
+    "dr.noDec": "未记录决策", "dr.defOnly": "仅使用默认",
+    "dr.noArt": "尚未登记输出产物",
+    "res.title": "结果", "res.pick": "已完成的运行", "res.none": "暂无已完成的运行。",
+    "res.prov": "输出清单、决策与溯源",
+    "res.bundle": "下载结果包（.zip）",
+    "res.download": "由持久化的运行状态生成；不会包含原始 FASTQ/BAM 输入，所有排除都附有原因；重复下载得到同一份固定字节。",
+    "res.artH": "输出产物（{n}）",
+    "res.noArtReg": "本次运行未登记任何产物——其结果均不可描述为已交付。",
+    "res.ranking": "排序", "res.empty0": "0 行——候选表为空是合法结果；上方产物状态与运行结论均已如实说明。",
+    "res.unavail": "结果不可用：{e}",
+    "disc.title": "工具发现与基准评估",
+    "disc.intro": "检索公开科学资源和你配置的 NeoAG 清单，以评估分析工具。只报告已核实的内容，其余一律标注为未核实。",
+    "disc.scope": "范围", "disc.scopeT": "定向评估",
+    "disc.scopeF": "全流程评估",
+    "disc.engine": "证据来源", "disc.engL": "公开来源",
+    "disc.engE": "示例数据（测试）",
+    "disc.run": "开始评估", "disc.targets": "目标",
+    "disc.targetsT": "（可多选；来自所配置仓库的真实阶段清单）",
+    "disc.targetsF": "——全流程评估覆盖清单中的全部阶段",
+    "disc.custom": "自定义目标", "disc.customPh": "例如：新抗原克隆性评分",
+    "disc.none": "暂无研究运行。",
+    "disc.needTarget": "定向评估请至少选择一个目标（或使用自定义目标）",
+    "disc.started": "研究 {id} 已开始",
+    "disc.docsStage": "文档层面的阶段", "disc.uses": "使用：",
+    "disc.reportFail": "报告加载失败：{e}",
+    "disc.cancelBtn": "取消运行", "disc.cancelNote": "在当前查询后停止；进度会保留",
+    "disc.resumeBtn": "继续（跳过已持久化的查询）",
+    "disc.partNote": "该运行未完成；这里没有任何内容可视为完整评估。请继续运行或接受部分结果。",
+    "disc.noRep": "暂无研究运行。",
+    "skill.title": "智能体技能",
+    "skill.intro": "技能是智能体在对话开始时阅读的建议性说明，只影响措辞与风格，不能改变批准、安全门禁或科学设置。修改将在新对话中生效。",
+    "skill.new": "新建技能", "skill.none": "暂无技能。",
+    "skill.edit": "编辑", "skill.enable": "启用", "skill.disable": "停用",
+    "skill.enabled": "已启用", "skill.disabled": "已停用",
+    "skill.loaded": "未加载", "skill.applies": "新对话生效",
+    "skill.savedNot": "已保存——尚未生效",
+    "skill.adv": "高级（版本历史、原始文本）",
+    "sk.editTitle": "编辑技能", "sk.newTitle": "新建技能",
+    "sk.name": "名称", "sk.namePh": "这个技能叫什么？",
+    "sk.body": "指令",
+    "sk.bodyPh": "希望智能体了解或改变哪些做法？请用平实语言描述——每次新对话开始时智能体都会阅读这段内容。",
+    "sk.save": "保存", "sk.cancel": "取消",
+    "sk.note": "Changes apply to new chats.",
+    "help.title": "帮助", "help.unavail": "不可用",
+    "st.incomplete": "未完成",
+    "res.noCand": "没有可展示的候选行。",
+    "disc.dl": "下载 {f}", "disc.dlTsv": "下载 TSV 表格",
+    "disc.dlNote": "按报告版本固定保存——重新下载不会重新执行检索",
+    "disc.compat": "检查兼容性", "disc.plan": "采用计划",
+    "disc.bench": "发起基准测试",
+    "disc.actNote": "只读检查；发起的基准测试是一项正式任务，在你批准之前不会运行任何内容",
+    "disc.benchDone": "已提出基准测试：任务 {id} 正等待批准 {a}——只有你在批准卡片上同意后才运行。",
+    "disc.compatT": "兼容性检查（只读）：{t}",
+    "disc.planT": "采用计划 - {t}（{tg}）",
+    "disc.notApplied": "未应用",
+    "disc.noDirect": "本次检索没有任何候选通过科学相关性筛选，成为该模块的直接替代方案。",
+    "disc.noProg": "暂无已保存的进度",
+    "disc.ignored": "——已忽略未知目标：{u}",
+    "disc.engineL": "公开来源", "disc.engineE": "示例数据",
+    "disc.h1": "1. 执行评估",
+    "disc.h2": "2. 模块级建议",
+    "disc.h3": "3. 科学比较",
+    "disc.h4": "4. 建议行动（科学优先级）",
+    "disc.h5": "5. 技术附录（排除项、候选全表、版本核验链、覆盖度、门禁、引用、溯源）",
+    "disc.qReady": "可支持决策的评估", "disc.qPre": "初步研究（未定论）",
+    "disc.whatIs": "本报告的定位（以及它不是什么）",
+    "disc.questionL": "问题：", "disc.curMethod": "当前 NeoAG 方法：",
+    "disc.exclL": "被排除的候选——每次未通过科学资格筛选的检索及其原因",
+    "disc.fullTbl": "候选工具完整比较表",
+    "disc.verChains": "版本核验链",
+    "disc.coverageL": "覆盖度统计",
+    "disc.gatesL": "研究质量门禁",
+    "disc.citesL": "来源与引用",
+    "disc.methL": "方法 / 局限 / 溯源",
+    "sk.hist": "版本历史", "sk.raw": "原始 SKILL.md",
+    "sk.restore": "恢复",
+    "attn.resolvedNote": "已在任务面板中处理",
+    "toast.actFail": "操作失败：{e}",
+    "toast.researchFail": "研究失败：{e}",
+    "toast.cancelFail": "取消失败：{e}",
+    "toast.resumeFail": "继续失败：{e}",
+    "toast.apprFail": "批准失败：{e}",
+    "toast.decFail": "提交决策失败：{e}",
+    "toast.togFail": "切换失败：{e}",
+    "toast.verFail": "读取版本失败：{e}",
+    "toast.rawFail": "无法读取原文：{e}",
+    "toast.restoreFail": "恢复失败：{e}",
+    "toast.restoreOk": "已将 v{v} 作为新版本恢复——新对话生效",
+    "toast.skillLoadFail": "无法加载技能：{e}",
+    "toast.saveApplyFail": "已保存，但应用失败：{st} {err}",
+    "toast.boot": "启动失败：{e}",
+    "toast.sendFail": "发送失败：{e}",
+    "toast.newChatFail": "新建对话失败：{e}",
+    "toast.stopFail": "停止失败：{e}",
+    "toast.renamed": "标题已更新",
+    "toast.renameFail": "重命名失败：{e}",
+    "toast.openFail": "无法打开任务：{e}",
+    "toast.confirmFail": "无法记录确认的输入：{e}",
+    "toast.confirmed": "输入已确认——开始生成计划",
+    "toast.pickFirst": "请先为以下项选择文件：{items}",
+  },
+};
+
+let LANG = "zh";
+function t(key, vars) {
+  let s = (I18N[LANG] && I18N[LANG][key]) ?? I18N.en[key] ?? key;
+  if (vars) for (const [k, v] of Object.entries(vars)) s = s.replaceAll(`{${k}}`, v);
+  return s;
+}
+function applyStaticI18n() {
+  document.documentElement.lang = LANG === "zh" ? "zh" : "en";
+  document.querySelectorAll("[data-i18n]").forEach((el) => {
+    el.textContent = t(el.dataset.i18n);
+  });
+  document.querySelectorAll("[data-i18n-ph]").forEach((el) => {
+    el.placeholder = t(el.dataset.i18nPh);
+  });
+  document.querySelectorAll("[data-i18n-title]").forEach((el) => {
+    el.title = t(el.dataset.i18nTitle);
+  });
+}
+function initLang() {
+  let saved = null;
+  try { saved = localStorage.getItem("nj_lang"); } catch { /* private mode */ }
+  LANG = (saved === "en" || saved === "zh") ? saved : "zh";
+}
+async function setLang(lang, persist) {
+  if (!(lang === "zh" || lang === "en")) return;
+  LANG = lang;
+  try { localStorage.setItem("nj_lang", lang); } catch { /* ignore */ }
+  const sel = $("lang-select");
+  if (sel && sel.value !== lang) sel.value = lang;
+  if (persist !== false) {
+    try { await api("POST", "/api/settings", { language: lang }); }
+    catch { /* local preference still applies */ }
+  }
+  applyStaticI18n();
+  renderAll();
+}
+
+/* ---------------- view state (M9 §10) ----------------
+   One consistent store: scroll position per workspace tab, selected
+   task, filters, folded sections and the in-progress preparation
+   review survive tab switches and reloads. State is re-validated on
+   restore (a vanished task or finished discovery is not resurrected
+   into a stale screen). */
+const VS = {
+  data: {},
+  load() {
+    try { this.data = JSON.parse(sessionStorage.getItem("nj.view.v1") || "{}"); }
+    catch { this.data = {}; }
+  },
+  save() {
+    try { sessionStorage.setItem("nj.view.v1", JSON.stringify(this.data)); }
+    catch { /* storage full/unavailable: state degrades gracefully */ }
+  },
+  get(k, dflt) { return this.data[k] === undefined ? dflt : this.data[k]; },
+  set(k, v) { this.data[k] = v; this.save(); },
+  drop(k) { delete this.data[k]; this.save(); },
+};
 
 const state = {
   boot: null, params: null, view: "tasks", kindFilter: "",
@@ -33,23 +573,50 @@ async function api(method, path, body) {
   return data;
 }
 
+/* api with a client-side ceiling - discovery can hold the request for
+   minutes, and the UI must reach a terminal state regardless. */
+function apiWithTimeout(ms, method, path, body) {
+  return new Promise((resolve, reject) => {
+    const to = setTimeout(
+      () => reject(Object.assign(new Error("timeout"), { timeout: true })),
+      ms);
+    api(method, path, body).then(
+      (v) => { clearTimeout(to); resolve(v); },
+      (e) => { clearTimeout(to); reject(e); });
+  });
+}
+
 function toast(msg, err) {
-  const t = $("toast");
-  t.textContent = msg;
-  t.classList.toggle("err", !!err);
-  t.classList.remove("hidden");
+  const tEl = $("toast");
+  tEl.textContent = msg;
+  tEl.classList.toggle("err", !!err);
+  tEl.classList.remove("hidden");
   clearTimeout(toast._h);
-  toast._h = setTimeout(() => t.classList.add("hidden"), 4200);
+  toast._h = setTimeout(() => tEl.classList.add("hidden"), 4200);
 }
 
 function ago(ts) {
   if (!ts) return "";
   const d = (Date.now() - new Date(ts).getTime()) / 1000;
-  if (d < 60) return "just now";
-  if (d < 3600) return `${Math.floor(d / 60)}m ago`;
-  if (d < 86400) return `${Math.floor(d / 3600)}h ago`;
-  if (d < 7 * 86400) return `${Math.floor(d / 86400)}d ago`;
+  if (d < 60) return t("ago.now");
+  if (d < 3600) return `${Math.floor(d / 60)}${t("ago.m")}`;
+  if (d < 86400) return `${Math.floor(d / 3600)}${t("ago.h")}`;
+  if (d < 7 * 86400) return `${Math.floor(d / 86400)}${t("ago.d")}`;
   return new Date(ts).toLocaleDateString();
+}
+function fmtDT(ts) {
+  if (!ts) return "";
+  const d = new Date(ts);
+  return isNaN(d) ? String(ts)
+    : d.toLocaleString([], { year: "numeric", month: "short", day: "numeric",
+      hour: "2-digit", minute: "2-digit" });
+}
+function fmtBytes(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n / 1024).toFixed(1) + " KB";
+  if (n < 1073741824) return (n / 1048576).toFixed(1) + " MB";
+  return (n / 1073741824).toFixed(2) + " GB";
 }
 
 /* ---------------- markdown (help docs) ---------------- */
@@ -102,23 +669,39 @@ async function boot() {
     state.convs = state.boot.conversations || [];
     state.activeCid = state.boot.active_conv || null;
     state.params = await api("GET", "/api/params");
-    renderAgentBadge();
+    // a language chosen on another device wins over the built-in
+    // default only when this browser never chose one itself
+    const srvLang = (state.boot.settings || {}).language;
+    let local = null;
+    try { local = localStorage.getItem("nj_lang"); } catch { /* ignore */ }
+    if (!local && (srvLang === "zh" || srvLang === "en")) LANG = srvLang;
+    $("lang-select").value = LANG;
+    applyStaticI18n();
+    VS.load();
     renderSidebar();
     await openConv(state.activeCid, true);
-    renderTasks();
-    renderJobs();
-    renderAttention();
-    renderResults();
-    renderDiscoveryControls();
-    renderDiscovery();
-    renderSkills();
-    renderHelp();
+    restorePrep();
+    renderAll();
+    restoreView();
     initSplitter();
     connectSSE();
   } catch (e) {
     if (e.status === 401) return; // browser shows the login prompt
-    toast("boot failed: " + e.message, true);
+    toast(t("toast.boot", { e: e.message }), true);
   }
+}
+
+function renderAll() {
+  renderTasks();
+  renderJobs();
+  renderAttention();
+  renderResults();
+  renderDiscoveryControls();
+  renderDiscovery();
+  renderSkills();
+  renderHelp();
+  renderChat();
+  renderPrepFlow();
 }
 
 let es = null;
@@ -130,14 +713,14 @@ function connectSSE() {
   // best-effort - the streaming watchdog below is the guarantee.
   es.onopen = () => {
     state.sseDown = false;
-    $("conn-dot").className = "dot on"; $("conn-text").textContent = "live";
+    $("conn-dot").className = "dot on"; $("conn-text").textContent = t("conn.live");
     refreshConv(); refreshSidebar(); refreshJobs(); renderAttention();
     renderResults();
   };
   es.onerror = () => {
     state.sseDown = true;
     $("conn-dot").className = "dot off";
-    $("conn-text").textContent = "reconnecting";
+    $("conn-text").textContent = t("conn.off");
     if (state.activeCid) renderChat(); // status line must say "Reconnecting"
   };
   es.onmessage = (m) => {
@@ -149,21 +732,26 @@ function connectSSE() {
     } else if (ev.type === "conversations") refreshSidebar();
     else if (ev.type === "job" || ev.type === "approval") {
       refreshJobs(); renderAttention(); refreshConv();
+      if (state.jobDetail) openJob(state.jobDetail, true);
     } else if (ev.type === "research" || ev.type === "research_changed") {
       refreshDiscovery();
       refreshJobs(); // research rows are unified task rows too (§1.2)
     } else if (ev.type === "skills_changed") refreshSkills();
     else if (ev.type === "manifest") { /* the prep flow keeps its own state */ }
-    else if (ev.type === "agent_mode") renderAgentBadge();
+    else if (ev.type === "agent_mode") {
+      state.agentMode = (state.boot && state.boot.agent_mode) || state.agentMode;
+      api("GET", "/api/bootstrap").then((b) => {
+        state.boot.agent_mode = b.agent_mode;
+      }).catch(() => { /* transient */ });
+    }
     else if (ev.type === "records_changed") boot();
   };
 }
 
 /* ---------------- conversation sidebar ---------------- */
-/* M6 PART F4: one ellipsis menu per conversation (Rename / Pin /
-   Archive / Delete) - the cluttered inline ren/del buttons and the
-   header rename are gone. Archived chats move to a collapsed group so
-   the action stays reversible. */
+/* One ellipsis menu per conversation (Rename / Pin / Archive /
+   Delete). Archived chats move to a collapsed group so the action
+   stays reversible. */
 function renderSidebar() {
   const host = $("conv-list");
   const convs = state.convs || [];
@@ -172,22 +760,21 @@ function renderSidebar() {
   const row = (c) => `
     <div class="conv-item ${c.id === state.activeCid ? "active" : ""}"
          data-conv="${esc(c.id)}">
-      <div class="ct">${c.pinned ? '<span class="cpin" title="pinned">&#9733;</span>' : ""}${esc(c.title || "New chat")}</div>
+      <div class="ct">${c.pinned ? '<span class="cpin" title="pinned">&#9733;</span>' : ""}${esc(c.title || t("chat.new"))}</div>
       <div class="cm">
         ${(c.job_state === "working" || c.job_state === "blocked")
-          ? '<span class="live" title="agent session live"></span>' : ""}
+          ? '<span class="live"></span>' : ""}
         <span>${ago(c.updated_at)}</span><span>-</span>
-        <span>${c.n_messages || 0} msg</span>
+        <span>${c.n_messages || 0} ${esc(t("conv.msg"))}</span>
       </div>
       <div class="cops">
-        <button class="icon-btn" data-menu="${esc(c.id)}"
-          title="Rename / pin / archive / delete">&#8943;</button>
+        <button class="icon-btn" data-menu="${esc(c.id)}">&#8943;</button>
       </div>
     </div>`;
   host.innerHTML =
-    (live.map(row).join("") || '<div class="empty">No chats yet.</div>')
+    (live.map(row).join("") || `<div class="empty">${esc(t("menu.noChats"))}</div>`)
     + (arch.length
-       ? `<details class="conv-arch"><summary>Archived (${arch.length})</summary>`
+       ? `<details class="conv-arch"><summary>${esc(t("menu.archived"))} (${arch.length})</summary>`
          + arch.map(row).join("") + "</details>" : "");
   host.querySelectorAll("[data-conv]").forEach((el) =>
     el.addEventListener("click", (ev) => {
@@ -213,10 +800,10 @@ function showConvMenu(cid, anchor) {
   closeConvMenu();
   const c = (state.convs || []).find((x) => x.id === cid) || {};
   const items = c.archived
-    ? [["unarchive", "Unarchive"], ["delete", "Delete"]]
-    : [["rename", "Rename"],
-       [c.pinned ? "unpin" : "pin", c.pinned ? "Unpin" : "Pin to top"],
-       ["archive", "Archive"], ["delete", "Delete"]];
+    ? [["unarchive", t("menu.unarchive")], ["delete", t("menu.delete")]]
+    : [["rename", t("menu.rename")],
+       [c.pinned ? "unpin" : "pin", c.pinned ? t("menu.unpin") : t("menu.pin")],
+       ["archive", t("menu.archive")], ["delete", t("menu.delete")]];
   const m = document.createElement("div");
   m.className = "conv-menu";
   m.innerHTML = items.map(([k, label]) =>
@@ -240,9 +827,7 @@ function showConvMenu(cid, anchor) {
         await api("POST", `/api/conversations/${cid}/flag`,
                   { archived: act === "archive" });
       } else if (act === "delete") {
-        if (!confirm(`Delete chat "${c.title || "New chat"}"?\n\n` +
-          "It disappears from this list; the saved messages stay on " +
-          "the server for audit.")) return;
+        if (!confirm(t("chat.deleteQ"))) return;
         await api("POST", `/api/conversations/${cid}/delete`, {});
       }
       if (state.activeCid === cid && ["archive", "delete"].includes(act)) {
@@ -250,7 +835,7 @@ function showConvMenu(cid, anchor) {
         await refreshSidebar();
         await openNextConv();
       } else await refreshSidebar();
-    } catch (e) { toast("chat action failed: " + e.message, true); }
+    } catch (e) { toast(e.message, true); }
   });
   convMenuCloser = (ev2) => {
     if (!ev2.target.closest(".conv-menu")
@@ -278,7 +863,7 @@ async function openConv(cid, quiet) {
     state.convMsgs = d.messages;
     state.convObj = d.conversation;
   } catch (e) {
-    if (!quiet) toast("cannot open chat: " + e.message, true);
+    if (!quiet) toast(e.message, true);
     state.convMsgs = []; state.convObj = null;
   }
   renderChat();
@@ -316,22 +901,22 @@ $("new-chat").addEventListener("click", async () => {
     await refreshSidebar();
     await openConv(r.conversation.id);
     $("chat-input").focus();
-  } catch (e) { toast("new chat failed: " + e.message, true); }
+  } catch (e) { toast(t("toast.newChatFail", { e: e.message }), true); }
 });
 
 function startRename(cid) {
   const item = document.querySelector(`[data-conv="${CSS.escape(cid)}"] .ct`);
   const conv = state.convs.find((c) => c.id === cid) || {};
   if (!item) return;
-  const old = conv.title || "New chat";
+  const old = conv.title || t("chat.new");
   item.innerHTML = `<input class="rename" value="${esc(old)}">`;
   const inp = item.querySelector("input");
   inp.focus(); inp.select();
   const commit = async () => {
-    const t = inp.value.trim();
-    if (t && t !== old) {
-      try { await api("POST", `/api/conversations/${cid}/rename`, { title: t }); }
-      catch (e) { toast("rename failed: " + e.message, true); }
+    const tt = inp.value.trim();
+    if (tt && tt !== old) {
+      try { await api("POST", `/api/conversations/${cid}/rename`, { title: tt }); }
+      catch (e) { toast(t("toast.renameFail", { e: e.message }), true); }
     }
     await refreshSidebar();
     if (cid === state.activeCid) renderChat();
@@ -343,10 +928,6 @@ function startRename(cid) {
   inp.addEventListener("blur", commit);
 }
 
-/* M6 PART F4: renaming now lives ONLY in the conversation's ⋯ menu -
-   the header rename button and the double-click shortcut are removed
-   (the header just displays the title). */
-
 /* ---------------- chat pane ---------------- */
 function fmtTime(ts) {
   if (!ts) return "";
@@ -355,6 +936,7 @@ function fmtTime(ts) {
     { hour: "2-digit", minute: "2-digit" });
 }
 const dayKey = (ts) => new Date(ts).toDateString();
+const roleLabel = (r) => t("role." + r) !== "role." + r ? t("role." + r) : r;
 
 /* Tool output arrives as two persisted messages (call + update) with the
    same tool_call_id; they merge into ONE collapsed entry, and the stored
@@ -366,8 +948,8 @@ function toolHtml(m) {
   const out = meta.tool_output ?? m.text;
   return `<details class="msg tool toolmsg">
     <summary><span class="tool-status ${esc(status)}">${
-      status === "completed" ? "done"
-      : status === "failed" ? "failed" : "..."}</span>
+      status === "completed" ? esc(t("tool.done"))
+      : status === "failed" ? esc(t("tool.failed")) : esc(t("tool.running"))}</span>
       <b>${esc(title)}</b>
       <span class="ts">${esc(fmtTime(m.ts))}</span></summary>
     <pre class="tool-out">${esc(out)}</pre></details>`;
@@ -379,12 +961,12 @@ function msgHtml(m) {
   const badges = (meta.badges || []).map((b) =>
     `<span class="badge">${esc(b)}</span>`).join("");
   return `<div class="msg ${esc(m.role)}">
-    <div class="meta"><span>${esc(m.role)}</span>${badges}<span class="ts">${
+    <div class="meta"><span>${esc(roleLabel(m.role))}</span>${badges}<span class="ts">${
       esc(fmtTime(m.ts))}</span></div>
     <div class="body">${esc(m.text)}</div></div>`;
 }
 
-/* M7 §6: the tool chatter of ONE turn collapses into a single expandable
+/* the tool chatter of ONE turn collapses into a single expandable
    activity summary once it is done - while tools are still running the
    summary stays open so the work is visible. Nothing is hidden from the
    audit trail: every call remains its own stored message, rendered
@@ -397,12 +979,13 @@ function activityHtml(rows) {
     (r.meta || {}).tool_status === "failed").length;
   const live = rows.length - done - failed;
   const bits = [];
-  if (done) bits.push(`${done} done`);
-  if (failed) bits.push(`${failed} failed`);
-  if (live) bits.push(`${live} running`);
+  if (done) bits.push(`${done} ${t("act.done")}`);
+  if (failed) bits.push(`${failed} ${t("act.failed")}`);
+  if (live) bits.push(`${live} ${t("act.running")}`);
+  const head = rows.length === 1 ? t("act.tools1")
+    : t("act.toolsN", { n: rows.length });
   return `<details class="msg activity"${live ? " open" : ""}>
-    <summary>Agent activity - ${rows.length} tool calls
-      (${bits.join(", ")})
+    <summary>${esc(head)} (${esc(bits.join(", "))})
       <span class="ts">${esc(fmtTime(rows[rows.length - 1].ts))}</span>
     </summary>
     <div class="act-rows">${rows.map((r) => toolHtml(r)).join("")}
@@ -430,15 +1013,12 @@ function gateCardHtml(a) {
   let info = {};
   try { info = JSON.parse(a.detail || "{}"); } catch { /* raw */ }
   return `<div class="inline-card confirm">
-    <div class="q">Confirm destructive operation</div>
-    <div class="sub">The execution gate blocked this before it ran. Approving
-      unlocks exactly this one operation; nothing else. It is also recorded
-      in the audit trail.</div>
+    <div class="q">${esc(t("gate.q"))}</div>
+    <div class="sub">${esc(t("gate.sub"))}</div>
     <div class="detail">${esc(info.note || a.detail || "")}</div>
     <div class="btnrow">
-      <button class="btn primary sm" data-appr="${esc(a.id)}" data-ok="1">Approve once</button>
-      <button class="btn danger sm" data-appr="${esc(a.id)}">Deny</button>
-      <span class="hint">op ${esc((info.op || "").slice(0, 12))}</span>
+      <button class="btn primary sm" data-appr="${esc(a.id)}" data-ok="1">${esc(t("gate.approve"))}</button>
+      <button class="btn danger sm" data-appr="${esc(a.id)}">${esc(t("gate.deny"))}</button>
     </div></div>`;
 }
 
@@ -446,17 +1026,17 @@ function renderChat() {
   const log = $("chat-log");
   const conv = state.convObj;
   $("chat-title").textContent =
-    (conv && (conv.title || "New chat")) || "New chat";
+    (conv && (conv.title || t("chat.new"))) || t("chat.new");
   const st = conv && conv.job_state;
   const chip = $("chat-state");
   if (st === "working" || st === "blocked") {
     chip.classList.remove("hidden");
     chip.className = "pill accent";
-    chip.textContent = st === "working" ? "agent working" : "awaiting confirmation";
+    chip.textContent = st === "working" ? t("chat.agentWorking") : t("chat.awaiting");
   } else chip.classList.add("hidden");
 
   const merged = mergeToolMsgs(state.convMsgs || []);
-  // §6: consecutive tool messages (one turn's work) become one block
+  // consecutive tool messages (one turn's work) become one block
   const blocks = [];
   for (const m of merged) {
     const last = blocks[blocks.length - 1];
@@ -491,9 +1071,9 @@ function renderChat() {
   updateActivity(gateCards.length > 0);
   if (!(state.convMsgs || []).length && !gateCards.length) {
     html += `<div class="emptychat">
-      <div class="et">Start a conversation</div>
-      <div class="es">Ask anything about NeoAG, or describe a sample and where its data live.</div>
-      <button id="load-example">Load example - walk through a synthetic case</button>
+      <div class="et">${esc(t("chat.emptyTitle"))}</div>
+      <div class="es">${esc(t("chat.emptySub"))}</div>
+      <button id="load-example">${esc(t("chat.example"))}</button>
     </div>`;
   }
   log.innerHTML = html;
@@ -502,7 +1082,7 @@ function renderChat() {
   if (le) le.addEventListener("click", loadExample);
 }
 
-/* B4: activity line right above the composer - what the agent is doing
+/* activity line right above the composer - what the agent is doing
    right now, for how long, and a Stop control for the live turn. */
 function currentTurn() {
   const msgs = state.convMsgs || [];
@@ -521,25 +1101,25 @@ function updateActivity(gatePending) {
   const working = !!turn && turn.state === "streaming";
   state.turnWorking = working;
   state.turnSince = turn && working ? new Date(turn.ts).getTime() : null;
-  // M7 §6 status semantics - honest at a glance: waiting for approval is
-  // never shown as "thinking", a lost connection is never shown as work
-  // in progress, and "thinking" only shows while no tool is executing.
+  // honest at a glance: waiting for approval is never shown as
+  // "thinking", a lost connection is never shown as work in progress,
+  // and "thinking" only shows while no tool is executing.
   const blocked = state.convObj && state.convObj.job_state === "blocked";
   let label = "";
   if (working && (gatePending || blocked)) {
-    label = "Waiting for your approval";
+    label = t("act.waitappr");
   } else if (working && state.sseDown) {
-    label = "Reconnecting - the last recorded state is shown below";
+    label = t("act.reconnect");
   } else if (working) {
     const tools = (state.convMsgs || []).slice(-4).some(
       (m) => (m.meta || {}).kind === "tool" &&
              !["completed", "failed"].includes((m.meta || {})
                .tool_status || ""));
-    label = tools ? "Running tools" : "Thinking";
+    label = tools ? t("act.tools") : t("act.think");
   } else if (gatePending || blocked) {
-    label = "Waiting for your approval";
+    label = t("act.waitappr");
   } else if (turn) {
-    label = "Last turn: " + turn.state;
+    label = t("act.lastturn") + turn.state;
   }
   if (!label) {
     bar.classList.add("hidden"); stop.classList.add("hidden");
@@ -567,7 +1147,7 @@ $("chat-stop").addEventListener("click", async () => {
                         { conv_id: state.activeCid || "" });
     toast(r.note || "stop requested");
     await refreshConv();
-  } catch (e) { toast("stop failed: " + e.message, true); }
+  } catch (e) { toast(t("toast.stopFail", { e: e.message }), true); }
   $("chat-stop").disabled = false;
 });
 
@@ -581,7 +1161,7 @@ async function loadExample() {
     await refreshConv();
     await refreshSidebar();
     await refreshJobs();
-  } catch (e) { toast("example failed: " + e.message, true); }
+  } catch (e) { toast(e.message, true); }
 }
 
 $("chat-form").addEventListener("submit", async (ev) => {
@@ -596,7 +1176,7 @@ $("chat-form").addEventListener("submit", async (ev) => {
     await refreshConv();
     await refreshSidebar();
     await refreshJobs();
-  } catch (e) { toast("send failed: " + e.message, true); }
+  } catch (e) { toast(t("toast.sendFail", { e: e.message }), true); }
 });
 $("chat-input").addEventListener("keydown", (ev) => {
   if (ev.key === "Enter" && !ev.shiftKey) {
@@ -611,8 +1191,7 @@ async function refreshJobs() {
     state.boot.jobs = b.jobs; state.boot.approvals = b.approvals;
     state.boot.decisions = b.decisions;
     renderJobs(); renderAttention();
-    // A1: finished runs must appear in Results WITHOUT a page reload -
-    // this was the bug: the Results view was never re-rendered here.
+    // finished runs must appear in Results WITHOUT a page reload
     renderResults();
   } catch (e) { /* transient */ }
 }
@@ -626,7 +1205,7 @@ function initSplitter() {
   sp.addEventListener("pointerdown", (ev) => {
     drag = { x: ev.clientX,
              w: parseInt(getComputedStyle(shell)
-                  .getPropertyValue("--chatw")) || 400 };
+                  .getPropertyValue("--chatw")) || 420 };
     sp.classList.add("drag");
     sp.setPointerCapture(ev.pointerId);
   });
@@ -639,411 +1218,697 @@ function initSplitter() {
     if (!drag) return;
     drag = null; sp.classList.remove("drag");
     localStorage.setItem("neoag.chatw",
-      shell.style.getPropertyValue("--chatw") || "400px");
+      shell.style.getPropertyValue("--chatw") || "420px");
   };
   sp.addEventListener("pointerup", end);
   sp.addEventListener("pointercancel", end);
 }
 
-/* ---------------- tasks ---------------- */
-function renderTasks() {
-  const sel = $("nj-sample");
-  sel.innerHTML = (state.boot.samples || []).map((s) =>
-    `<option value="${esc(s.id)}">${esc(s.id)} - ${esc(s.label)}</option>`).join("");
-  const stages = $("nj-stages");
-  stages.innerHTML = (state.boot.stages || []).map((s) => {
-    const dep = (s.depends_on || []).length
-      ? `needs: ${s.depends_on.join(", ")}` : "independent entry";
-    return `<label class="stage-row">
-      <input type="checkbox" data-stage="${esc(s.id)}" ${s.required ? "checked" : ""} ${s.required ? "disabled" : ""}>
-      <span>${esc(s.name)}</span>
-      ${s.required ? '<span class="req">required</span>' : ""}
-      <span class="dep">${esc(dep)}</span></label>`;
-  }).join("");
-  renderScience();
+/* ---------------- workspace tabs + view state (M9 §10) ---------------- */
+function switchView(view) {
+  const wb = $("work-body");
+  VS.set("scroll." + state.view, wb.scrollTop);
+  state.view = view;
+  VS.set("view", view);
+  document.querySelectorAll(".wtab").forEach((x) =>
+    x.classList.toggle("active", x.dataset.view === view));
+  document.querySelectorAll(".wview").forEach((x) =>
+    x.classList.toggle("active", x.id === "view-" + view));
+  requestAnimationFrame(() => {
+    wb.scrollTop = VS.get("scroll." + view, 0);
+  });
+}
+document.querySelectorAll(".wtab").forEach((tab) =>
+  tab.addEventListener("click", () => switchView(tab.dataset.view)));
+
+/* folded sections remember open/closed across tabs and reloads */
+document.querySelectorAll("details[id]").forEach((d) => {
+  d.addEventListener("toggle", () => VS.set("fold." + d.id, d.open));
+});
+function restoreFolds() {
+  document.querySelectorAll("details[id]").forEach((d) => {
+    const v = VS.get("fold." + d.id, null);
+    if (v === true && d.hasAttribute("hidden") === false) d.open = true;
+    else if (v === false) d.open = false;
+  });
+}
+let scrollT = null;
+$("work-body").addEventListener("scroll", () => {
+  clearTimeout(scrollT);
+  scrollT = setTimeout(() => VS.set("scroll." + state.view,
+    $("work-body").scrollTop), 200);
+});
+window.addEventListener("beforeunload", () => {
+  VS.set("scroll." + state.view, $("work-body").scrollTop);
+  VS.set("kindFilter", state.kindFilter);
+});
+
+function restoreView() {
+  const v = VS.get("view", "tasks");
+  state.view = v;
+  document.querySelectorAll(".wtab").forEach((x) =>
+    x.classList.toggle("active", x.dataset.view === v));
+  document.querySelectorAll(".wview").forEach((x) =>
+    x.classList.toggle("active", x.id === "view-" + v));
+  const kf = VS.get("kindFilter", "");
+  state.kindFilter = kf;
+  document.querySelectorAll("#kind-filter .chip").forEach((x) =>
+    x.classList.toggle("active", x.dataset.kind === kf));
+  restoreFolds();
+  requestAnimationFrame(() => {
+    $("work-body").scrollTop = VS.get("scroll." + v, 0);
+  });
 }
 
-function renderScience() {
-  const host = $("cfg-science");
-  if (!state.params) {
-    host.innerHTML = "<p class='hint'>parameter inventory unavailable - " +
-      "showing nothing rather than guessing options</p>";
-    return;
-  }
-  const modules = state.params.groups.filter((g) => g.concern === "science");
-  host.innerHTML = sciencePanelHtml(modules);
-  host.querySelectorAll("input,select").forEach((el) =>
-    el.addEventListener("change", updateSciState));
-  updateSciState();
-}
+/* ---------------- scientific configuration (M9 §6) ----------------
+   Only the curated, verified-modifiable controls render. The native
+   default IS the displayed selection; an untouched control forwards
+   nothing (display is not an override), and only intentional changes
+   become overrides. CLI flags, code paths and provenance strings stay
+   out of this view - the API keeps serving them for audit. */
+let planDebounce = null;
 
-function updateSciState() {
-  const el = $("sci-state");
-  if (!el) return;
-  const n = Object.keys(collectAdvanced()).length;
-  el.textContent = n ? `${n} customization${n > 1 ? "s" : ""} - recorded in the run`
-                     : "NeoAG defaults";
-}
-
-function collectAdvanced() {
+function scienceOverrides() {
   const cfg = {};
-  document.querySelectorAll("[data-param]").forEach((el) => {
-    if (el.type === "checkbox") {
-      if (el.checked) cfg[el.dataset.param] = true;
-    } else if (el.type === "radio") {
-      // M6 PART E: the default radio carries value "" = "change nothing,
-      // native default stays"; only a ticked non-default option is sent.
-      if (el.checked && el.value !== "") cfg[el.dataset.param] = el.value;
-    } else if (el.value !== "") {
-      cfg[el.dataset.param] = el.value;
+  if (!state.params) return cfg;
+  (state.params.science || []).forEach((c) => {
+    const el = document.querySelector(`[data-param="${CSS.escape(c.id)}"]`);
+    if (!el) return;
+    if (c.control === "checkbox") {
+      if (el.checked) cfg[c.id] = true;
+    } else if (c.control === "number") {
+      const v = parseInt(el.value, 10);
+      if (!isNaN(v) && v !== Number(c.native_default)) cfg[c.id] = v;
+    } else if (c.control === "radio") {
+      const sel = document.querySelector(
+        `input[name="sci-${CSS.escape(c.id)}"]:checked`);
+      if (sel && sel.value !== String(c.native_default)) cfg[c.id] = sel.value;
     }
   });
   state.requestedConfig = cfg;
   return cfg;
 }
 
-/* M6 PART E: the science panel renders ONLY the curated structured set
-   served by /api/params (radio / bounded number / checkbox - never free
-   text). Each row cites the deployed code and states what it changes;
-   leaving it untouched forwards nothing, so native defaults apply. */
-function sciencePanelHtml(modules) {
+function renderScience() {
+  const host = $("cfg-science");
   const sc = state.params || {};
   const secs = sc.science_sections || {};
   const ctrl = sc.science || [];
-  const mods = {};
-  (modules || []).forEach((g) => { if (g.module) mods[g.module.id] = g.module; });
   if (!ctrl.length) {
-    return "<h3>Scientific configuration</h3><p class='hint'>science control " +
-      "inventory unavailable - showing nothing rather than guessing options</p>";
+    host.innerHTML = `<p class="hint">${esc(t("sci.unavail"))}</p>`;
+    return;
   }
-  let html = `<h3>Scientific configuration</h3>
-    <p class="hint">Every control below was verified against the deployed NeoAG
-    code (cited per row) and is forwarded to native execution - the value
-    is also re-validated on the server, so nothing unparseable can reach a
-    run. Leaving a control at its default sends nothing: the native default
-    shown applies. Scientific decisions the code makes on its own are listed
-    below the controls instead of given fake knobs.</p>`;
+  const ov = state.requestedConfig || {};
+  let html = `<div class="scientific">`;
   Object.keys(secs).forEach((sid) => {
     const items = ctrl.filter((c) => c.section === sid);
     if (!items.length) return;
-    const mod = mods[sid];
-    html += `<div class="pgroup"><h3>${esc(secs[sid])}</h3>`;
-    if (mod) html += `<p class="hint">${esc(mod.purpose || "")}
-      <br>Tools (from the configured repo's workflow TOML):
-      <b>${esc((mod.tools || []).join(", "))}</b>
-      <br><span class="psrc">${esc((mod.tools_provenance || []).join("; "))}</span></p>`;
-    html += items.map((c) => scCtrlHtml(c)).join("") + "</div>";
+    html += `<div class="pgroup"><h3>${esc(LANG === "zh" ? secLabelZh(sid) : secs[sid])}</h3>`;
+    html += items.map((c) => scCtrlHtml(c, ov)).join("") + `</div>`;
   });
-  const info = sc.science_info || [];
-  if (info.length) {
-    html += `<div class="pgroup"><h3>Decided by the deployed code - no knob offered</h3>
-      ${info.map((i) => `<div class="pitem">
-        <div><div class="pname">${esc(i.title)}</div></div><div></div>
-        <div class="pdesc">${esc(i.decided)}</div>
-        <div class="psrc">${esc(i.evidence)}</div></div>`).join("")}</div>`;
-  }
-  return html;
+  html += `</div>`;
+  host.innerHTML = html;
+  host.querySelectorAll("input").forEach((el) =>
+    el.addEventListener("change", () => {
+      updateSciState();
+      renderScience();          // repaint "changed" highlight state
+      if (prep.manifest) {      // planner re-checks the consequences
+        clearTimeout(planDebounce);
+        planDebounce = setTimeout(loadPlan, 600);
+      }
+    }));
+  updateSciState();
 }
 
-function scCtrlHtml(c) {
+function secLabelZh(sid) {
+  return {
+    rna_fusion_splice: "RNA 表达证据",
+    tool_routing: "主工具缺失时的证据来源策略",
+    structural_variants: "结构变异分支",
+    ranking_reporting: "排序窗口",
+    reference_consistency: "参考基因组一致性",
+  }[sid] || sid;
+}
+function scLabelZh(id) {
+  return {
+    rna_quant_method: "转录本定量后端",
+    automatic_tool_policy: "替代工具策略",
+    skip_dna_sv: "跳过 DNA 结构变异识别",
+    skip_bam_matcher: "跳过肿瘤/正常样本一致性检查",
+    event_top_n: "事件排名数量上限",
+    candidate_top_n: "候选肽排名数量上限",
+    genome_build: "基因组版本",
+  }[id] || id;
+}
+function scHintZh(id) {
+  return {
+    rna_quant_method: "决定用哪个定量工具产生表达证据。",
+    automatic_tool_policy: "主工具不可用时允许改用哪些替代证据来源。",
+    skip_dna_sv: "勾选后本次运行不再产生 SV 来源的肽段事件。",
+    skip_bam_matcher: "关闭样本身份（污染/混淆）安全检查——仅当已在别处核实身份时才勾选。",
+    event_top_n: "最终排名保留的事件级行数（1-500）。",
+    candidate_top_n: "每条分析线保留的肽-HLA 候选数（1-2000）。",
+    genome_build: "参考序列与注释资产必须与之一致。",
+  }[id] || "";
+}
+
+function scCtrlHtml(c, ov) {
   const id = esc(c.id);
-  let ctrl;
+  const name = LANG === "zh" ? scLabelZh(c.id) : c.label;
+  const hint = LANG === "zh" ? scHintZh(c.id) : "";
+  const changed = ov[c.id] !== undefined;
+  let ctl;
   if (c.control === "radio") {
-    ctrl = `<div class="radios">
-      <label class="radio"><input type="radio" name="sci-${id}" data-param="${id}"
-        value="" checked><span>native default (${esc(String(c.native_default))})</span></label>
-      ${(c.options || []).map((o) => `<label class="radio">
-        <input type="radio" name="sci-${id}" data-param="${id}" value="${esc(o)}">
-        <span>${esc(o)}</span></label>`).join("")}</div>`;
+    ctl = `<div class="sc-ctl">${(c.options || []).map((o) => {
+      const on = String(ov[c.id] !== undefined ? ov[c.id] : c.native_default) === String(o);
+      return `<label class="radio"><input type="radio" name="sci-${id}"
+        data-param="${id}" value="${esc(o)}"${on ? " checked" : ""}>
+        <span>${esc(o)}</span></label>`;
+    }).join("")}</div>`;
   } else if (c.control === "number") {
-    ctrl = `<input type="number" data-param="${id}" min="${c.min}" max="${c.max}"
-      step="${c.step || 1}" placeholder="native default: ${esc(String(c.native_default))}">`;
+    const v = ov[c.id] !== undefined ? ov[c.id] : c.native_default;
+    ctl = `<div class="sc-ctl"><input type="number" data-param="${id}"
+      min="${c.min}" max="${c.max}" step="${c.step || 1}" value="${esc(v)}"></div>`;
   } else {
-    ctrl = `<label class="chk"><input type="checkbox" data-param="${id}">
-      enabled for this run</label>`;
+    ctl = `<div class="sc-ctl"><label class="chk"><input type="checkbox"
+      data-param="${id}"${ov[c.id] ? " checked" : ""}>
+      <span>${esc(LANG === "zh" ? "本次运行跳过该项" : "skip for this run")}</span></label></div>`;
   }
-  return `<div class="pitem">
-    <div><div class="pname">${esc(c.label)} <code>--${esc(c.id.replace(/_/g, "-"))}</code></div>
-    <div class="pdef">native default: ${esc(String(c.native_default))}</div></div>
-    <div>${ctrl}</div>
-    <div class="pdesc">${esc(c.affects || "")}</div>
-    <div class="psrc">${esc(c.evidence || "")}</div></div>`;
+  return `<div class="sctrl${changed ? " changed" : ""}">
+    <div><div class="sc-name">${esc(name)}</div></div>
+    ${ctl}
+    ${hint ? `<div class="sc-hint">${esc(hint)}</div>` : ""}</div>`;
 }
 
-/* M7 PART 2: the unified preparation flow. ONE data location in; the
-   NATIVE NeoAG detector's answer reviewed; the human confirms (picking
-   among real candidates where genuinely ambiguous); the confirmed
-   manifest file is the single input source for planning AND execution.
-   No per-file fields, no engine choice, no mock substitution in this
-   flow - the simulation engine lives under Demo & developer controls. */
-const prep = { disc: null, manifest: null };
-
-function prepSetState(txt, cls) {
-  const el = $("prep-state");
-  el.textContent = txt;
-  el.className = "pill " + (cls || "muted");
+function updateSciState() {
+  const el = $("sci-state");
+  if (!el) return;
+  const n = Object.keys(scienceOverrides()).length;
+  el.textContent = n === 0 ? t("sci.defaults")
+    : (n === 1 ? t("sci.n1") : t("sci.nn", { n }));
+  el.setAttribute("data-i18n", n ? "" : "sci.defaults");
+  $("sci-block").hidden = !state.params;
 }
-function prepSetActions(hint, canPreview, canSubmit) {
-  $("prep-hint").textContent = hint;
-  $("nj-native-preview").disabled = !canPreview;
-  $("nj-submit").disabled = !canSubmit;
+
+$("sci-reset").addEventListener("click", () => {
+  state.requestedConfig = {};
+  renderScience();
+  if (prep.manifest) loadPlan();
+});
+
+/* ---------------- preparation flow (M9 §5/§7) ----------------
+   Choose data directory → discover → review the real inventory →
+   confirm the manifest → the real native Planner's stage plan →
+   submit. Discovery and planning are the deployed NeoAG detector and
+   planner; the Web layer only presents their answers. The review
+   survives tab switches and reloads (VS "prep"). */
+const prep = { disc: null, manifest: null, plan: null, planState: "idle",
+               caseName: "" };
+let discReq = 0;
+
+function prepPersist() {
+  VS.set("prep", {
+    dir: $("prep-dir").value.trim(),
+    disc: prep.disc, manifest: prep.manifest, caseName: prep.caseName,
+  });
+}
+function restorePrep() {
+  const p = VS.get("prep", null);
+  if (!p) return;
+  if (p.dir) $("prep-dir").value = p.dir;
+  prep.disc = p.disc || null;
+  prep.manifest = p.manifest || null;
+  prep.caseName = p.caseName || "";
+  if (prep.manifest) {
+    // revalidate against the server (a vanished manifest must not leave
+    // a dead confirmation card on screen)
+    api("GET", `/api/manifests/${prep.manifest.id}`).then((m) => {
+      prep.manifest = m;
+      renderPrepFlow();
+      if (m.status === "confirmed" && !prep.plan) loadPlan();
+    }).catch(() => {
+      prep.manifest = null;
+      prepPersist();
+      renderPrepFlow();
+    });
+  }
+}
+
+function renderPrepFlow() {
+  if (!prep.disc) {
+    $("prep-flow").innerHTML = "";
+    $("prep-error").innerHTML = "";
+    $("prep-actions").hidden = true;
+    $("sci-block").hidden = true;
+    $("plan-block").hidden = true;
+    $("approval-note").hidden = true;
+    $("prep-entry").hidden = false;
+    return;
+  }
+  $("prep-entry").hidden = false;
+  renderInvCard();
+  if (prep.manifest) renderConfirmed();
+}
+
+function discoverBtnState(busy, elapsed) {
+  const btn = $("prep-discover"), pg = $("prep-progress");
+  btn.disabled = busy;
+  btn.classList.toggle("loading", busy);
+  btn.textContent = busy ? "…" : t("prep.discover");
+  pg.classList.toggle("hidden", !busy);
+  if (busy) {
+    $("prep-progress-text").textContent =
+      t("prep.discovering", { dir: $("prep-dir").value.trim() }) +
+      " - " + t("prep.scanning") + " " + t("prep.elapsed", { s: elapsed });
+  }
 }
 
 $("prep-discover").addEventListener("click", async () => {
   const data_dir = $("prep-dir").value.trim();
-  if (!data_dir) { toast("enter the sequencing data directory first", true); return; }
-  $("prep-flow").innerHTML =
-    '<div class="hint">inspecting the directory with the NeoAG detector ' +
-    "(read-only; VCFs and tables are read as the detector requires)...</div>";
-  prepSetState("discovering...", "warn");
-  prepSetActions("scanning", false, false);
-  loadNativeCap();
+  if (!data_dir) { toast(t("prep.needDir"), true); return; }
+  const req = ++discReq;
+  $("prep-error").innerHTML = "";
+  const t0 = Date.now();
+  discoverBtnState(true, 0);
+  const tick = setInterval(() => {
+    if (req === discReq) discoverBtnState(true,
+      Math.round((Date.now() - t0) / 1000));
+  }, 1000);
   try {
-    const d = await api("POST", "/api/native/discover", { data_dir });
-    prep.disc = d; prep.manifest = null;
-    renderDiscovery(d);
+    const d = await apiWithTimeout(240000, "POST",
+                                   "/api/native/discover", { data_dir });
+    if (req !== discReq) return;           // a newer scan superseded this
+    prep.disc = d; prep.manifest = null; prep.plan = null;
+    prep.planState = "idle";
+    prep.caseName = ((d.summary || {}).tumor_sample_id
+      || (d.summary || {}).case_guess || "").replace(/_T$/i, "").toUpperCase();
+    prepPersist();
+    renderPrepFlow();
   } catch (e) {
-    $("prep-flow").innerHTML = `<div class="mnote warn"><b>Discovery ` +
-      `failed:</b> ${esc(e.message)}<br><span class="hint">nothing was ` +
-      `proposed from this directory, and no demo data was substituted.</span></div>`;
-    prepSetState("discovery failed", "danger");
-    prepSetActions("fix the path above and try again", false, false);
+    if (req !== discReq) return;
+    const msg = e.timeout
+      ? t("prep.timeout")
+      : String((e.data && (e.data.error || e.data.detail)) || e.message);
+    $("prep-error").innerHTML = alertHtml("blocking", t("prep.failTitle"),
+      esc(msg), t("prep.failFix"));
+    prep.disc = null; prep.manifest = null;
+    prepPersist();
+    renderPrepFlow();
+  } finally {
+    clearInterval(tick);
+    if (req === discReq) discoverBtnState(false);
   }
 });
 
-function renderDiscovery(d) {
-  const s = d.summary || {};
-  const amb = d.ambiguous || [];
-  const blocked = (d.missing || []).length > 0;
-  const pill = blocked ? '<span class="pill danger">blocked - see details</span>'
-    : amb.length ? '<span class="pill warn">needs one confirmation</span>'
-    : '<span class="pill ok">ready for native analysis</span>';
-  const list = (a) => (a && a.length) ? a.map(esc).join(" &middot; ") : "none found";
-  const ambHtml = amb.map((a) => (a.candidates || []).length ? `
-    <div class="pitem"><div><div class="pname">${esc(a.label || a.field)}</div>
-    <div class="pdesc">several candidates were found - pick one:</div></div>
-    <div>${(a.candidates || []).map((c) =>
-      `<label class="chk"><input type="radio" name="amb-${esc(a.field)}" ` +
-      `value="${esc(c)}"> <code>${esc(String(c).split("/").pop())}</code></label>`
-    ).join("")}</div></div>` : `
-    <div class="pitem"><div><div class="pname">${esc(a.label || a.field)}</div>
-    <div class="pdesc">${esc(a.reason || "the native scanner flagged this")}` +
-    ` - add or correct the file, then scan again</div></div></div>`).join("");
-  $("prep-flow").innerHTML = `<div class="manifest-card">
-    <div class="mnote"><b>Case ${esc(s.case_guess || "")}</b> ${pill}</div>
-    <div class="kv">
-      <div class="k">Sample identity</div><div>${esc(s.relationship ||
-        (s.tumor_sample_id ? "tumor sample " + s.tumor_sample_id +
-         " read from the data" :
-         "no paired-sample evidence yet - the directory name is used, " +
-         "rename it below if you like"))}</div>
-      <div class="k">DNA sequencing</div><div>${list(s.dna)}</div>
-      <div class="k">RNA sequencing</div><div>${list(s.rna)}</div>
-      <div class="k">Existing evidence</div><div>${list(s.evidence)}</div>
-      <div class="k">Ambiguous assignments</div><div>${amb.length ? amb.length + " - choose below" : "none"}</div>
-      <div class="k">Missing required data</div><div>${blocked ? (d.missing || []).length + " - blocking" : "none"}</div>
-      <div class="k">HLA</div><div>${esc(d.native_hla_note || "")}</div>
+function alertHtml(kind, title, body, fix) {
+  const ico = { blocking: "&#10006;", warn: "&#9888;", info: "&#8505;",
+                good: "&#10003;" }[kind] || "";
+  return `<div class="alert ${kind}"><span class="ico">${ico}</span>
+    <div class="ab"><b>${esc(title)}</b>
+    ${body ? `<div>${body}</div>` : ""}
+    ${fix ? `<div class="fix">${esc(fix)}</div>` : ""}</div></div>`;
+}
+
+function renderInvCard() {
+  const d = prep.disc, s = d.summary || {};
+  const amb = d.ambiguous || [], missing = d.missing || [];
+  const confirmed = !!prep.manifest;
+  const picks = VS.get("picks", {});
+  const unresolved = amb.filter((a) => (a.candidates || []).length && !picks[a.field]);
+  const alerts = [];
+  if (missing.length) alerts.push(alertHtml("blocking", t("blk.title"),
+    (missing || []).map((m) => esc(m.field ? `${m.field}: ${m.reason || ""}` : (m.reason || m))).join("<br>"),
+    LANG === "zh" ? "补齐上述数据后重新扫描即可。"
+      : "Add the missing data to the directory and scan again."));
+  if (amb.length) alerts.push(alertHtml("warn", t("warn.title"),
+    esc(t("inv.needPick")), ""));
+  if ((d.warnings || []).length) alerts.push(alertHtml("warn", t("warn.title"),
+    d.warnings.map(esc).join("<br>"), ""));
+  if (d.native_hla_note) alerts.push(alertHtml("info", t("info.title"),
+    esc(d.native_hla_note), ""));
+
+  const roleRow = (i) => `<div class="role-row">
+    <span class="rr-name">${esc(roleLabelFor(i.flag))}</span>
+    <span class="rr-path">${esc(String(i.path).split("/").slice(-2).join("/"))}</span>
+    <span class="rr-size">${fmtBytes(i.size_bytes)}</span></div>`;
+  const pickHtml = amb.map((a) => (a.candidates || []).length ? `
+    <div class="pickbox" data-pick="${esc(a.field)}">
+      <div class="pq">${esc(t("pick.q", { label: roleLabelFor(a.field) || a.label || a.field }))}</div>
+      ${(a.candidates || []).map((c) => `
+        <label><input type="radio" name="amb-${esc(a.field)}" value="${esc(c)}"
+          ${picks[a.field] === c ? "checked" : ""}>
+          <span class="pp">${esc(String(c).split("/").slice(-2).join("/"))}</span></label>`).join("")}
+    </div>` : "").join("");
+
+  $("prep-flow").innerHTML = `<div class="inv-card card-in" id="inv-card">
+    <div class="card-head"><h3 class="sec" style="margin:0">${esc(t("inv.title"))}</h3>
+      ${confirmed ? "" : `<button class="btn ghost sm" id="prep-rescan">${esc(t("prep.rescan"))}</button>`}
     </div>
-    ${amb.length ? `<h3>Confirm which file to use</h3>${ambHtml}` : ""}
-    <details class="adv"><summary>Input details - the ${s.n_recognized || 0} recognized file(s) of ${s.n_files || 0} seen</summary>
-      <div class="tablewrap"><table class="data"><thead><tr><th>Role</th><th>File</th><th>State</th></tr></thead><tbody>
-      ${(d.inputs || []).map((i) => `<tr><td>${esc(i.role)}</td><td><code>${esc(i.path)}</code></td><td>${esc([i.status, i.bam_index && ("bam index " + i.bam_index)].filter(Boolean).join(", "))}</td></tr>`).join("")}
-      </tbody></table></div>
-      ${(d.routes || []).length ? `<p class="hint">Native routing from these inputs: ${(d.routes || []).map((r) => `<b>${esc(r.route)}</b> ${esc(r.status)}`).join(" &middot; ")}</p>` : ""}
-      ${blocked ? `<p class="hint">Blocking: <ul>${(d.missing || []).map((m) => `<li>${esc(m.field || "")}${m.field ? ": " : ""}${esc(m.reason || m)}</li>`).join("")}</ul></p>` : ""}
-      ${(d.warnings || []).length ? `<p class="hint">${(d.warnings || []).map(esc).join("<br>")}</p>` : ""}
-      ${(d.unmatched || []).length ? `<p class="hint">${d.unmatched.length} file(s) were not recognized as inputs and stay untouched: ${(d.unmatched || []).slice(0, 12).map((f) => `<code>${esc(f)}</code>`).join(" ")}${d.unmatched.length > 12 ? " ..." : ""}</p>` : ""}
-    </details>
-    <label class="lbl">Sample / case id for this run</label>
-    <input type="text" id="prep-sample" value="${esc(((s.tumor_sample_id || s.case_guess || "").replace(/_T$/i, "")).toUpperCase())}">
-    <div class="btnrow">
-      <button id="prep-confirm" class="btn primary" ${blocked ? "disabled" : ""}>Confirm these inputs</button>
-      <span class="hint">${blocked ? "resolve the blocking items first - a plan would fail honestly the same way" : "the confirmed manifest is reused by planning and execution - nothing will be asked again"}</span>
+    <div class="inv-root">${esc(d.data_dir)}</div>
+    <div class="inv-sum">
+      <span><b>${s.n_files || 0}</b> ${esc(t("inv.files", { n: "" }).replace(/^\d*\s*/, ""))}</span>
+      <span><b>${s.n_recognized || 0}</b> ${esc(t("inv.recognized", { n: "" }).replace(/^\d*\s*/, ""))}</span>
+      <span><b>${(d.unmatched || []).length}+</b> ${esc(t("inv.excluded", { n: "" }).replace(/^\d*\s*/, ""))}</span>
+      ${amb.length ? `<span class="pill warn">${esc(t("inv.ambiguous", { n: amb.length }))}</span>` : ""}
+      ${missing.length ? `<span class="pill danger">${esc(t("inv.blocked", { n: missing.length }))}</span>` : `<span class="pill ok">${esc(t("inv.ok"))}</span>`}
     </div>
+    ${alerts.join("")}
+    ${pickHtml}
+    <div class="inv-sec">
+      <h3>${esc(t("inv.recognized", { n: s.n_recognized || 0 }))}</h3>
+      <div class="role-grid">${(d.inputs || []).map(roleRow).join("") || `<div class="empty">${esc(t("inv.none"))}</div>`}</div>
+    </div>
+    <div class="inv-sec">
+      <h3>${esc(t("inv.tree"))}</h3>
+      <div class="tree" id="inv-tree"></div>
+    </div>
+    <label class="lbl">${esc(t("prep.caseName"))}
+      <span class="count">${esc(t("prep.caseFrom"))}</span></label>
+    <div class="conf-row"><span id="case-name-txt" class="hint">${esc(prep.caseName || "-")}</span>
+      ${confirmed ? "" : `<button class="btn ghost sm" id="case-name-edit">${esc(t("prep.caseEdit"))}</button>`}</div>
+    ${confirmed ? "" : `<div class="btnrow">
+      <button id="prep-confirm" class="btn primary" ${missing.length ? "disabled" : ""}>${esc(t("prep.confirm"))}</button>
+      ${missing.length ? `<span class="hint">${esc(t("plan.blocked"))}</span>` : ""}
+    </div>`}
   </div>`;
-  prepSetState(blocked ? "blocked" : (amb.length ? "review needed" : "inputs detected"),
-               blocked ? "danger" : (amb.length ? "warn" : "ok"));
-  prepSetActions(blocked ? "the detector reported what is missing - add it to the directory and re-scan"
-                         : "review the detected inputs, then confirm", false, false);
+  mountTree();
+  const rc = $("prep-rescan");
+  if (rc) rc.addEventListener("click", () => {
+    prep.disc = null; prep.manifest = null; prep.plan = null; prep.planState = "idle";
+    VS.drop("picks"); prepPersist(); renderPrepFlow();
+    $("prep-dir").focus();
+  });
+  const cn = $("case-name-edit");
+  if (cn) cn.addEventListener("click", () => {
+    const host = $("case-name-txt");
+    host.innerHTML = `<input id="case-name-in" value="${esc(prep.caseName)}" style="max-width:320px;display:inline-block">`;
+    const inp = $("case-name-in");
+    inp.focus();
+    inp.addEventListener("change", () => {
+      prep.caseName = inp.value.trim().toUpperCase() || prep.caseName;
+      prepPersist(); renderInvCard();
+    });
+  });
+  document.querySelectorAll("#prep-flow input[name^='amb-']").forEach((r) =>
+    r.addEventListener("change", () => {
+      const p = VS.get("picks", {});
+      p[r.name.replace(/^amb-/, "")] = r.value;
+      VS.set("picks", p);
+    }));
   const cb = $("prep-confirm");
   if (cb) cb.addEventListener("click", confirmInputs);
 }
 
+/* human-readable scientific role names (zh/en) - the ROLES themselves
+   come from the native detector, this only localizes their labels */
+function roleLabelFor(flag) {
+  const zh = {
+    tumor_dna_bam: "肿瘤 DNA 比对", normal_dna_bam: "配对正常 DNA 比对",
+    tumor_dna_fastq: "肿瘤 DNA reads", normal_dna_fastq: "配对正常 DNA reads",
+    tumor_rna_bam: "RNA 比对", tumor_rna_fastq: "RNA reads",
+    somatic_vcf: "体细胞变异调用", sv_vcf: "结构变异调用",
+    fusion_tsv: "融合基因结果表", splice_junction_tsv: "剪接连接结果表",
+    hla_file: "HLA 分型结果", peptide_csv: "既有肽-HLA 表",
+    expression_tsv: "基因表达表", purity_tsv: "纯度/倍体表",
+    cnv_tsv: "拷贝数节段", hla_loh_tsv: "HLA LOH 证据",
+    capture_bed: "捕获试剂盒 BED", tumor_sample_id: "肿瘤样本名",
+  };
+  const amb = { tumor_sample_id: "哪个样本是肿瘤？" };
+  if (LANG === "zh") return zh[flag] || flag;
+  const hit = ((prep.disc || {}).ambiguous || []).find((a) => a.field === flag);
+  return hit ? (hit.label || flag) : flag;
+}
+
+/* ---------------- input inventory folder tree ----------------
+   Real listing via /api/native/tree, one level per expansion (lazy,
+   so huge directories never render at once). Sizes come from the real
+   filesystem; the scientific role tags come ONLY from what the native
+   detector recognized - nothing is inferred from filenames here. */
+const treeCache = {};
+function inputRoleMap() {
+  const map = {};
+  const base = (prep.disc || {}).data_dir || "";
+  for (const i of (prep.disc || {}).inputs || []) {
+    const rel = String(i.path).startsWith(base)
+      ? String(i.path).slice(base.length).replace(/^\/+/, "")
+      : null;
+    if (rel) map[rel] = roleLabelFor(i.flag);
+  }
+  return map;
+}
+function unmatchedSet() {
+  const base = (prep.disc || {}).data_dir || "";
+  const rels = new Set();
+  for (const u of (prep.disc || {}).unmatched || []) rels.add(u);
+  return rels;
+}
+async function mountTree() {
+  const host = $("inv-tree");
+  if (!host || !prep.disc) return;
+  const roles = inputRoleMap(), un = unmatchedSet();
+  treeCache[""] = null;
+  host.innerHTML = `<div class="tnote">${esc(t("prep.scanning"))}</div>`;
+  try {
+    const r = await api("GET", "/api/native/tree?data_dir=" +
+      encodeURIComponent(prep.disc.data_dir));
+    if (!r.ok) throw new Error(r.error || "listing failed");
+    renderTreeLevel(host, r, "", roles, un);
+  } catch (e) {
+    host.innerHTML = `<div class="tnote">${esc(e.message)}</div>`;
+  }
+}
+function renderTreeLevel(host, r, prefix, roles, un) {
+  host.innerHTML = "";
+  if (r.truncated) {
+    const n = document.createElement("div");
+    n.className = "tnote";
+    n.textContent = `… ${r.n_total - r.entries.length} more`;
+    host.appendChild(n);
+  }
+  for (const ent of r.entries) {
+    const row = document.createElement("div");
+    row.className = "trow";
+    const role = roles[ent.rel];
+    const excluded = !ent.dir && un.has(ent.rel);
+    const tw = document.createElement("span");
+    tw.className = "tw";
+    tw.textContent = ent.dir ? "+" : "";
+    const nm = document.createElement("span");
+    nm.className = "tname";
+    nm.textContent = ent.name;
+    row.appendChild(tw); row.appendChild(nm);
+    if (!ent.dir && role) {
+      const tag = document.createElement("span");
+      tag.className = "trole";
+      tag.textContent = role;
+      row.appendChild(tag);
+    } else if (!ent.dir && excluded) {
+      const tag = document.createElement("span");
+      tag.className = "trole excl";
+      tag.textContent = t("inv.notInput");
+      row.appendChild(tag);
+    }
+    if (!ent.dir) {
+      const sz = document.createElement("span");
+      sz.className = "tsize";
+      sz.textContent = fmtBytes(ent.size);
+      row.appendChild(sz);
+    }
+    host.appendChild(row);
+    if (ent.dir) {
+      const kid = document.createElement("div");
+      kid.style.paddingLeft = "18px";
+      kid.style.display = "none";
+      host.appendChild(kid);
+      tw.addEventListener("click", async () => {
+        if (kid.style.display === "none") {
+          kid.style.display = ""; tw.textContent = "−";
+          if (!kid.dataset.loaded) {
+            kid.dataset.loaded = "1";
+            kid.innerHTML = `<div class="tnote">…</div>`;
+            try {
+              const sub = await api("GET", "/api/native/tree?data_dir=" +
+                encodeURIComponent(prep.disc.data_dir) +
+                "&sub=" + encodeURIComponent(ent.rel));
+              if (sub.ok) renderTreeLevel(kid, sub, ent.rel, roles, un);
+              else kid.innerHTML = `<div class="tnote">${esc(sub.error)}</div>`;
+            } catch (e) {
+              kid.innerHTML = `<div class="tnote">${esc(e.message)}</div>`;
+            }
+          }
+        } else { kid.style.display = "none"; tw.textContent = "+"; }
+      });
+    }
+  }
+}
+
 async function confirmInputs() {
-  const picked = {};
-  document.querySelectorAll("#prep-flow input[type=radio]:checked").forEach((r) => {
-    picked[r.name.replace(/^amb-/, "")] = r.value;
-  });
+  const picks = VS.get("picks", {});
   const unresolved = (prep.disc.ambiguous || [])
-    // only entries that actually offer candidate files can be picked;
+    // only entries that actually offer candidate files must be picked;
     // the rest are notes resolved by fixing the directory + re-scan
-    .filter((a) => (a.candidates || []).length && !picked[a.field])
-    .map((a) => a.label || a.field);
+    .filter((a) => (a.candidates || []).length && !picks[a.field])
+    .map((a) => roleLabelFor(a.field) || a.label || a.field);
   if (unresolved.length) {
-    toast("choose among the candidates for: " + unresolved.join(", "), true);
+    toast(t("toast.pickFirst", { items: unresolved.join(", ") }), true);
+    document.querySelectorAll(".pickbox").forEach((p) => {
+      if (!unresolved.length) return;
+      const box = p; const f = box.dataset.pick;
+      const lbl = (prep.disc.ambiguous.find((a) => a.field === f) || {});
+      if (unresolved.includes(roleLabelFor(f) || lbl.label || f)) {
+        if (!box.querySelector(".perr")) {
+          const e = document.createElement("div");
+          e.className = "perr"; e.textContent = t("pick.need");
+          box.appendChild(e);
+        }
+      }
+    });
     return;
   }
   try {
     const m = await api("POST", "/api/native/manifest", {
       data_dir: prep.disc.data_dir,
-      sample_id: $("prep-sample").value.trim(),
-      picked });
+      sample_id: prep.caseName,
+      picked: picks });
     prep.manifest = m;
-    renderConfirmed(m);
-    toast("manifest written - the planner and the runner both read this run's inputs from that single file");
-  } catch (e) { toast("could not write the manifest: " + e.message, true); }
-}
-
-function renderConfirmed(m) {
-  const p = m.proposal || {};
-  const old = $("confirmed-card");
-  if (old) old.remove();
-  const div = document.createElement("div");
-  div.id = "confirmed-card";
-  div.innerHTML = `<div class="manifest-card">
-    <div class="mnote"><span class="pill ok">confirmed</span> input manifest
-      <b>${esc(m.id)}</b> &middot; sample <b>${esc(p.sample_id || "")}</b>
-      &middot; ${(p.inputs || []).length} inputs &middot; native schema
-      open-neo-sample-v1</div>
-    <p class="hint">${esc(p.note || "")}</p>
-    <details class="adv"><summary>Confirmed input list</summary>
-      ${(p.inputs || []).map((i) => `<div><b>${esc(i.role)}</b>: <code>${esc(i.path)}</code></div>`).join("")}</details>
-  </div>`;
-  $("prep-flow").appendChild(div);
-  const c = $("prep-confirm");
-  if (c) { c.disabled = true; c.textContent = "Confirmed"; }
-  prepSetState("manifest confirmed", "ok");
-  prepSetActions("preview the native plan, or submit for approval", true, true);
-}
-
-/* native capability line (honest, cached) */
-let nativeCap = null;
-function renderNativeCap() {
-  const host = $("native-cap");
-  if (!nativeCap || !host) return;
-  const t = nativeCap.toolchain || {};
-  const y = (b) => b ? "present" : "<b>MISSING</b>";
-  host.innerHTML = nativeCap.available
-    ? `Native source imports <b>OK</b> &middot; demo fixtures ${y(t.demo_fixtures && t.demo_fixtures.present)}` +
-      ` &middot; reference FASTA ${y(t.reference_fasta && t.reference_fasta.present)}` +
-      ` &middot; VEP ${y(t.vep_bin && t.vep_bin.present)}` +
-      ` &middot; native gateway ${nativeCap.gateway && nativeCap.gateway.running
-        ? "running (" + esc(String(nativeCap.gateway.url)) + ")"
-        : "not running - started on demand at submission"}` +
-      ` &middot; gateway cancel: ${nativeCap.cancel_supported_by_native_gateway ? "supported" : "NOT supported (verified limitation)"}`
-    : `<b>Native execution UNAVAILABLE on this host</b> - discovery and ` +
-      `native jobs report the failure honestly; nothing is silently ` +
-      `substituted by the simulation engine`;
-}
-async function loadNativeCap() {
-  if (nativeCap) { renderNativeCap(); return; }
-  const host = $("native-cap");
-  if (!host) return;
-  host.textContent = "checking native capability...";
-  try { nativeCap = await api("GET", "/api/native/capability"); renderNativeCap(); }
-  catch (e) { host.innerHTML = "capability check failed: " + esc(e.message); }
-}
-
-/* Demo/Developer mode gate (Milestone 5 PART 2 concern D): the
-   simulation engine and developer controls are hidden until explicitly
-   enabled, and stay off by default in every fresh session. */
-function devModeOn() {
-  try { return localStorage.getItem("nj_devmode") === "1"; }
-  catch (_) { return false; }
-}
-function applyDevMode() {
-  const on = devModeOn();
-  const cb = $("devmode-toggle");
-  if (cb) cb.checked = on;
-  $("dev-controls").classList.toggle("hidden", !on);
-  if (!on) $("nj-fail").checked = false;
-  const stubWrap = $("nj-stub-wrap");
-  if (stubWrap) {
-    const showStub = on && !$("nj-n-demo").checked;
-    stubWrap.style.display = showStub ? "" : "none";
-    if (!showStub) $("nj-n-stub").checked = false;
-  }
-}
-$("devmode-toggle").addEventListener("change", (e) => {
-  try { localStorage.setItem("nj_devmode", e.target.checked ? "1" : "0"); }
-  catch (_) { /* storage unavailable: session-only toggle */ }
-  applyDevMode();
-});
-$("nj-n-demo").addEventListener("change", () => applyDevMode());
-applyDevMode();
-
-function renderNativePlan(plan) {
-  let host = $("native-plan-view");
-  if (!host) {
-    host = document.createElement("div");
-    host.id = "native-plan-view";
-    $("prep-flow").appendChild(host);
-  }
-  if (!plan) return;
-  const steps = (plan.steps || []).map((st) =>
-    `<li><b>${esc(st.step_id || "")} ${esc(st.name || "")}</b> ` +
-    `<span class="pill ${st.status === "PASS" ? "ok"
-      : st.status === "SKIPPED" || st.status === "DRY_RUN" ? "muted"
-      : st.status === "FAILED" || st.status === "BLOCKED" ? "danger"
-      : "warn"}">${esc(st.status || "")}</span>` +
-    (st.detail ? ` <span class="hint">${esc(String(st.detail).slice(0, 140))}</span>` : "") +
-    `</li>`).join("");
-  host.innerHTML = `<div class="manifest-card">
-    <div class="mnote ${plan.ok ? "" : "warn"}">native plan: <b>${esc(plan.status || plan.status_code || "?")}</b>${plan.run_id ? " &middot; run " + esc(plan.run_id) : ""}</div>
-    ${steps ? `<ul>${steps}</ul>` : ""}
-    ${plan.blocking_issues && plan.blocking_issues.length
-      ? `<p class="hint">Blocking: ${plan.blocking_issues.map(esc).join(", ")}</p>` : ""}
-    ${plan.missing_evidence && plan.missing_evidence.length
-      ? `<p class="hint">Toolchain not installed for: ${plan.missing_evidence.map(esc).join(", ")} - the plan marks those steps BLOCKED honestly</p>` : ""}
-    ${plan.detail ? `<p class="hint">${esc(plan.detail)}</p>` : ""}
-    ${plan.run_plan_md ? `<details><summary class="hint">generated run plan (native markdown)</summary><pre class="tool-out">${esc(plan.run_plan_md)}</pre></details>` : ""}
-  </div>`;
-}
-
-$("nj-native-preview").addEventListener("click", async () => {
-  const m = prep.manifest;
-  if (!(m && m.status === "confirmed")) {
-    toast("confirm the detected inputs first - the preview plans exactly those inputs, nothing invented", true);
-    return;
-  }
-  let host = $("native-plan-view");
-  if (!host) {
-    host = document.createElement("div");
-    host.id = "native-plan-view";
-    $("prep-flow").appendChild(host);
-  }
-  host.innerHTML = '<div class="hint">running the REAL NeoAG planner on the confirmed manifest (read-only, executes nothing)... this can take a minute</div>';
-  try {
-    const plan = await api("POST", "/api/jobs/native/preview", { manifest_id: m.id });
-    renderNativePlan(plan);
+    VS.drop("picks");
+    prepPersist();
+    renderConfirmed();
+    toast(t("toast.confirmed"));
+    loadPlan();
   } catch (e) {
-    host.innerHTML = `<div class="mnote warn">preview failed: ${esc(e.message)}</div>`;
+    toast(t("toast.confirmFail", { e: String((e.data && e.data.error) || e.message) }), true);
   }
-});
+}
 
-/* submit: the GUI and the chat path post to the SAME /api/jobs endpoint
-   - one Job ID either way, registered in the unified task system. */
-$("nj-submit").addEventListener("click", async () => {
-  if (devModeOn() && $("nj-n-demo").checked) {
-    const body = { engine: "native", synthetic_demo: true,
-                   stub: $("nj-n-stub").checked };
-    const sid = ($("prep-sample") || {}).value;
-    if (sid) body.sample_id = sid;
-    try {
-      const res = await api("POST", "/api/jobs", body);
-      toast(`native synthetic-demo job ${res.job_id} waiting for your approval (Tasks panel above)`);
-      await refreshJobs();
-    } catch (e) { toast("native demo submit failed: " + e.message, true); }
+function renderConfirmed() {
+  const m = prep.manifest;
+  if (!m) return;
+  const p = m.proposal || {};
+  let card = $("confirmed-card");
+  if (card) card.remove();
+  card = document.createElement("div");
+  card.id = "confirmed-card";
+  card.innerHTML = alertHtml("good",
+    `${t("prep.confirmedBtn")} - ${esc(p.sample_id || "")}`,
+    (p.inputs || []).length + " " + esc(t("inv.recognized", { n: "" }).trim()));
+  $("prep-flow").appendChild(card);
+  $("sci-block").hidden = false;
+  $("plan-block").hidden = false;
+  $("prep-actions").hidden = false;
+  $("approval-note").hidden = false;
+  updateSciState();
+  renderSubmitState();
+}
+
+/* ---------------- stage plan: the REAL native Planner (M9 §7) -------- */
+async function loadPlan() {
+  const m = prep.manifest;
+  if (!m || m.status !== "confirmed") return;
+  prep.planState = "loading";
+  const body = $("plan-body");
+  $("plan-block").hidden = false;
+  $("plan-block").open = true;
+  body.innerHTML = `<div class="prep-progress"><span class="spin"></span>
+    <span>${esc(t("plan.loading"))}</span></div>`;
+  try {
+    const plan = await apiWithTimeout(300000, "POST",
+      "/api/jobs/native/preview", { manifest_id: m.id });
+    prep.plan = plan; prep.planState = "done";
+    renderPlan();
+  } catch (e) {
+    prep.plan = null; prep.planState = "failed";
+    body.innerHTML = alertHtml("blocking",
+      t("plan.fail", { e: String((e.data && e.data.error) || e.message) }),
+      "", t("plan.failFix")) +
+      `<div class="btnrow"><button class="btn sm" id="plan-retry">${esc(t("plan.retry"))}</button></div>`;
+    $("plan-retry").addEventListener("click", loadPlan);
+    renderSubmitState();
+  }
+}
+
+function renderPlan() {
+  const plan = prep.plan, body = $("plan-body");
+  if (!plan) return;
+  if (plan.status === "NATIVE_UNAVAILABLE" || plan.ok === false && !(plan.steps || []).length) {
+    body.innerHTML = alertHtml("blocking", t("plan.unavail"),
+      esc(plan.detail || ""));
+    renderSubmitState();
     return;
   }
+  const steps = (plan.steps || []).map((st) => {
+    const cls = st.status === "PASS" ? "pass" : st.status === "DRY_RUN" ? "dry"
+      : st.status === "SKIPPED" ? "skip"
+      : (st.status === "BLOCKED" || st.status === "FAILED") ? "blocked" : "dry";
+    return `<div class="pstep ${cls}">
+      <span class="ps-name">${esc([st.step_id, st.name].filter(Boolean).join(" "))}${
+        LANG === "zh" && planStepName(st)
+          ? ` <i class="ps-zh">${esc(planStepName(st))}</i>` : ""}</span>
+      <span class="ps-detail">${esc(String(st.detail || "").slice(0, 160))}</span>
+      <span class="ps-tag">${esc(t("ps." + st.status) !== "ps." + st.status ? t("ps." + st.status) : st.status)}</span>
+    </div>`;
+  }).join("");
+  const blocking = (plan.blocking_issues || []).length
+    ? alertHtml("blocking", t("plan.blocked"),
+        (plan.blocking_issues || []).map(esc).join("<br>")) : "";
+  const missingEv = (plan.missing_evidence || []).length
+    ? alertHtml("warn", t("warn.title"),
+        (plan.missing_evidence || []).map(esc).join("<br>")) : "";
+  body.innerHTML = `
+    <div class="hint">${esc(t("plan.status"))} <b>${esc(plan.status || plan.status_code || "?")}</b></div>
+    ${blocking}${missingEv}
+    <div class="plan-steps">${steps || `<div class="empty">${esc(plan.detail || "")}</div>`}</div>
+    ${plan.run_plan_md ? `<details class="adv"><summary>${esc(t("plan.runplan"))}</summary>
+      <pre class="tool-out">${esc(plan.run_plan_md)}</pre></details>` : ""}`;
+  renderSubmitState();
+}
+
+/* The planner's step names are its own identifiers and stay verbatim;
+   the line below only adds a plain-language gloss when Chinese is
+   active. Keys are the real skill_result step names (verified 2026-11-
+   18 against the deployed planner; unknown names render unexplained,
+   never mislabelled). */
+function planStepName(st) {
+  const zh = {
+    "input-detection-and-routing": "识别输入并确定分析路线",
+    "capability-aware-production-plan": "按本机可用工具生成生产计划",
+    "doctor-preflight": "环境体检（预检）",
+    "rna-expression-and-allele-evidence": "RNA 表达与等位基因证据",
+    "pipeline-plan": "生成执行计划",
+    "pipeline-full-dry-run": "全流程空跑校验",
+    "variant-calling": "变异识别",
+    "hla-typing": "HLA 分型",
+    "expression-quantification": "表达定量",
+    "candidate-ranking": "候选排序",
+    "report-generation": "报告生成",
+  };
+  if (LANG === "zh") return zh[st.name] || "";
+  return "";
+}
+
+function renderSubmitState() {
+  const btn = $("nj-submit"), hint = $("prep-hint");
+  const plan = prep.plan;
+  let can = !!prep.manifest && prep.manifest.status === "confirmed";
+  let why = "";
+  if (!can) { why = t("prep.needConfirm"); can = false; }
+  else if (prep.planState === "loading") { why = t("plan.loading"); can = false; }
+  else if (plan && (plan.status === "NATIVE_UNAVAILABLE")) {
+    why = t("plan.unavail"); can = false;
+  } else if (plan && (plan.blocking_issues || []).length) {
+    why = t("plan.blocked"); can = false;
+  }
+  btn.disabled = !can;
+  hint.textContent = why;
+}
+
+$("nj-submit").addEventListener("click", async () => {
   const m = prep.manifest;
   if (!(m && m.status === "confirmed")) {
-    toast("first discover the inputs and confirm them - the confirmed manifest is the run's input list", true);
-    return;
+    toast(t("prep.needConfirm"), true); return;
   }
-  const body = { engine: "native", manifest_id: m.id,
-                 stub: $("nj-n-stub").checked };
-  const sci = collectAdvanced();
+  const body = { engine: "native", manifest_id: m.id };
+  const sci = scienceOverrides();
   const fwd = {};
   ["event_top_n", "candidate_top_n", "genome_build",
    "rna_quant_method", "automatic_tool_policy",
@@ -1051,30 +1916,20 @@ $("nj-submit").addEventListener("click", async () => {
     if (sci[k] !== undefined && sci[k] !== "") fwd[k] = sci[k];
   });
   if (Object.keys(fwd).length) body.native_params = fwd;
+  $("nj-submit").disabled = true;
   try {
     const res = await api("POST", "/api/jobs", body);
-    toast(`native job ${res.job_id} waiting for your approval ` +
-      "(Tasks panel above) - this page stays usable while it runs");
+    toast(t("prep.submitted", { id: res.job_id }));
+    prep.disc = null; prep.manifest = null; prep.plan = null;
+    prep.planState = "idle"; state.requestedConfig = {};
+    VS.drop("prep");
+    renderPrepFlow(); renderScience();
+    switchView("tasks");
     await refreshJobs();
-  } catch (e) { toast("native submit failed: " + e.message, true); }
-});
-
-/* simulation engine (demo) submission - dev controls only */
-$("nj-submit-demo").addEventListener("click", async () => {
-  const sample = $("nj-sample").value;
-  const stage_ids = [...document.querySelectorAll("[data-stage]")]
-    .filter((c) => c.checked).map((c) => c.dataset.stage);
-  const execution_mode = document.querySelector(
-    'input[name="execmode"]:checked').value;
-  const body = { sample_id: sample, stage_ids, mode: "auto",
-                 execution_mode, simulate_failure: $("nj-fail").checked,
-                 kind: "analysis", requested_config: collectAdvanced(),
-                 requested_by: "user (simulation engine)" };
-  try {
-    const res = await api("POST", "/api/jobs", body);
-    toast(`simulated job ${res.job_id} waiting for your approval (demo engine)`);
-    await refreshJobs();
-  } catch (e) { toast("submit failed: " + e.message, true); }
+  } catch (e) {
+    $("nj-submit").disabled = false;
+    toast(String((e.data && e.data.error) || e.message), true);
+  }
 });
 
 /* attention strip: anything blocked on a human click */
@@ -1086,85 +1941,106 @@ function renderAttention() {
     let info = {};
     try { info = JSON.parse(a.detail || "{}"); } catch { /* plain note */ }
     if (info.kind === "benchmark_consent") {
-      // M6 C: the consent card states the whole experiment - dataset
-      // and source, question, tools, download size, destination,
-      // compute, metrics, installation, production impact - and offers
-      // the four answers the user is entitled to give.
+      // the consent card states the whole experiment and offers the
+      // four answers the user is entitled to give.
       const fields = (info.fields || [])
         .map((f) => `<b>${esc(f.label)}</b><span>${esc(f.value)}</span>`)
         .join("");
       rows.push(`<div class="at-col">
-        <span><b>Benchmark consent</b> - job ${esc(a.job_id)} (${esc(a.risk)} risk)</span>
+        <span><b>${esc(t("attn.bench"))}</b> - ${esc(a.risk)}</span>
         <div class="at-fields">${fields}</div>
         <span class="hint">${esc(info.note || "")}</span>
         <span class="btnrow" style="margin:0">
-          <button class="btn primary sm" data-appr="${esc(a.id)}" data-dec="approve">Approve</button>
-          <button class="btn sm" data-appr="${esc(a.id)}" data-dec="limit_scope">Limit scope…</button>
-          <button class="btn sm" data-appr="${esc(a.id)}" data-dec="literature_only">Literature only</button>
-          <button class="btn danger sm" data-appr="${esc(a.id)}" data-dec="reject">Reject</button>
+          <button class="btn primary sm" data-appr="${esc(a.id)}" data-dec="approve">${esc(t("attn.approve"))}</button>
+          <button class="btn sm" data-appr="${esc(a.id)}" data-dec="limit_scope">${esc(t("attn.limit"))}</button>
+          <button class="btn sm" data-appr="${esc(a.id)}" data-dec="literature_only">${esc(t("attn.lit"))}</button>
+          <button class="btn danger sm" data-appr="${esc(a.id)}" data-dec="reject">${esc(t("attn.reject"))}</button>
         </span></div>`);
       continue;
     }
     rows.push(`<div class="at-row">
-      <span><b>Execute approval</b> - job ${esc(a.job_id)} (${esc(a.risk)} risk)</span>
+      <span><b>${esc(t("attn.execute"))}</b> - ${esc(taskDisplayNameById(a.job_id))} (${esc(a.risk)})</span>
       <span class="btnrow" style="margin:0">
-        <button class="btn primary sm" data-appr="${esc(a.id)}" data-ok="1">Approve</button>
-        <button class="btn danger sm" data-appr="${esc(a.id)}">Deny</button>
+        <button class="btn primary sm" data-appr="${esc(a.id)}" data-ok="1">${esc(t("attn.approve"))}</button>
+        <button class="btn danger sm" data-appr="${esc(a.id)}">${esc(t("attn.deny"))}</button>
       </span></div>`);
   }
   for (const d of (state.boot.decisions || [])) {
     if (d.status !== "pending") continue;
     rows.push(`<div class="at-row">
-      <span><b>Decision</b> - ${esc(d.question)}</span>
+      <span><b>${esc(t("attn.decision"))}</b> - ${esc(d.question)}</span>
       <span class="btnrow" style="margin:0">${(d.options || []).map((o) =>
         `<button class="btn sm" data-dec="${esc(d.id)}" data-choice="${esc(o.id)}"
-          title="${esc(o.validation_status || "")}">${esc(o.label)}${o.policy_default ? " (policy default)" : ""}</button>`).join("")}</span></div>`);
+          title="${esc(o.validation_status || "")}">${esc(o.label)}${o.policy_default ? " " + esc(t("attn.policyDefault")) : ""}</button>`).join("")}</span></div>`);
   }
   if (!rows.length) { host.classList.add("hidden"); host.innerHTML = ""; return; }
   host.classList.remove("hidden");
-  host.innerHTML = `<b>${rows.length} item${rows.length > 1 ? "s" : ""} waiting for you</b>` +
+  host.innerHTML = `<div class="at-head">${rows.length} ${esc(t("attn.waiting"))}</div>` +
     rows.join("");
 }
 
-/* ---------------- jobs ---------------- */
+/* ---------------- tasks (M9 §8/§9) ---------------- */
 const ACTIVE_STATES = ["queued", "running", "paused", "blocked"];
 function statusPill(st) {
   const cls = { completed: "ok", running: "accent", queued: "accent",
                 blocked: "warn", paused: "warn", failed: "danger",
                 cancelled: "muted" }[st] || "muted";
-  return `<span class="pill ${cls}">${esc(st)}</span>`;
+  const lbl = t("st." + st) !== "st." + st ? t("st." + st) : st;
+  return `<span class="pill ${cls}">${esc(lbl)}</span>`;
+}
+/* Display name: an explicit user title always wins; otherwise pieces
+   derived from stored metadata only. The internal id stays beside it,
+   smaller - never the headline. */
+function displayName(j) {
+  if (j.display_title) return j.display_title;
+  const tp = t("type." + (j.name_type || "task"));
+  return j.name_subject ? `${j.name_subject} · ${tp}` : tp;
+}
+function taskDisplayNameById(id) {
+  const j = (state.boot.jobs || []).find((x) => x.id === id);
+  return j ? displayName(j) : id;
 }
 function jobRowHtml(j) {
-  return `
-    <div class="jr-top">
-      <span class="jr-id">${esc(j.id)}</span>
-      <span class="jr-sample">${esc(j.sample_id)}</span>
-      <span class="pill muted">${esc(j.kind)}</span>
-      ${statusPill(j.state)}
+  const running = ACTIVE_STATES.includes(j.state);
+  const bar = running && j.progress > 0
+    ? `<span class="jr-bar"><i style="width:${Math.min(95, j.progress)}%"></i></span>`
+    : "";
+  const concl = j.kind === "discovery" && j.outcome
+    ? t("concl." + j.outcome) !== "concl." + j.outcome
+      ? t("concl." + j.outcome) : "" : "";
+  const sub = [j.id, fmtDT(j.created_at), j.stage || "", concl]
+    .filter(Boolean).join(" · ");
+  return `<div class="jr-main">
+      <div class="jr-name">${esc(displayName(j))}</div>
+      <div class="jr-sub">${esc(sub)}${j.error ? " - " + esc(j.error) : ""}</div>
     </div>
-    <div class="jr-meta">${esc(j.stage || "")} ${esc(j.error || "")}</div>
-    <div class="progress"><i style="width:${j.progress || 0}%"></i></div>`;
+    <div class="jr-side">${bar}${statusPill(j.state)}</div>`;
 }
 
 function renderJobs() {
   const kind = state.kindFilter;
-  const all = (state.boot.jobs || []).filter((j) => !kind || j.kind === kind);
+  const all = (state.boot.jobs || []).filter((j) => {
+    if (!kind) return true;
+    if (kind === "analysis") return j.kind === "analysis" || j.kind === "neoag-native-run";
+    return j.kind === kind;
+  });
   const active = all.filter((j) => ACTIVE_STATES.includes(j.state));
   const past = all.filter((j) => !ACTIVE_STATES.includes(j.state));
   const host = $("job-list");
   host.innerHTML = active.length ? active.map((j) =>
-    `<div class="job-row" data-job="${esc(j.id)}">${jobRowHtml(j)}</div>`).join("")
-    : `<div class="empty">Nothing running or queued. Prepare an analysis above, or ask the agent in chat.</div>`;
+    `<div class="job-row ${state.jobDetail === j.id ? "selected" : ""}"
+      data-job="${esc(j.id)}">${jobRowHtml(j)}</div>`).join("")
+    : `<div class="empty">${esc(t("run.none"))}</div>`;
   $("history-count").textContent = past.length ? `(${past.length})` : "";
   $("history-list").innerHTML = past.length ? past.map((j) =>
     `<div class="job-row" data-job="${esc(j.id)}">${jobRowHtml(j)}</div>`).join("")
-    : `<div class="empty">No finished jobs yet.</div>`;
+    : `<div class="empty">${esc(t("run.histnone"))}</div>`;
   document.querySelectorAll("[data-job]").forEach((el) =>
     el.addEventListener("click", () => {
       const id = el.dataset.job;
       if (/^res-/.test(id)) {
-        // §1.2: research task row -> its report lives in the Discovery
-        // workspace; jump there instead of opening the job modal
+        // a research task row -> its report lives in the Discovery
+        // workspace; jump there instead of opening the job drawer
         const tab = document.querySelector(
           '.wtab[data-view="discovery"]');
         if (tab) tab.click();
@@ -1181,87 +2057,120 @@ document.querySelectorAll("#kind-filter .chip").forEach((c) =>
       x.classList.remove("active"));
     c.classList.add("active");
     state.kindFilter = c.dataset.kind;
+    VS.set("kindFilter", c.dataset.kind);
     renderJobs();
   }));
 
-async function openJob(id) {
+async function openJob(id, quiet) {
   let detail = [], task = null;
   try { detail = await api("GET", `/api/jobs/${id}/events`); }
-  catch (e) { toast("cannot open job: " + e.message, true); return; }
+  catch (e) { if (!quiet) toast(t("toast.openFail", { e: e.message }), true); return; }
   try { task = await api("GET", `/api/tasks/${id}`); } catch { /* older row */ }
   const job = (state.boot.jobs || []).find((j) => j.id === id);
+  if (!job) return;
+  state.jobDetail = id;
+  VS.set("jobDetail", id);
+  renderJobs();
   const decisions = (task && task.decisions) || [];
   const jobEl = $("job-detail");
-  const running = job && job.state === "running";
+  const running = job.state === "running";
   jobEl.classList.remove("hidden");
   const arts = (task && task.artifacts) || [];
-  let snapHtml = `<div class="hint">loading snapshot...</div>`;
+  // §8.1: execution state and scientific conclusion shown side by side,
+  // never merged into one label.
+  const conclHtml = job.kind === "discovery" && job.outcome
+    ? `<span class="pill ${job.outcome === "decision_ready" ? "ok" : "warn"}">${esc(t("concl." + job.outcome) !== "concl." + job.outcome ? t("concl." + job.outcome) : job.outcome)}</span>`
+    : job.outcome ? `<span class="pill ${job.outcome === "delivered" ? "ok" : "warn"}">${esc(job.outcome.replace(/_/g, " "))}</span>` : "";
   jobEl.innerHTML = `
-    <button class="btn sm ghost close" id="jd-close">Close</button>
-    <h2>${esc(job ? job.sample_id : id)}</h2>
-    <div class="btnrow">${job ? statusPill(job.state) : ""}
-      ${task && task.outcome ? `<span class="pill ${task.outcome === "delivered"
-        ? "ok" : task.outcome ? "warn" : "muted"}">${esc(task.outcome)}</span>` : ""}
-      <span class="pill muted">${esc(job ? job.kind : "?")}</span>
-      ${task && task.native ? `<span class="pill accent">native ${esc(task.native.profile || "")}</span>`
-        : `<span class="pill warn">mock engine</span>`}</div>
-    <section><h3>Controls</h3><div class="btnrow">
-      <button class="btn sm" id="jd-pause" ${running && !(task && task.native) ? "" : "disabled"}
-        title="${task && task.native ? "native runs have no safe pause point (real pipeline process)" : ""}">Pause</button>
-      <button class="btn sm" id="jd-resume" ${job && job.state === "paused" ? "" : "disabled"}>Resume</button>
+    <button class="btn sm ghost close" id="jd-close">${esc(t("dr.close"))}</button>
+    <div class="dr-title-row">
+      <h2 id="jd-title">${esc(displayName(job))}</h2>
+      <button class="btn sm ghost" id="jd-rename">${esc(t("dr.rename"))}</button>
+    </div>
+    <div id="jd-rename-box"></div>
+    <div class="dr-sub">${esc(t("dr.created"))}: ${esc(fmtDT(job.created_at))}</div>
+    <div class="dr-id">${esc(t("dr.id"))}: ${esc(job.id)}</div>
+    <div class="state-pair">
+      <span>${esc(t("dr.exec"))}:</span> ${statusPill(job.state)} ${conclHtml}
+    </div>
+    <section><h3>${esc(t("dr.controls"))}</h3><div class="btnrow">
+      <button class="btn sm" id="jd-pause"
+        ${running && !(task && task.native) ? "" : "disabled"}
+        title="${task && task.native ? esc(t("dr.noPause")) : ""}">${esc(t("dr.pause"))}</button>
+      <button class="btn sm" id="jd-resume" ${job.state === "paused" ? "" : "disabled"}>${esc(t("dr.resume"))}</button>
       <button class="btn sm danger" id="jd-cancel"
-        ${job && !["completed", "failed", "cancelled"].includes(job.state) ? "" : "disabled"}
-        title="${task && task.native && task.native.profile === "gateway" ? "cancelling stops the Web job only - the native gateway job has no cancel route (verified) and runs on" : ""}">Cancel</button>
-      ${task && task.native && task.native.profile === "gateway"
-        ? `<span class="hint">native gateway job ${esc(task.native.gateway_job_id || "")}${task.native.gateway_job_id ? "" : " (not yet submitted)"} - cancel caveats in the event log</span>` : ""}
+        ${!["completed", "failed", "cancelled"].includes(job.state) ? "" : "disabled"}
+        title="${task && task.native && task.native.profile === "gateway" ? esc(t("dr.cancelNote")) : ""}">${esc(t("dr.cancel"))}</button>
     </div></section>
-    ${task && task.native ? `<section><h3>Native execution</h3>
-      <div class="kv">
-        <div class="k">engine</div><div>${esc(task.native.engine || "native")} ${esc(task.native.engine_version || "")} (${esc(task.native.profile || "")})</div>
-        <div class="k">inputs</div><div><code>${esc(JSON.stringify(task.native.native_params || {}))}</code></div>
-        <div class="k">output directory</div><div><code>${esc(task.native.outdir || "-")}</code></div>
-        ${task.native.failure_code ? `<div class="k">failure</div><div>${esc(task.native.failure_code)}</div>` : ""}
-      </div>
-      ${task.native.plan && (task.native.plan.steps || []).length
-        ? `<details open><summary class="hint">native plan (produced by NeoAG's own planner, not a hardcoded stage list)</summary><ul>${
-            (task.native.plan.steps || []).map((s) => `<li><b>${esc(s.step_id || "")} ${esc(s.name || "")}</b>: ${esc(s.status || "")}${s.detail ? " - " + esc(String(s.detail).slice(0, 140)) : ""}</li>`).join("")
-          }</ul></details>` : ""}
-      ${task.native.plan && task.native.plan.run_plan_md
-        ? `<details><summary class="hint">generated run plan (markdown)</summary><pre class="tool-out">${esc(task.native.plan.run_plan_md)}</pre></details>` : ""}
-    </section>` : ""}
-    <section><h3>Requested configuration</h3>
-      <div class="kv">${Object.entries((job && job.spec &&
-        job.spec.requested_config) || {})
-        .map(([k, v]) => `<div class="k">${esc(k)}</div><div>${esc(v)}</div>`).join("") ||
-        '<div class="hint">defaults only</div>'}</div></section>
-    <section><h3>Output artifacts</h3>
-      ${arts.length ? `<div class="tablewrap"><table class="data">
-        <thead><tr><th>Artifact</th><th>Status</th><th>Rows</th><th>Checksum</th></tr></thead>
+    ${arts.length ? `<section><h3>${esc(t("dr.artifacts"))}</h3>
+      <div class="tablewrap"><table class="data">
+        <thead><tr><th>${esc(t("dr.artifacts"))}</th><th>Status</th><th>Rows</th></tr></thead>
         <tbody>${arts.map((a) => `<tr><td>${esc(a.name)}</td>
           <td><span class="pill ${a.status === "available" ? "ok"
             : a.status === "empty" ? "warn" : "danger"}">${esc(a.status)}</span></td>
-          <td>${esc(a.rows ?? "")}</td><td><code>${esc(a.checksum || "")}</code></td></tr>`).join("")}</tbody></table></div>`
-      : '<div class="hint">no artifacts registered (pre-artifact run or nothing generated)</div>'}</section>
-    <section><h3>Decision history (with applied effects)</h3><div class="timeline">${decisions.map((d) => `
-      <div class="tl-row"><span class="tl-ts">${esc(d.ts || "")}</span>
-        <span class="tl-kind">${esc(d.key || d.decision_type || "")}</span>
-        <span>${esc(d.question || "")} -> <b>${esc(d.chosen || "pending")}</b>
-        <span class="hint">(${esc(d.decided_by || "")}, ${esc(d.policy_id || "")}${
-          d.policy_version ? " v" + esc(d.policy_version) : ""})</span>
-        ${d.downstream && d.downstream.applied_effect
-          ? `<div class="hint">effect applied: ${esc(
-              JSON.stringify(d.downstream.applied_effect))}</div>` : ""}</span>
-      </div>`).join("") || '<div class="hint">no decisions recorded</div>'}</div></section>
-    <section><h3>Immutable run snapshot</h3>
-      <div id="jd-snapshot">${snapHtml}</div></section>
-    <section><h3>Live events</h3><div class="logview">${detail.slice(0, 120)
-      .map((e) => `${esc(e.ts || "")} ${esc(e.kind || "")} ${esc(e.text || "")}`)
-      .join("\n")}</div></section>`;
-  $("jd-close").addEventListener("click", () => jobEl.classList.add("hidden"));
-  const pc = $("jd-pause"), rc = $("jd-resume"), cc = $("jd-cancel");
-  pc.addEventListener("click", () => api("POST", `/api/jobs/${id}/pause`, {}).then(refreshJobs));
-  rc.addEventListener("click", () => api("POST", `/api/jobs/${id}/resume`, {}).then(refreshJobs));
-  cc.addEventListener("click", () => api("POST", `/api/jobs/${id}/cancel`, {}).then(refreshJobs));
+          <td>${esc(a.rows ?? "")}</td></tr>`).join("")}</tbody></table></div></section>` : ""}
+    <section><h3>${esc(t("dr.tech"))}</h3>
+      <details class="adv"><summary>${esc(t("dr.reqcfg"))}</summary>
+        <div class="kv">${Object.entries((job.spec &&
+          job.spec.requested_config) || {})
+          .map(([k, v]) => `<div class="k">${esc(k)}</div><div>${esc(v)}</div>`).join("") ||
+          `<div class="hint">${esc(t("dr.defOnly"))}</div>`}</div></details>
+      ${task && task.native ? `<details class="adv"><summary>native execution</summary>
+        <div class="kv">
+          <div class="k">engine</div><div>native ${esc(task.native.engine_version || "")} (${esc(task.native.profile || "")})</div>
+          <div class="k">inputs</div><div><code>${esc(JSON.stringify(task.native.native_params || {}))}</code></div>
+          <div class="k">outdir</div><div><code>${esc(task.native.outdir || "-")}</code></div>
+          ${task.native.failure_code ? `<div class="k">failure</div><div>${esc(task.native.failure_code)}</div>` : ""}
+        </div>
+        ${task.native.plan && (task.native.plan.steps || []).length
+          ? `<details open><summary class="hint">${esc(t("plan.runplan"))}</summary><ul>${
+            (task.native.plan.steps || []).map((s) => `<li><b>${esc(s.step_id || "")} ${esc(s.name || "")}</b>: ${esc(s.status || "")}${s.detail ? " - " + esc(String(s.detail).slice(0, 140)) : ""}</li>`).join("")
+          }</ul></details>` : ""}
+      </details>` : ""}
+      <details class="adv"><summary>${esc(t("dr.decisions"))}</summary><div class="timeline">${decisions.map((d) => `
+        <div class="tl-row"><span class="tl-ts">${esc(d.ts || "")}</span>
+          <span class="tl-kind">${esc(d.key || d.decision_type || "")}</span>
+          <span>${esc(d.question || "")} -> <b>${esc(d.chosen || "pending")}</b>
+          <span class="hint">(${esc(d.decided_by || "")}, ${esc(d.policy_id || "")}${
+            d.policy_version ? " v" + esc(d.policy_version) : ""})</span>
+          ${d.downstream && d.downstream.applied_effect
+            ? `<div class="hint">effect applied: ${esc(
+                JSON.stringify(d.downstream.applied_effect))}</div>` : ""}</span>
+        </div>`).join("") || `<div class="hint">${esc(t("dr.noDec"))}</div>`}</div></details>
+      <details class="adv"><summary>${esc(t("dr.snapshot"))}</summary>
+        <div id="jd-snapshot"><div class="hint">…</div></div></details>
+      <details class="adv"><summary>${esc(t("dr.events"))}</summary>
+        <div class="logview">${detail.slice(0, 120)
+          .map((e) => `${esc(e.ts || "")} ${esc(e.kind || "")} ${esc(e.text || "")}`)
+          .join("\n")}</div></details>
+    </section>`;
+  $("jd-close").addEventListener("click", () => {
+    jobEl.classList.add("hidden");
+    state.jobDetail = null; VS.drop("jobDetail"); renderJobs();
+  });
+  $("jd-rename").addEventListener("click", () => {
+    const box = $("jd-rename-box");
+    box.innerHTML = `<div class="conf-row">
+      <input id="jd-title-in" value="${esc(displayName(job))}" style="max-width:340px">
+      <button class="btn primary sm" id="jd-title-save">${esc(t("dr.renameSave"))}</button>
+      <button class="btn ghost sm" id="jd-title-cancel">${esc(t("dr.renameCancel"))}</button></div>`;
+    $("jd-title-in").focus();
+    $("jd-title-cancel").addEventListener("click", () => { box.innerHTML = ""; });
+    $("jd-title-save").addEventListener("click", async () => {
+      const title = $("jd-title-in").value.trim();
+      if (!title) return;
+      try {
+        await api("POST", `/api/jobs/${encodeURIComponent(id)}/title`, { title });
+        box.innerHTML = "";
+        toast(t("toast.renamed"));
+        await refreshJobs();
+        openJob(id, true);
+      } catch (e) { toast(e.message, true); }
+    });
+  });
+  $("jd-pause").addEventListener("click", () => api("POST", `/api/jobs/${id}/pause`, {}).then(refreshJobs));
+  $("jd-resume").addEventListener("click", () => api("POST", `/api/jobs/${id}/resume`, {}).then(refreshJobs));
+  $("jd-cancel").addEventListener("click", () => api("POST", `/api/jobs/${id}/cancel`, {}).then(refreshJobs));
   api("GET", `/api/tasks/${id}/snapshot`).then((snap) => {
     const s = snap.snapshot || {};
     $("jd-snapshot").innerHTML = `
@@ -1273,25 +2182,25 @@ async function openJob(id) {
         stage_plan: (s.stage_plan || []).join(", ") })
         .map(([k, v]) => `<div class="k">${esc(k)}</div><div>${esc(
           typeof v === "object" ? JSON.stringify(v) : v)}</div>`).join("")}</div>
-      <details class="adv"><summary>full recorded snapshot</summary>
+      <details class="adv"><summary>${esc(t("dr.snapFull"))}</summary>
         <pre class="tool-out">${esc(JSON.stringify(s, null, 1))}</pre></details>
-      <div class="hint">written once when the run started; never updated -
-        later setting/policy/skill changes cannot rewrite this record.</div>`;
+      <div class="hint">${esc(t("dr.snapNote"))}</div>`;
   }).catch(() => {
-    $("jd-snapshot").innerHTML = `<div class="hint">no snapshot recorded for
-      this run (created before the snapshot contract existed)</div>`;
+    $("jd-snapshot").innerHTML = `<div class="hint">-</div>`;
   });
 }
 
-/* ---------------- results (rendered from the OUTPUT MANIFEST) --------- */
+function renderTasks() {
+  renderScience();
+}
+
+/* ---------------- results view ---------------- */
 const OUTCOME_CLS = { delivered: "ok", zero_candidates: "warn",
   partial: "warn", generation_failed: "danger", no_artifacts: "danger" };
 
 function candTable(rows) {
   if (!rows || !rows.length) {
-    return `<div class="mnote"><b>0 rows.</b> An empty candidate table is
-      a legitimate result, not a hidden failure - the artifact above shows
-      status <b>empty</b> and the run outcome reflects it.</div>`;
+    return `<div class="alert info">${esc(t("res.empty0"))}</div>`;
   }
   return `<div class="tablewrap"><table class="data">
       <thead><tr><th>Rank</th><th>Peptide</th><th>Gene</th><th>HLA</th>
@@ -1310,10 +2219,11 @@ function renderResults() {
   const done = (state.boot.jobs || []).filter((j) => j.state === "completed"
                                               && !/^res-/.test(j.id));
   $("res-job").innerHTML = done.map((j) =>
-    `<option value="${esc(j.id)}">${esc(j.id)} - ${esc(j.sample_id)}` +
-    `${j.outcome ? " - " + esc(j.outcome) : ""}</option>`).join("");
+    `<option value="${esc(j.id)}">${esc(displayName(j))} · ${esc(j.id)}` +
+    `${j.outcome ? " - " + esc(j.outcome.replace(/_/g, " ")) : ""}</option>`)
+    .join("");
   if (!done.length) {
-    $("res-outcome").innerHTML = `<div class="empty">No completed runs yet.</div>`;
+    $("res-outcome").innerHTML = `<div class="empty">${esc(t("res.none"))}</div>`;
     $("res-meta").innerHTML = ""; $("res-table").innerHTML = "";
     $("res-warnings").innerHTML = ""; $("res-artifacts").innerHTML = "";
     $("res-strategy").innerHTML = ""; $("res-manifest").innerHTML = "";
@@ -1330,17 +2240,13 @@ function renderResults() {
         <div>${esc(res.outcome_note || "")}</div>
         <div class="hint">${esc(res.delivery_claim || "")}</div>
       </div>
-      ${res.outcome_drift ? `<div class="mnote warn">${esc(res.outcome_drift)}</div>` : ""}
+      ${res.outcome_drift ? `<div class="alert warn">${esc(res.outcome_drift)}</div>` : ""}
       ${res.production_release === false
-        ? `<div class="mnote">production release BLOCKED: ${esc(res.release_note || "")}</div>` : ""}
+        ? `<div class="alert info">${esc(res.release_note || "")}</div>` : ""}
       <div class="btnrow"><a class="btn sm"
         href="/api/results/${esc(state.resultsJob)}/bundle"
-        download>Download results bundle (.zip)</a>
-        <span class="hint">built once from the persisted job state (result,
-        ranking tables, decision history, immutable snapshot, artifacts,
-        provenance); raw FASTQ/BAM-class inputs and oversized files are
-        NEVER included and every exclusion is listed with its reason in
-        the bundle manifest; re-download serves the same pinned bytes</span>
+        download>${esc(t("res.bundle"))}</a>
+        <span class="hint">${esc(t("res.download"))}</span>
       </div>`;
     $("res-meta").innerHTML = `
       <div class="hint">${esc(res.disclaimer || "")}</div>
@@ -1348,10 +2254,10 @@ function renderResults() {
         .map(([k, v]) => `<div class="k">${esc(k)}</div><div>${esc(v)}</div>`).join("")}</div>`;
     $("res-warnings").innerHTML = (res.warnings || []).length
       ? `<div class="warnlist">${res.warnings.map((w) =>
-          `<div class="mnote warn">warning: ${esc(w)}</div>`).join("")}</div>` : "";
+          `<div class="alert warn">${esc(w)}</div>`).join("")}</div>` : "";
     if (res.engine === "benchmark") {
-      // M5 PART 6: the stated metrics are shown COMPUTED or honestly
-      // marked unanswered - never silently omitted
+      // the stated metrics are shown COMPUTED or honestly marked
+      // unanswered - never silently omitted
       const m = res.metrics || {};
       const ck = (res.arms_summary || {}).candidate || {};
       $("res-meta").insertAdjacentHTML("afterbegin",
@@ -1359,13 +2265,13 @@ function renderResults() {
         `<div class="hint">candidate arm: ${esc(ck.kind || "")}` +
         `${ck.tool ? " (" + esc(ck.tool) + ")" : ""}</div>` +
         (m.computed ? `<pre class="json">${esc(JSON.stringify(m.computed, null, 1))}</pre>` : "") +
-        `<div class="mnote${m.computed ? "" : " warn"}">${esc(m.note || "")}</div>` +
+        `<div class="alert${m.computed ? " info" : " warn"}">${esc(m.note || "")}</div>` +
         `<div class="hint">seed ${esc((res.reproducibility || {}).seed || "")}` +
         ` - the arm files under this run's directory are the measured` +
         ` artefacts (see the results bundle)</div></div>`);
     }
     const arts = res.artifacts || (res.manifest || {}).artifacts || [];
-    $("res-artifacts").innerHTML = `<h3 class="sec">Output artifacts (${arts.length})</h3>` +
+    $("res-artifacts").innerHTML = `<h3 class="sec">${esc(t("res.artH", { n: arts.length }))}</h3>` +
       (arts.length ? `<div class="tablewrap"><table class="data">
         <thead><tr><th>Artifact</th><th>Strategy</th><th>Status</th>
         <th>Rows</th><th>Checksum</th></tr></thead><tbody>${arts.map((a) => `
@@ -1374,16 +2280,15 @@ function renderResults() {
             : a.status === "empty" ? "warn" : "danger"}">${esc(a.status)}</span></td>
           <td>${esc(a.rows ?? "")}</td>
           <td><code>${esc(a.checksum || "")}</code></td></tr>`).join("")}</tbody></table></div>`
-      : `<div class="mnote warn">No artifacts are registered for this run -
-          nothing from it can be described as delivered.</div>`);
-    // A2: every strategy the run produced gets its own table, not one
+      : `<div class="alert warn">${esc(t("res.noArtReg"))}</div>`);
+    // every strategy the run produced gets its own table, not one
     const byS = res.candidates_by_strategy || {};
     const strategies = Object.keys(byS).length ? Object.keys(byS)
       : (res.candidates_strategy ? [res.candidates_strategy] : []);
     if (!state.resultsStrategy || !strategies.includes(state.resultsStrategy))
       state.resultsStrategy = strategies[0] || null;
     if (strategies.length) {
-      $("res-strategy").innerHTML = `<div class="row"><label class="lbl">Ranking
+      $("res-strategy").innerHTML = `<div class="row"><label class="lbl">${esc(t("res.ranking"))}
         <select id="res-strategy-sel">${strategies.map((s) => {
           const a = arts.find((x) => x.strategy === s);
           return `<option value="${esc(s)}">${esc(s)}${
@@ -1399,7 +2304,7 @@ function renderResults() {
     } else {
       $("res-strategy").innerHTML = "";
       $("res-table").innerHTML = arts.length
-        ? `<div class="mnote">no candidate rows to display</div>` : "";
+        ? `<div class="hint">${esc(t("res.noCand"))}</div>` : "";
     }
     const man = res.manifest || {};
     const kv = (o) => Object.entries(o || {}).map(([k, v]) =>
@@ -1410,19 +2315,19 @@ function renderResults() {
         execution_mode: man.execution_mode,
         requested_vs_effective_note: man.requested_vs_effective_note,
         generated_at: man.generated_at, snapshot: man.snapshot })}</div>
-      <h3 class="sec">Requested configuration</h3>
-      <div class="kv">${kv(man.requested_config) || "<div class='hint'>defaults only</div>"}</div>
-      <h3 class="sec">Effective configuration (what this run really applied)</h3>
+      <h3 class="sec">${esc(t("dr.reqcfg"))}</h3>
+      <div class="kv">${kv(man.requested_config) || `<div class="hint">${esc(t("dr.defOnly"))}</div>`}</div>
+      <h3 class="sec">${esc(t("dr.effcfg"))}</h3>
       <div class="kv">${kv(man.effective_config)}</div>
-      <h3 class="sec">Versions</h3>
+      <h3 class="sec">${esc(t("dr.versions"))}</h3>
       <div class="kv">${kv(man.versions)}</div>
-      <h3 class="sec">Decisions this run applied</h3>
+      <h3 class="sec">${esc(t("dr.decisions"))}</h3>
       <div class="timeline">${(man.decisions || []).map((d) => `
         <div class="tl-row"><span class="tl-kind">${esc(d.key || d.decision_type)}</span>
         <span>${esc(d.question)} -> <b>${esc(d.chosen || "pending")}</b> (${esc(d.decided_by)}, ${esc(d.policy_id || "")})</span></div>`).join("")
-        || '<div class="hint">none</div>'}</div>`;
+        || `<div class="hint">${esc(t("dr.noDec"))}</div>`}</div>`;
   }).catch((e) => {
-    $("res-outcome").innerHTML = `<div class="mnote warn">results unavailable: ${esc(e.message)}</div>`;
+    $("res-outcome").innerHTML = `<div class="alert warn">${esc(t("res.unavail", { e: e.message }))}</div>`;
     $("res-table").innerHTML = "";
   });
 }
@@ -1434,27 +2339,27 @@ $("res-job").addEventListener("change", () => {
 
 /* ---------------- discovery (real retrieval + example fixture) -------- */
 function discoveryTargets() {
-  const d = state.boot?.discovery || {};
-  return ($("res-engine")?.value || "live") === "example"
+  const d = (state.boot || {}).discovery || {};
+  return ($("res-engine").value || "live") === "example"
     ? (d.example_targets || []) : (d.live_targets || []);
 }
 
 function renderDiscoveryControls() {
+  if (!$("res-scope")) return;
   const scope = $("res-scope").value;
   const targeted = scope === "targeted";
   $("res-target-hint").textContent = targeted
-    ? "(one or more; from the configured repository's real stage inventory)"
-    : "- full pipeline review covers every inventoried stage";
+    ? t("disc.targetsT") : t("disc.targetsF");
   const box = $("res-targets");
   box.classList.toggle("off", !targeted);
   const sel = state.discSel || {};
-  box.innerHTML = discoveryTargets().map((t) => `
-    <label class="stage-row"><input type="checkbox" data-dtarget="${esc(t.id)}"
-      ${sel[t.id] ? "checked" : ""} ${targeted ? "" : "disabled"}>
-      <span>${esc(t.label)}</span>
-      ${t.code_verified ? "" : '<span class="dep">docs-level stage</span>'}
-      ${(t.tools || []).length
-        ? `<span class="dep">uses: ${esc(t.tools.join(", "))}</span>` : ""}
+  box.innerHTML = discoveryTargets().map((x) => `
+    <label class="stage-row"><input type="checkbox" data-dtarget="${esc(x.id)}"
+      ${sel[x.id] ? "checked" : ""} ${targeted ? "" : "disabled"}>
+      <span>${esc(x.label)}</span>
+      ${x.code_verified ? "" : `<span class="dep">${esc(t("disc.docsStage"))}</span>`}
+      ${(x.tools || []).length
+        ? `<span class="dep">${esc(t("disc.uses"))} ${esc(x.tools.join(", "))}</span>` : ""}
     </label>`).join("");
   box.querySelectorAll("[data-dtarget]").forEach((c) =>
     c.addEventListener("change", () => {
@@ -1464,22 +2369,30 @@ function renderDiscoveryControls() {
   $("res-custom").disabled = !targeted;
 }
 
+function researchName(r) {
+  if (r.display_title) return r.display_title;
+  return r.name_subject
+    ? `${r.name_subject} · ${t("type." + (r.name_type || "review"))}`
+    : t("type.review");
+}
+function resPill(st) {
+  const cls = st === "completed" ? "ok"
+    : ["running", "queued"].includes(st) ? "accent" : "warn";
+  const lbl = t("st." + st) !== "st." + st ? t("st." + st) : st;
+  return `<span class="pill ${cls}">${esc(lbl)}</span>`;
+}
+
 function renderDiscovery() {
-  const list = (state.boot.research || []);
+  const list = ((state.boot || {}).research || []);
   const ACTIVE = ["running", "queued"];
   $("res-list").innerHTML = list.length ? list.map((r) => `
     <div class="job-row" data-res="${esc(r.id)}">
-      <div class="jr-top"><span class="jr-id">${esc(r.id)}</span>
-        <span class="pill ${r.engine === "live" ? "accent" : "muted"}">${esc(r.engine || "example")}</span>
-        <span class="pill muted">${esc(r.scope)}</span>
-        <span class="pill ${r.status === "completed" ? "ok"
-          : ACTIVE.includes(r.status) ? "accent" : "warn"}">${esc(r.status)}</span>
-      </div>
-      <div class="jr-meta">${esc(r.target || "")}</div>
+      <div class="jr-name">${esc(researchName(r))}</div>
+      <div class="jr-sub">${esc(r.id)} · ${esc(r.engine === "live" ? t("disc.engineL") : t("disc.engineE"))} · ${esc(r.scope)} · ${resPill(r.status)}</div>
       ${(r.progress && r.progress.note)
-        ? `<div class="jr-meta hint">${esc(r.progress.note)}</div>` : ""}
+        ? `<div class="jr-sub hint">${esc(r.progress.note)}</div>` : ""}
     </div>`).join("")
-    : `<div class="empty">No research runs yet.</div>`;
+    : `<div class="empty">${esc(t("disc.none"))}</div>`;
   document.querySelectorAll("[data-res]").forEach((el) =>
     el.addEventListener("click", () => showReport(el.dataset.res)));
   if (list.length && !list.some((r) => r.id === state.discOpen))
@@ -1491,16 +2404,16 @@ function renderDiscovery() {
 }
 
 function exportBar(rid) {
-  // M5 PART 7: files are rendered ONCE server-side, pinned to the stored
-  // report content, and re-downloads serve those exact bytes (the view
-  // never re-runs retrieval to serve a download).
+  // files are rendered ONCE server-side, pinned to the stored report
+  // content, and re-downloads serve those exact bytes (the view never
+  // re-runs retrieval to serve a download).
   const b = (fmt, label) =>
     `<a class="btn sm" href="/api/research/${encodeURIComponent(rid)}` +
     `/export/${fmt}" download>${label}</a>`;
-  return `<div class="btnrow">${b("html", "Download HTML")}` +
-    `${b("json", "Download JSON")}${b("tsv", "Download TSV tables")}` +
-    `${b("pdf", "Download PDF")}<span class="hint">persisted per report ` +
-    `version - re-download never re-runs retrieval</span></div>`;
+  return `<div class="btnrow">${b("html", esc(t("disc.dl", { f: "HTML" })))}` +
+    `${b("json", esc(t("disc.dl", { f: "JSON" })))}` +
+    `${b("tsv", esc(t("disc.dlTsv")))}${b("pdf", esc(t("disc.dl", { f: "PDF" })))}` +
+    `<span class="hint">${esc(t("disc.dlNote"))}</span></div>`;
 }
 
 async function discoveryAction(btn) {
@@ -1526,39 +2439,39 @@ async function discoveryAction(btn) {
           compute_estimate: "single host, CPU minutes (fixture harness)",
           risks: ["fixture inputs are synthetic - results do not " +
             "establish real-world performance"] } });
-      show(`<div class="mnote">Benchmark PROPOSED: job ${esc(r.job_id)} ` +
-        `is blocked on approval ${esc(r.approval_id)} - it runs only if ` +
-        `you approve the card (Approvals panel).</div>`);
-      refresh();
+      show(`<div class="alert info">${esc(t("disc.benchDone",
+        { id: r.job_id, a: r.approval_id }))}</div>`);
+      refreshJobs();
     } else if (d.dact === "compat") {
       const j = await api("GET", `/api/research/${encodeURIComponent(d.rid)}` +
         `/compatibility?${qs}`);
-      show(`<div class="card"><b>Compatibility check (read-only): ` +
-        `${esc(j.candidate)}</b>` +
+      show(`<div class="card"><b>${esc(t("disc.compatT", { t: j.candidate }))}</b>` +
         `<div class="hint">${esc(j.interface)}</div><pre class="json">${
           esc(JSON.stringify(j, null, 1))}</pre></div>`);
     } else {
       const j = await api("GET", `/api/research/${encodeURIComponent(d.rid)}` +
         `/adoption-plan?${qs}`);
-      show(`<div class="card"><b>Adoption plan - ${esc(j.candidate)} ` +
-        `(${esc(j.target || "")})</b><span class="pill danger">not ` +
-        `applied</span><div class="mnote">${esc(j.statement)}</div>` +
+      show(`<div class="card"><b>${esc(t("disc.planT",
+          { t: j.candidate, tg: j.target || "" }))}</b>` +
+        `<span class="pill danger">${esc(t("disc.notApplied"))}</span>` +
+        `<div class="alert info">${esc(j.statement)}</div>` +
         `<ol>${(j.steps || []).map((s) => `<li>${esc(s)}</li>`).join("")}` +
         `</ol><div class="hint">${esc(j.verification_gate)}</div></div>`);
     }
-  } catch (e) { toast("action failed: " + e.message, true); }
+  } catch (e) { toast(t("toast.actFail", { e: e.message }), true); }
 }
 
 function reportHtmlLive(rep, rid) {
-  // M6 B: conclusion-first view mirroring the HTML export - assessment,
+  // conclusion-first view mirroring the HTML export - assessment,
   // module table, scientific comparison, actions; all technical detail
-  // behind collapsed <details>.
+  // behind collapsed <details>. The report tables mirror the persisted
+  // (English) export document; interface chrome here is translated.
   const kv = (o) => `<div class="kv">${Object.entries(o || {}).map(([k, v]) =>
     `<div class="k">${esc(k)}</div><div>${esc(
       typeof v === "object" ? JSON.stringify(v) : v)}</div>`).join("")}</div>`;
   const ul = (xs) => `<ul>${(xs || []).map((x) =>
     `<li>${esc(typeof x === "object" ? JSON.stringify(x) : x)}</li>`).join("")}</ul>`;
-  const pill = (t, kind) => `<span class="pill ${kind || ""}">${esc(t)}</span>`;
+  const pill = (txt, kind) => `<span class="pill ${kind || ""}">${esc(txt)}</span>`;
   const a = rep.assessment || {};
   const ready = !!rep.decision_ready;
   const mtRows = (rep.module_table || []).map((m) => `<tr>
@@ -1567,52 +2480,49 @@ function reportHtmlLive(rep, rid) {
     <td>${esc(m["best relevant alternative"])}</td>
     <td class="hint">${esc(m.evidence)}</td>
     <td>${esc(m.recommendation)}</td></tr>`).join("");
-  const scards = (rep.scientific_comparison || []).map((t) => {
-    const firstAlt = (t.rows || [])[0];
-    const bl = t.baseline || {};
-    const curName = (bl.tools || []).map((x) => x.name).join(", ") ||
+  const scards = (rep.scientific_comparison || []).map((x) => {
+    const firstAlt = (x.rows || [])[0];
+    const bl = x.baseline || {};
+    const curName = (bl.tools || []).map((o) => o.name).join(", ") ||
       bl.note || "NOT identified";
-    const dec = t.decision || {};
+    const dec = x.decision || {};
     const dKind = dec.recommendation === "Retain current tool" ? "ok"
-      : ["Research incomplete", "Insufficient evidence"].includes(dec.recommendation) ? "danger" : "warn";
+      : ["Research incomplete", "Insufficient Evidence"].includes(dec.recommendation) ? "danger" : "warn";
     const actions = firstAlt ? `
       <div class="btnrow">
         <button class="btn sm" data-dact="compat" data-rid="${esc(rid || "")}"
-          data-tid="${esc(t.target_id)}" data-tool="${esc(firstAlt.tool)}">Check compatibility</button>
+          data-tid="${esc(x.target_id)}" data-tool="${esc(firstAlt.tool)}">${esc(t("disc.compat"))}</button>
         <button class="btn sm" data-dact="plan" data-rid="${esc(rid || "")}"
-          data-tid="${esc(t.target_id)}" data-tool="${esc(firstAlt.tool)}">Adoption plan</button>
-        <button class="btn sm" data-dact="bench" data-tid="${esc(t.target_id)}"
-          data-tool="${esc(firstAlt.tool)}" data-base="${esc((bl.tools || [])[0]?.name || "")}">Propose benchmark</button>
-        <span class="hint">read-only checks; a proposed benchmark is a
-        FORMAL job that waits for your approval before anything runs</span></div>
-      <div id="dact-${esc(t.target_id)}"></div>` : "";
+          data-tid="${esc(x.target_id)}" data-tool="${esc(firstAlt.tool)}">${esc(t("disc.plan"))}</button>
+        <button class="btn sm" data-dact="bench" data-tid="${esc(x.target_id)}"
+          data-tool="${esc(firstAlt.tool)}" data-base="${esc((bl.tools || [])[0] ? (bl.tools[0].name || "") : "")}">${esc(t("disc.bench"))}</button>
+        <span class="hint">${esc(t("disc.actNote"))}</span></div>
+      <div id="dact-${esc(x.target_id)}"></div>` : "";
     const groupLine = (label, names) => (names || []).length
       ? `<div class="hint"><b>${esc(label)}:</b> ${esc((names || []).join(", "))}</div>` : "";
     return `
-    <div class="card"><b>${esc(t.target)}</b>
-    ${t.question ? `<div class="mnote"><b>Question:</b> ${esc(t.question)}</div>` : ""}
-    <div class="hint"><b>Current NeoAG method:</b> ${esc(curName)}
+    <div class="card"><b>${esc(x.target)}</b>
+    ${x.question ? `<div class="alert info"><b>${esc(t("disc.questionL"))}</b> ${esc(x.question)}</div>` : ""}
+    <div class="hint"><b>${esc(t("disc.curMethod"))}</b> ${esc(curName)}
       ${bl.consensus ? pill("multi-tool consensus", "ok") : ""}</div>
-    ${(t.rows || []).length ? `<div class="tablewrap"><table class="data">
+    ${(x.rows || []).length ? `<div class="tablewrap"><table class="data">
       <thead><tr><th>Alternative (direct)</th><th>Version</th>
       <th>Published performance (context-established)</th>
       <th>License · maintenance</th></tr></thead>
-      <tbody>${(t.rows || []).map((r) => `<tr>
+      <tbody>${(x.rows || []).map((r) => `<tr>
         <td><b>${esc(r.tool)}</b><div class="hint">${esc(r.why_comparable || "")}</div></td>
         <td>${esc(r.version)}</td>
         <td>${esc(r.evidence)}</td>
         <td>${esc(r.license)} · ${esc(r.maintenance)}</td></tr>`).join("")}</tbody>
-    </table></div>` : `<div class="hint">No retrieved candidate passed the
-      scientific relevance screen as a direct alternative for this
-      module.</div>`}
-    ${groupLine("Complementary methods", t.complementary)}
-    ${groupLine("Wrappers / integrations", t.wrappers_integrations)}
-    ${groupLine("Related but not comparable", t.related_not_comparable)}
-    ${(t.excluded_irrelevant || []).length ? `<div class="hint"><b>Screened out as irrelevant:</b> ${esc((t.excluded_irrelevant || []).slice(0, 6).join(", "))} - reasons in the appendix</div>` : ""}
+    </table></div>` : `<div class="hint">${esc(t("disc.noDirect"))}</div>`}
+    ${groupLine("Complementary methods", x.complementary)}
+    ${groupLine("Wrappers / integrations", x.wrappers_integrations)}
+    ${groupLine("Related but not comparable", x.related_not_comparable)}
+    ${(x.excluded_irrelevant || []).length ? `<div class="hint"><b>Screened out as irrelevant:</b> ${esc((x.excluded_irrelevant || []).slice(0, 6).join(", "))} - reasons in the appendix</div>` : ""}
     ${dec.recommendation ? `<div>${pill(dec.recommendation, dKind)}
       <span class="hint">${esc(dec.rationale || "")}</span></div>` : ""}
-    ${dec.action ? `<div class="mnote"><b>Action:</b> ${esc(dec.action)}</div>` : ""}
-    <div class="hint">${esc(t.note || "")}</div>${actions}</div>`;
+    ${dec.action ? `<div class="alert info"><b>Action:</b> ${esc(dec.action)}</div>` : ""}
+    <div class="hint">${esc(x.note || "")}</div>${actions}</div>`;
   }).join("");
   const cov = rep.coverage_accounting || {};
   const prov = rep.provenance || {};
@@ -1630,60 +2540,54 @@ function reportHtmlLive(rep, rid) {
     <td class="hint">${esc((c.reasons || []).join("; "))}</td>
     <td class="hint">${esc((c.origin || "").slice(0, 90))}</td></tr>`).join("");
   return `<div class="card">
-    <div>${pill(ready ? "decision-ready review" : "PRELIMINARY RESEARCH",
+    <div>${pill(ready ? t("disc.qReady") : t("disc.qPre"),
                 ready ? "ok" : "warn")}</div>
-    <h3 class="sec">1. Executive assessment</h3>
-    <p class="mnote"><b>${esc(a.headline || "")}</b></p>
+    <h3 class="sec">${esc(t("disc.h1"))}</h3>
+    <p class="alert info"><b>${esc(a.headline || "")}</b></p>
     <div class="hint">${esc(a.scope || "")}</div>
-    ${(a.top_findings || []).length ? `<b>Most important findings</b>${ul(a.top_findings)}` : ""}
+    ${(a.top_findings || []).length ? `<b>${esc(t("disc.h1"))}</b>${ul(a.top_findings)}` : ""}
     ${(a.evidence_gaps || []).length ? `<b>Evidence gaps</b>${ul(a.evidence_gaps)}` : ""}
-    ${a.next_action ? `<div class="mnote"><b>Next recommended action:</b> ${esc(a.next_action)}</div>` : ""}
-    <details class="adv"><summary>What this report is (and is not)</summary>
-      <div class="mnote">${esc(rep.disclaimer)}</div></details>
-    ${(rep.module_table || []).length ? `<h3 class="sec">2. Module-level
-      recommendations</h3><div class="tablewrap"><table class="data">
+    ${a.next_action ? `<div class="alert good"><b>Next recommended action:</b> ${esc(a.next_action)}</div>` : ""}
+    <details class="adv"><summary>${esc(t("disc.whatIs"))}</summary>
+      <div class="alert info">${esc(rep.disclaimer)}</div></details>
+    ${(rep.module_table || []).length ? `<h3 class="sec">${esc(t("disc.h2"))}</h3><div class="tablewrap"><table class="data">
       <thead><tr><th>Module</th><th>Current NeoAG method</th>
       <th>Best relevant alternative</th><th>Evidence</th>
       <th>Recommendation</th></tr></thead>
       <tbody>${mtRows}</tbody></table></div>` : ""}
-    ${(rep.scientific_comparison || []).length ? `<h3 class="sec">3.
-      Scientific comparison</h3>${scards}` : ""}
-    ${(rep.recommended_next_actions || []).length ? `<h3 class="sec">4.
-      Recommended actions (scientific priority)</h3>${ul(rep.recommended_next_actions)}` : ""}
-    <details class="adv"><summary>5. Technical appendix (exclusions,
-      full candidates, version chains, evidence records, coverage,
-      gates, citations, provenance)</summary>
-      <b class="hint">Excluded candidates - every retrieval that failed
-      the scientific eligibility screen, with its reason</b>
+    ${(rep.scientific_comparison || []).length ? `<h3 class="sec">${esc(t("disc.h3"))}</h3>${scards}` : ""}
+    ${(rep.recommended_next_actions || []).length ? `<h3 class="sec">${esc(t("disc.h4"))}</h3>${ul(rep.recommended_next_actions)}` : ""}
+    <details class="adv"><summary>${esc(t("disc.h5"))}</summary>
+      <b class="hint">${esc(t("disc.exclL"))}</b>
       <div class="tablewrap"><table class="data"><thead><tr><th>Name</th>
       <th>Module</th><th>Class</th><th>Why excluded</th>
       <th>Origin</th></tr></thead><tbody>${exRows ||
         '<tr><td colspan="5" class="hint">none</td></tr>'}</tbody></table></div>
-      <b class="hint">Full candidate comparison table</b>
+      <b class="hint">${esc(t("disc.fullTbl"))}</b>
       <div class="tablewrap"><table class="data"><thead><tr><th>Tool</th>
       <th>Module</th><th>Eligibility</th><th>Kind</th><th>Version</th>
       <th>License</th><th>Maintenance</th><th>Performance (context gate)</th>
       </tr></thead><tbody>${rows}</tbody></table></div>
-      <b class="hint">Version verification chains</b>
+      <b class="hint">${esc(t("disc.verChains"))}</b>
       ${(rep.candidates || []).map((c) => `<div class="hint"><b>${esc(c.name)}</b>
         → ${esc(c.verified_version)} · installed: ${esc(c.installed_version || "n/a")}
         <ul>${((c.version_chain || {}).chain || []).map((s) =>
           `<li>${esc(s.step)}: ${esc(s.outcome)}${s.value ? " = " + esc(JSON.stringify(s.value)) : ""}${s.reason ? " (" + esc(s.reason) + ")" : ""} [${esc(String(s.checked_at || "").slice(0, 10))}]</li>`).join("")}</ul>
       </div>`).join("")}
-      <b class="hint">Coverage accounting</b>
+      <b class="hint">${esc(t("disc.coverageL"))}</b>
       ${kv({ completeness: cov.completeness,
         identified_modules: cov.identified_modules,
         researched_modules: cov.researched_modules,
         sufficient_evidence: cov.sufficient_evidence,
         insufficient_evidence: cov.insufficient_evidence,
         not_researched: cov.not_researched, note: cov.note })}
-      <b class="hint">Research quality gates</b>
+      <b class="hint">${esc(t("disc.gatesL"))}</b>
       <ul>${(rep.quality_gates || []).map((g) => `<li>${g.passed ? "PASS" : "FAIL"} ${esc(g.check)} - ${esc(g.detail)}</li>`).join("")}</ul>
-      <b class="hint">Sources and citations</b>
+      <b class="hint">${esc(t("disc.citesL"))}</b>
       <ul>${(rep.literature_citations || []).slice(0, 40).map((c) => `
         <li><b>${esc(c.title || "")}</b> ${esc(c.year || "")} -
         ${esc(c.source || "")} ${esc(c.url || c.id || "")}</li>`).join("")}</ul>
-      <b class="hint">Methodology / limitations / provenance</b>
+      <b class="hint">${esc(t("disc.methL"))}</b>
       <p class="hint">${esc(rep.methodology || "")}</p>
       ${ul(rep.limitations)}
       ${kv({ sources_consulted: prov.sources_consulted,
@@ -1704,7 +2608,7 @@ function reportHtmlExample(rep) {
     <td>${c.independently_benchmarked ? "YES" : "no"}</td>
     <td>${esc(c.notes || "")}</td></tr>`).join("");
   return `<div class="card">
-    <div class="mnote warn">${esc(rep.disclaimer)}</div>
+    <div class="alert warn">${esc(rep.disclaimer)}</div>
     <div class="tablewrap"><table class="data">
       <thead><tr><th>Tool</th><th>Availability</th><th>License</th>
       <th>Evidence</th><th>Example figures</th><th>Independently benchmarked</th>
@@ -1719,40 +2623,58 @@ async function showReport(id) {
   try {
     const r = await api("GET", `/api/research/${id}`);
     if (!r.report) {
-      const prog = r.progress || {};
       $("res-report").innerHTML = `<div class="card">
-        <div class="jr-top"><span class="jr-id">${esc(r.id)}</span>
-        <span class="pill accent">${esc(r.status)}</span></div>
-        ${r.progress?.steps?.length ? `<ul>${r.progress.steps.map((s) =>
-          `<li class="hint">${esc(s)}</li>`).join("")}</ul>`
-          : `<p class="hint">no persisted progress yet</p>`}
+        <div class="jr-name">${esc(researchName(r))}</div>
+        <div class="jr-sub">${esc(r.id)} · ${resPill(r.status)}</div>
+        ${r.progress && r.progress.steps && r.progress.steps.length
+          ? `<ul>${r.progress.steps.map((s) =>
+            `<li class="hint">${esc(s)}</li>`).join("")}</ul>`
+          : `<p class="hint">${esc(t("disc.noProg"))}</p>`}
         ${["running", "queued"].includes(r.status)
-          ? `<div class="btnrow"><button class="btn danger sm" id="rep-cancel">Cancel run</button>
-             <span class="hint">stops after the current query; progress is kept</span></div>` : ""}
+          ? `<div class="btnrow"><button class="btn danger sm" id="rep-cancel">${esc(t("disc.cancelBtn"))}</button>
+             <span class="hint">${esc(t("disc.cancelNote"))}</span></div>` : ""}
         ${["incomplete", "failed", "cancelled"].includes(r.status)
-          ? `<div class="btnrow"><button class="btn sm" id="rep-resume">Resume (persisted queries skipped)</button></div>` : ""}
+          ? `<div class="btnrow"><button class="btn sm" id="rep-resume">${esc(t("disc.resumeBtn"))}</button></div>` : ""}
         ${["incomplete", "failed"].includes(r.status)
-          ? `<div class="mnote warn">This run did not finish; nothing here
-             is a complete review. Resume or accept the partial result.</div>` : ""}
+          ? `<div class="alert warn">${esc(t("disc.partNote"))}</div>` : ""}
       </div>`;
       const cb = $("rep-cancel");
       if (cb) cb.addEventListener("click", async () => {
         try { await api("POST", `/api/research/${id}/cancel`, {}); refreshDiscovery(); }
-        catch (e) { toast("cancel failed: " + e.message, true); } });
+        catch (e) { toast(t("toast.cancelFail", { e: e.message }), true); } });
       const rb = $("rep-resume");
       if (rb) rb.addEventListener("click", async () => {
         try { await api("POST", `/api/research/${id}/resume`, {}); refreshDiscovery(); }
-        catch (e) { toast("resume failed: " + e.message, true); } });
+        catch (e) { toast(t("toast.resumeFail", { e: e.message }), true); } });
       return;
     }
     const rep = r.report;
-    const isLive = (rep.engine || "").includes("live") ||
-      !!rep.inventory;
-    $("res-report").innerHTML = exportBar(r.id) +
+    const isLive = (rep.engine || "").includes("live") || !!rep.inventory;
+    $("res-report").innerHTML =
+      `<div class="btnrow" style="justify-content:flex-end"><button class="btn sm ghost" id="rep-rename">${esc(t("dr.rename"))}</button></div>` +
+      exportBar(r.id) +
       (isLive ? reportHtmlLive(rep, r.id) : reportHtmlExample(rep));
     document.querySelectorAll("[data-dact]").forEach((b) =>
       b.addEventListener("click", () => discoveryAction(b)));
-  } catch (e) { toast("report failed: " + e.message, true); }
+    $("rep-rename").addEventListener("click", () => {
+      const box = $("rep-rename").closest(".btnrow");
+      box.innerHTML = `<input id="rep-title" style="max-width:340px"
+          value="${esc(r.display_title || researchName(r))}">
+        <button class="btn primary sm" id="rep-title-save">${esc(t("dr.renameSave"))}</button>
+        <button class="btn ghost sm" id="rep-title-cancel">${esc(t("dr.renameCancel"))}</button>`;
+      $("rep-title").focus();
+      $("rep-title-cancel").addEventListener("click", () => showReport(id));
+      $("rep-title-save").addEventListener("click", async () => {
+        const title = $("rep-title").value.trim();
+        if (!title) return;
+        try {
+          await api("POST", `/api/research/${id}/title`, { title });
+          toast(t("dr.renamed"));
+          await refreshDiscovery();
+        } catch (e) { toast(t("toast.renameFail", { e: e.message }), true); }
+      });
+    });
+  } catch (e) { toast(t("disc.reportFail", { e: e.message }), true); }
 }
 
 $("res-run").addEventListener("click", async () => {
@@ -1763,20 +2685,20 @@ $("res-run").addEventListener("click", async () => {
   const custom = $("res-custom").value.trim()
     ? $("res-custom").value.trim().split(/\s*,\s*/) : [];
   if (scope === "targeted" && !targets.length && !custom.length) {
-    toast("pick at least one target (or a custom one) for a targeted review", true);
+    toast(t("disc.needTarget"), true);
     return;
   }
   try {
     const r = await api("POST", "/api/research",
                         { scope, engine, targets, custom });
-    toast(`${engine} research ${r.research_id} started` +
-      (r.unknown_targets?.length
-        ? ` - ignored unknown targets: ${r.unknown_targets.join(", ")}` : ""));
+    toast(t("disc.started", { id: r.research_id }) +
+      (r.unknown_targets && r.unknown_targets.length
+        ? t("disc.ignored", { u: r.unknown_targets.join(", ") }) : ""));
     state.discOpen = r.research_id;
     $("res-custom").value = "";
     await refreshDiscovery();
   } catch (e) {
-    toast("research failed: " + (e.data?.error || e.message), true);
+    toast(t("toast.researchFail", { e: (e.data && e.data.error) || e.message }), true);
   }
 });
 $("res-scope").addEventListener("change", renderDiscoveryControls);
@@ -1794,59 +2716,58 @@ async function refreshDiscovery() {
   } catch (e) { /* transient */ }
 }
 
-/* ---------------- skills (advisory instructions, M7 §5) ---------------
+/* ---------------- skills (advisory instructions) -----------------------
  * Normal UI = name + instructions only. One Save validates, records a
  * version and applies the skill for new chats; slug/category/frontmatter
  * and deploy are generated or pinned by the backend. Version history and
  * raw text live in a collapsed "Advanced" fold; rollback is there too. */
-function stripFrontmatter(t) {
-  const m = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/.exec(t || "");
-  return m ? t.slice(m[0].length).replace(/^\s+/, "") : (t || "");
+function stripFrontmatter(txt) {
+  const m = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/.exec(txt || "");
+  return m ? txt.slice(m[0].length).replace(/^\s+/, "") : (txt || "");
 }
 
 function renderSkills() {
-  const skills = state.boot.skills || [];
+  const skills = (state.boot || {}).skills || [];
   $("skill-list").innerHTML = skills.map((s) => `
     <div class="job-row skill-row" data-skill="${esc(s.slug)}">
-      <div class="jr-top">
-        <span class="jr-id">${esc(s.title || s.slug)}</span>
-        <span class="pill ${s.enabled ? "ok" : "muted"}">${s.enabled ? "enabled" : "disabled"}</span>
-        <span class="pill ${s.active_in_new_sessions ? "accent" : "warn"}">${
-          !s.enabled ? "not loaded"
-          : s.active_in_new_sessions ? "applies to new chats"
-          : "saved - not applied yet"}</span>
+      <div class="jr-name">${esc(s.title || s.slug)}
+        <span class="pill ${s.enabled ? "ok" : "muted"}">${esc(s.enabled ? t("skill.enabled") : t("skill.disabled"))}</span>
+        <span class="pill ${s.active_in_new_sessions ? "accent" : "warn"}">${esc(
+          !s.enabled ? t("skill.loaded")
+          : s.active_in_new_sessions ? t("skill.applies")
+          : t("skill.savedNot"))}</span>
       </div>
-      <div class="jr-meta hint">${esc(s.description || "")}</div>
+      <div class="jr-sub hint">${esc(s.description || "")}</div>
       <div class="btnrow">
-        <button class="btn sm" data-sedit="${esc(s.slug)}">Edit</button>
+        <button class="btn sm" data-sedit="${esc(s.slug)}">${esc(t("skill.edit"))}</button>
         <button class="btn sm ${s.enabled ? "danger" : ""}" data-stog="${esc(s.slug)}"
-          data-on="${s.enabled ? "0" : "1"}">${s.enabled ? "Disable" : "Enable"}</button>
+          data-on="${s.enabled ? "0" : "1"}">${esc(s.enabled ? t("skill.disable") : t("skill.enable"))}</button>
       </div>
       <details class="skill-adv">
-        <summary>Advanced (version history, raw text)</summary>
+        <summary>${esc(t("skill.adv"))}</summary>
         <div class="btnrow">
-          <button class="btn sm ghost" data-svers="${esc(s.slug)}">Version history</button>
-          <button class="btn sm ghost" data-sraw="${esc(s.slug)}">Raw SKILL.md</button>
+          <button class="btn sm ghost" data-svers="${esc(s.slug)}">${esc(t("sk.hist"))}</button>
+          <button class="btn sm ghost" data-sraw="${esc(s.slug)}">${esc(t("sk.raw"))}</button>
         </div>
         <div class="skill-versions hidden" id="sv-${esc(s.slug)}"></div>
         <pre class="skill-raw hidden" id="raw-${esc(s.slug)}"></pre>
       </details>
     </div>`).join("") ||
-    `<div class="empty">No skills yet.</div>`;
+    `<div class="empty">${esc(t("skill.none"))}</div>`;
   const on = (attr, fn) => document.querySelectorAll(`[data-${attr}]`)
     .forEach((el) => el.addEventListener("click", (ev) => {
       ev.stopPropagation(); fn(el); }));
   on("sedit", (el) => openSkillEditor(el.dataset.sedit));
   on("stog", async (el) => {
     try {
+      const on1 = el.dataset.on === "1";
       const r = await api("POST", `/api/skills/${el.dataset.stog}/` +
-        (el.dataset.on === "1" ? "enable" : "disable"), {});
+        (on1 ? "enable" : "disable"), {});
       const st = (r.deploy || {}).state || "";
-      toast(el.dataset.on === "1"
-        ? `${el.dataset.stog}: enabled - ${st || "applies to new chats"}`
-        : `${el.dataset.stog}: disabled - ${st || "will not load"}`);
+      toast(`${el.dataset.stog}: ${t(on1 ? "skill.enabled" : "skill.disabled")}` +
+        ` - ${st || t(on1 ? "skill.applies" : "skill.loaded")}`);
       await refreshSkills();
-    } catch (e) { toast("toggle failed: " + e.message, true); }
+    } catch (e) { toast(t("toast.togFail", { e: e.message }), true); }
   });
   on("svers", async (el) => {
     const host = $(`sv-${el.dataset.svers}`);
@@ -1857,18 +2778,18 @@ function renderSkills() {
         <div class="tl-row"><span class="tl-ts">${esc(v.created_at || "")}</span>
         <span>v${esc(v.version)} - ${esc(v.source || "")}</span>
         <button class="btn sm ghost" data-srestore="${esc(el.dataset.svers)}"
-          data-ver="${esc(v.version)}">restore</button></div>`).join("");
+          data-ver="${esc(v.version)}">${esc(t("sk.restore"))}</button></div>`).join("");
       host.classList.remove("hidden");
       host.querySelectorAll("[data-srestore]").forEach((b) =>
         b.addEventListener("click", async () => {
           try {
             await api("POST", `/api/skills/${b.dataset.srestore}/restore`,
                       { version: parseInt(b.dataset.ver, 10) });
-            toast(`restored v${b.dataset.ver} as a new version - applies to new chats`);
+            toast(t("toast.restoreOk", { v: b.dataset.ver }));
             await refreshSkills();
-          } catch (e) { toast("restore failed: " + e.message, true); }
+          } catch (e) { toast(t("toast.restoreFail", { e: e.message }), true); }
         }));
-    } catch (e) { toast("versions failed: " + e.message, true); }
+    } catch (e) { toast(t("toast.verFail", { e: e.message }), true); }
   });
   on("sraw", async (el) => {
     const host = $(`raw-${el.dataset.sraw}`);
@@ -1877,7 +2798,7 @@ function renderSkills() {
       const d = await api("GET", `/api/skills/${el.dataset.sraw}`);
       host.textContent = d.content;
       host.classList.remove("hidden");
-    } catch (e) { toast("cannot load raw text: " + e.message, true); }
+    } catch (e) { toast(t("toast.rawFail", { e: e.message }), true); }
   });
 }
 
@@ -1893,17 +2814,17 @@ function openSkillEditor(slug) {
   const host = $("skill-editor");
   const fill = (s) => {
     host.innerHTML = `<div class="card">
-      <div class="card-head"><h2>${s ? "Edit skill" : "New skill"}</h2></div>
-      <label class="lbl">Name</label>
+      <div class="card-head"><h2>${esc(t(s ? "sk.editTitle" : "sk.newTitle"))}</h2></div>
+      <label class="lbl">${esc(t("sk.name"))}</label>
       <input id="sk-name" value="${esc(s ? s.title : "")}"
-        placeholder="What is this skill called?">
-      <label class="lbl">Instructions</label>
+        placeholder="${esc(t("sk.namePh"))}">
+      <label class="lbl">${esc(t("sk.body"))}</label>
       <textarea id="sk-body" rows="14" spellcheck="false"
-        placeholder="What should the agent know or do differently? Write it in plain language - the agent reads this at the start of each new chat.">${esc(s ? stripFrontmatter(s.content) : "")}</textarea>
+        placeholder="${esc(t("sk.bodyPh"))}">${esc(s ? stripFrontmatter(s.content) : "")}</textarea>
       <div class="btnrow">
-        <button class="btn primary sm" id="sk-save">Save</button>
-        <button class="btn ghost sm" id="sk-cancel">Cancel</button>
-        <span class="hint">Changes apply to new chats.</span>
+        <button class="btn primary sm" id="sk-save">${esc(t("sk.save"))}</button>
+        <button class="btn ghost sm" id="sk-cancel">${esc(t("sk.cancel"))}</button>
+        <span class="hint">${esc(t("sk.note"))}</span>
       </div>
       <div id="sk-err" class="hint"></div></div>`;
     $("sk-cancel").addEventListener("click", () => { host.innerHTML = ""; });
@@ -1916,31 +2837,31 @@ function openSkillEditor(slug) {
                             body);
         const st = (r.deploy || {}).state || "";
         if (r.applied) {
-          toast(`saved v${r.skill.version} - changes apply to new chats`);
-        } else if (st.startsWith("disabled")) {
+          toast(`${t("sk.note")} (v${r.skill.version})`);
+        } else if (st.indexOf("disabled") === 0) {
           toast("saved - but the skill is disabled, so new chats will not " +
                 "load it. Press Enable to apply.", true);
         } else {
-          toast("saved, but applying failed: " + st + " " +
-                ((r.deploy || {}).error || ""), true);
+          toast(t("toast.saveApplyFail",
+                  { st, err: (r.deploy || {}).error || "" }), true);
         }
         host.innerHTML = "";
         await refreshSkills();
       } catch (e) {
         $("sk-err").textContent =
-          (e.data?.errors || [e.data?.error || e.message]).join("; ");
+          ((e.data && e.data.errors) || [(e.data && e.data.error) || e.message]).join("; ");
       }
     });
   };
   if (!slug) return fill(null);
   api("GET", `/api/skills/${slug}`).then(fill)
-    .catch((e) => toast("cannot load skill: " + e.message, true));
+    .catch((e) => toast(t("toast.skillLoadFail", { e: e.message }), true));
 }
 $("skill-new").addEventListener("click", () => openSkillEditor(null));
 
 /* ---------------- help ---------------- */
 function renderHelp() {
-  const docs = (state.boot.help || []);
+  const docs = (state.boot || {}).help || [];
   $("help-tabs").innerHTML = docs.map((d, i) =>
     `<button class="chip ${i === 0 ? "active" : ""}" data-doc="${esc(d.name)}">${esc(d.title)}</button>`).join("");
   document.querySelectorAll("[data-doc]").forEach((el) =>
@@ -1957,77 +2878,15 @@ async function loadHelp(name) {
     const d = await api("GET", `/api/help/${name}`);
     $("help-doc").innerHTML = `<div class="doc-src">${esc(d.source)}</div>`
       + mdToHtml(d.markdown);
-  } catch (e) { $("help-doc").innerHTML = `<p class="hint">unavailable</p>`; }
+  } catch (e) { $("help-doc").innerHTML = `<p class="hint">${esc(t("help.unavail"))}</p>`; }
 }
 
-/* ---------------- workspace tabs ---------------- */
-document.querySelectorAll(".wtab").forEach((t) =>
-  t.addEventListener("click", () => {
-    document.querySelectorAll(".wtab").forEach((x) => x.classList.remove("active"));
-    t.classList.add("active");
-    document.querySelectorAll(".wview").forEach((x) => x.classList.remove("active"));
-    $(`view-${t.dataset.view}`).classList.add("active");
-  }));
-
-/* ---------------- agent mode badge ---------------- */
-function renderAgentBadge() {
-  const real = state.agentMode === "real";
-  $("agent-mode").textContent = real
-    ? "CodeBuddy (real)" : "Demo agent (scripted)";
-  $("agent-mode").title = real
-    ? "Connected to the real server-side CodeBuddy agent: ordinary work executes directly; destructive or out-of-workspace operations are blocked until you approve a confirmation card. Click to switch back to the scripted demo agent."
-    : "Scripted demo agent - no LLM. Click to connect the real server-side CodeBuddy agent.";
-}
-/* M6 PART F5: a small in-page dropdown replaces the native confirm().
-   It states what each mode means BEFORE choosing, marks the current
-   one, and refuses (server-enforced, not just advisory) while a chat
-   turn or a job is in flight. */
-$("agent-mode").addEventListener("click", (ev) => {
-  ev.stopPropagation();
-  const open = document.querySelector(".mode-menu");
-  if (open) { open.remove(); return; }
-  const m = document.createElement("div");
-  m.className = "conv-menu mode-menu";
-  const cur = state.agentMode;
-  m.innerHTML = `
-    <button data-mode="mock"${cur === "mock" ? ' class="cur"' : ""}>
-      Demo agent (scripted)</button>
-    <button data-mode="real"${cur === "real" ? ' class="cur"' : ""}>
-      Real CodeBuddy agent</button>
-    <div class="mm-note">Real mode sends your chat to the server-side
-      CodeBuddy gateway: ordinary reads and workspace work execute
-      directly (logged); destructive or out-of-workspace operations
-      pause until you approve a confirmation card.</div>
-    <div class="mm-note">Switching is blocked while a chat turn or a
-      job is in flight.</div>`;
-  document.body.appendChild(m);
-  const r = $("agent-mode").getBoundingClientRect();
-  m.style.top = (r.bottom + 4) + "px";
-  m.style.left = Math.max(6, Math.min(r.left, window.innerWidth - 280)) + "px";
-  m.addEventListener("click", async (ev2) => {
-    const mode = (ev2.target.closest("[data-mode]") || {}).dataset
-      && ev2.target.closest("[data-mode]").dataset.mode;
-    if (!mode || mode === cur) { m.remove(); return; }
-    try {
-      await api("POST", "/api/agent/mode", { mode });
-      m.remove();
-      state.agentMode = mode;
-      renderAgentBadge();
-      toast(mode === "real"
-        ? "real CodeBuddy agent connected - gated execution, card-based confirmations"
-        : "switched to the scripted demo agent");
-    } catch (e) { m.remove(); toast("mode switch failed: " + e.message, true); }
-  });
-  setTimeout(() => document.addEventListener("click", function h(ev3) {
-    if (!ev3.target.closest(".mode-menu")
-        && !ev3.target.closest("#agent-mode")) {
-      m.remove();
-      document.removeEventListener("click", h);
-    }
-  }), 0);
+/* ---------------- language switch ---------------- */
+$("lang-select").addEventListener("change", function () {
+  setLang(this.value);
 });
 
-/* ---------------- approvals + decisions ---------------- */
+/* ---------------- approvals + decisions (delegated) ---------------- */
 document.addEventListener("click", async (ev) => {
   const appr = ev.target.closest("[data-appr]");
   if (appr) {
@@ -2037,24 +2896,22 @@ document.addEventListener("click", async (ev) => {
         ? { decision: dec }
         : { approve: appr.dataset.ok === "1" };
       if (dec === "limit_scope") {
-        const s = window.prompt(
-          "What scope will you allow? (e.g. 'subsample 5 of 200 " +
-          "samples; CPU only; no GPU')");
+        const s = window.prompt(t("attn.scopePrompt"));
         if (!s) return;           // user backed out - card stays pending
         body.scope = s;
       }
       await api("POST", `/api/approvals/${appr.dataset.appr}`, body);
       await refreshJobs(); refreshConv();
-    } catch (e) { toast("approval failed: " + e.message, true); }
+    } catch (e) { toast(t("toast.apprFail", { e: e.message }), true); }
     return;
   }
   const dec = ev.target.closest("[data-dec]");
   if (dec) {
     try {
       await api("POST", `/api/decisions/${dec.dataset.dec}/resolve`,
-        { choice: dec.dataset.choice, note: "resolved in Tasks panel" });
+        { choice: dec.dataset.choice, note: t("attn.resolvedNote") });
       await refreshJobs();
-    } catch (e) { toast("resolve failed: " + e.message, true); }
+    } catch (e) { toast(t("toast.decFail", { e: e.message }), true); }
   }
 });
 

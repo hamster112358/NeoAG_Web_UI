@@ -170,6 +170,14 @@ class Store:
                 "INTEGER DEFAULT 0",
                 "ALTER TABLE conversations ADD COLUMN archived "
                 "INTEGER DEFAULT 0",
+                # Milestone 9: user-facing display titles. Presentation
+                # only - the row id, sample_id and stored provenance stay
+                # authoritative; an empty title means "derive from the
+                # real metadata in the API layer".
+                "ALTER TABLE jobs ADD COLUMN display_title "
+                "TEXT DEFAULT ''",
+                "ALTER TABLE research ADD COLUMN display_title "
+                "TEXT DEFAULT ''",
             ):
                 try:
                     self.db.execute(stmt)
@@ -639,6 +647,16 @@ class Store:
                  now() if finished else None, rid))
             self.db.commit()
 
+    def research_set_title(self, rid: str, title: str) -> bool:
+        """Milestone 9: display title only (see the display_title
+        migration). The id, scope and target stay the record."""
+        with self.lock:
+            cur = self.db.execute(
+                "UPDATE research SET display_title=? WHERE id=?",
+                (title[:200], rid))
+            self.db.commit()
+        return cur.rowcount > 0
+
     def research_event_add(self, rid: str, text: str) -> None:
         with self.lock:
             self.db.execute(
@@ -697,8 +715,8 @@ class Store:
         with self.lock:
             rows = self.db.execute(
                 "SELECT id,created_at,finished_at,status,scope,target,engine,"
-                "conv_id,progress_json FROM research ORDER BY created_at "
-                "DESC LIMIT ?",
+                "conv_id,progress_json,display_title FROM research "
+                "ORDER BY created_at DESC LIMIT ?",
                 (limit,)).fetchall()
         return [dict(r) for r in rows]
 

@@ -1,37 +1,51 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NeoAG Workspace</title>
+<title>NeoAG</title>
 <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
 <header id="topbar">
   <div class="brand">
-    <div class="logo">N</div>
+    <svg class="brand-mark" viewBox="0 0 40 40" aria-hidden="true">
+      <defs>
+        <linearGradient id="neoagGrad" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#2f7fd1"/>
+          <stop offset="1" stop-color="#1fa9a2"/>
+        </linearGradient>
+      </defs>
+      <path d="M7 29 L15 21 L24 26 L33 11" fill="none" stroke="url(#neoagGrad)"
+            stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="7"  cy="29" r="3.4" fill="#2f7fd1"/>
+      <circle cx="15" cy="21" r="2.7" fill="#3d94c8"/>
+      <circle cx="24" cy="26" r="2.7" fill="#1fa9a2"/>
+      <circle cx="33" cy="11" r="3.8" fill="url(#neoagGrad)"/>
+    </svg>
     <div class="brand-text">
       <span class="name">NeoAG</span>
-      <span class="tag">neoantigen workspace</span>
+      <span class="tag" data-i18n="brand.tag">Neoantigen scientific workspace</span>
     </div>
   </div>
   <div class="top-right">
-    <button id="agent-mode" class="pill interactive" title="Switch between the scripted demo agent and the real server-side CodeBuddy agent">Demo agent</button>
-    <span id="demo-pill" class="pill demo" title="Demonstration mode: synthetic data only. No real pipeline and no patient data are connected.">Demo mode</span>
-    <span class="conn"><span id="conn-dot" class="dot"></span><span id="conn-text">connecting</span></span>
+    <select id="lang-select" class="lang-select" title="Language / 语言" aria-label="Language">
+      <option value="zh">中文</option>
+      <option value="en">English</option>
+    </select>
+    <span class="conn"><span id="conn-dot" class="dot"></span><span id="conn-text">&nbsp;</span></span>
   </div>
 </header>
 
 <main id="shell">
   <aside id="sidebar" aria-label="Chat history">
-    <button id="new-chat" class="btn primary block">New chat</button>
+    <button id="new-chat" class="btn primary block" data-i18n="chat.new">New chat</button>
     <div id="conv-list" class="convlist"></div>
-    <div class="sidebar-foot">Chats are saved on the server and survive<br>restarts. Deleting a chat hides it here.</div>
   </aside>
 
   <section id="agent-pane" aria-label="Agent conversation">
     <div id="chat-head">
-      <div id="chat-title">New chat</div>
+      <div id="chat-title" data-i18n="chat.new">New chat</div>
       <span id="chat-state" class="pill muted hidden"></span>
     </div>
     <div id="chat-log" class="chat-log"></div>
@@ -39,12 +53,13 @@
       <span id="act-dot" class="act-dot"></span>
       <span id="act-text"></span>
       <span id="act-elapsed" class="act-elapsed"></span>
-      <button id="chat-stop" class="btn danger sm hidden" type="button">Stop</button>
+      <button id="chat-stop" class="btn danger sm hidden" type="button" data-i18n="chat.stop">Stop</button>
     </div>
     <form id="chat-form" autocomplete="off">
       <textarea id="chat-input" rows="2"
+        data-i18n-ph="chat.ph"
         placeholder="Describe your goal - e.g. analyze a sample, or tell the agent where your sequencing data are stored"></textarea>
-      <button id="chat-send" class="btn primary" type="submit">Send</button>
+      <button id="chat-send" class="btn primary" type="submit" data-i18n="chat.send">Send</button>
     </form>
   </section>
 
@@ -52,11 +67,11 @@
 
   <section id="work-pane" aria-label="Workspace">
     <nav id="work-nav">
-      <button class="wtab active" data-view="tasks">Tasks</button>
-      <button class="wtab" data-view="results">Results</button>
-      <button class="wtab" data-view="discovery">Discovery</button>
-      <button class="wtab" data-view="skills">Skills</button>
-      <button class="wtab" data-view="help">Help</button>
+      <button class="wtab active" data-view="tasks" data-i18n="tab.tasks">Tasks</button>
+      <button class="wtab" data-view="results" data-i18n="tab.results">Results</button>
+      <button class="wtab" data-view="discovery" data-i18n="tab.discovery">Discovery</button>
+      <button class="wtab" data-view="skills" data-i18n="tab.skills">Skills</button>
+      <button class="wtab" data-view="help" data-i18n="tab.help">Help</button>
     </nav>
     <div id="work-body">
 
@@ -64,86 +79,60 @@
 
         <div id="attention" class="attention hidden"></div>
 
-        <div class="card">
+        <div class="card" id="prep-card">
           <div class="card-head">
-            <h2>Prepare an analysis</h2>
-            <span class="pill muted" id="prep-state">no inputs yet</span>
+            <h2 data-i18n="prep.title">Prepare an analysis</h2>
           </div>
 
-          <div class="block">
-            <label class="lbl" for="prep-dir">Sequencing data location</label>
-            <p class="hint">One directory is enough. Tumor / normal DNA,
-              RNA and any already-processed evidence (variant calls, HLA
-              typing, fusion or junction tables) are recognized there by
-              the NeoAG detector itself - you will never enter BAM, VCF
-              or HLA values by hand, at this step or any later one.</p>
+          <div class="block" id="prep-entry">
+            <label class="lbl" for="prep-dir" data-i18n="prep.dirlabel">Sequencing data directory</label>
+            <p class="hint" data-i18n="prep.dirhint">Enter the folder that holds this case's data; NeoAG recognizes the files inside it.</p>
             <div class="btnrow">
               <input type="text" id="prep-dir" placeholder="/data/projects/case-042">
-              <button id="prep-discover" class="btn primary">Discover inputs / Prepare analysis</button>
+              <button id="prep-discover" class="btn primary" data-i18n="prep.discover">Discover inputs</button>
             </div>
-            <div id="native-cap" class="mnote">checking native capability&hellip;</div>
-            <div id="prep-flow"></div>
+            <div id="prep-progress" class="prep-progress hidden" role="status">
+              <span class="spin"></span><span id="prep-progress-text"></span>
+            </div>
+            <div id="prep-error"></div>
           </div>
 
-          <details class="adv" id="sci-block">
-            <summary>Scientific configuration: <b id="sci-state">NeoAG defaults</b></summary>
+          <div id="prep-flow"></div>
+
+          <details class="adv" id="sci-block" hidden>
+            <summary><span data-i18n="sci.summary">Scientific configuration:</span>
+              <b id="sci-state" data-i18n="sci.defaults">NeoAG defaults</b></summary>
             <div id="cfg-science"></div>
-          </details>
-
-          <details class="adv" id="dev-block">
-            <summary>Demo &amp; developer controls</summary>
-            <label class="chk"><input type="checkbox" id="devmode-toggle"> Show demo &amp; developer controls</label>
-            <div id="dev-controls" class="hidden">
-              <p class="hint">Simulation engine: a seeded, clearly-labelled
-                mock run for UI/workflow testing only - never real science.
-                Native controls below run REAL NeoAG code on the bundled
-                synthetic fixtures.</p>
-              <label class="lbl">Sample</label>
-              <select id="nj-sample"></select>
-              <label class="lbl">Stage plan</label>
-              <div id="nj-stages" class="stages"></div>
-              <label class="lbl">Execution mode</label>
-              <div class="mode-row" id="nj-exec-row">
-                <label class="mode-opt">
-                  <input type="radio" name="execmode" value="controlled" checked>
-                  <div><b>Controlled</b><span>pauses at each decision point and asks you</span></div>
-                </label>
-                <label class="mode-opt">
-                  <input type="radio" name="execmode" value="autonomous">
-                  <div><b>Autonomous</b><span>validated defaults applied on its own, every choice recorded</span></div>
-                </label>
-              </div>
-              <label class="chk"><input type="checkbox" id="nj-fail"> simulate missing stability tool (demo failure path - clearly labelled in the job)</label>
-              <div class="btnrow"><button id="nj-submit-demo" class="btn sm">Submit simulated job (demo)</button></div>
-              <label class="chk"><input type="checkbox" id="nj-n-demo"> Native synthetic demo: real NeoAG pipeline code on the repo's own fixtures, predictors stubbed (no patient data, cancels cleanly)</label>
-              <label class="chk" id="nj-stub-wrap" style="display:none"><input type="checkbox" id="nj-n-stub"> stub predictor outputs (developer control - testing only, flagged in every record)</label>
+            <div class="fold-foot">
+              <button id="sci-reset" class="btn ghost sm" data-i18n="sci.reset">Restore defaults</button>
             </div>
           </details>
 
-          <div class="btnrow" id="prep-actions">
-            <button id="nj-native-preview" class="btn ghost" disabled>Preview native plan (read-only)</button>
-            <button id="nj-submit" class="btn primary" disabled>Submit for approval</button>
-            <span class="hint" id="prep-hint">enter the data directory above to begin</span>
+          <details class="adv" id="plan-block" hidden>
+            <summary data-i18n="plan.summary">Stage plan</summary>
+            <div id="plan-body"></div>
+          </details>
+
+          <div class="btnrow" id="prep-actions" hidden>
+            <button id="nj-submit" class="btn primary" disabled data-i18n="prep.submit">Start analysis</button>
+            <span class="hint" id="prep-hint"></span>
           </div>
-          <p class="hint">Execute-class work always requires a human approval click (POL-005), in both modes.
-            The confirmed input manifest is the run's single input source: the native planner plans the
-            stages from it, and a background job runs after your approval (native gateway jobs cannot be
-            cancelled once submitted - verified limitation).</p>
+          <p class="hint" id="approval-note" data-i18n="prep.approval">Your approval is always required before anything runs.</p>
         </div>
 
         <div class="card">
           <div class="card-head">
-            <h2>Running &amp; recent</h2>
+            <h2 data-i18n="run.title">Running &amp; recent</h2>
             <div class="chiprow" id="kind-filter">
-              <button class="chip active" data-kind="">All</button>
-              <button class="chip" data-kind="analysis">Analysis</button>
-              <button class="chip" data-kind="discovery">Discovery</button>
-              <button class="chip" data-kind="diagnostic">Diagnostics</button>
+              <button class="chip active" data-kind="" data-i18n="filter.all">All</button>
+              <button class="chip" data-kind="analysis" data-i18n="filter.analysis">Analyses</button>
+              <button class="chip" data-kind="discovery" data-i18n="filter.discovery">Discovery</button>
+              <button class="chip" data-kind="diagnostic" data-i18n="filter.diagnostic">Diagnostics</button>
             </div>
           </div>
           <div id="job-list" class="joblist"></div>
           <details class="adv" id="history-block">
-            <summary>Task history <span id="history-count" class="count"></span></summary>
+            <summary><span data-i18n="run.history">Task history</span> <span id="history-count" class="count"></span></summary>
             <div id="history-list" class="joblist"></div>
           </details>
         </div>
@@ -154,8 +143,8 @@
       <section id="view-results" class="wview">
         <div class="card">
           <div class="card-head">
-            <h2>Results</h2>
-            <label class="lbl">Completed run
+            <h2 data-i18n="res.title">Results</h2>
+            <label class="lbl inline"><span data-i18n="res.pick">Completed run</span>
               <select id="res-job"></select></label>
           </div>
           <div id="res-outcome"></div>
@@ -165,7 +154,7 @@
           <div id="res-strategy"></div>
           <div id="res-table"></div>
           <details class="adv" id="res-manifest-wrap">
-            <summary>Output manifest, decisions and provenance</summary>
+            <summary data-i18n="res.prov">Output manifest, decisions and provenance</summary>
             <div id="res-manifest"></div>
           </details>
         </div>
@@ -174,35 +163,29 @@
       <section id="view-discovery" class="wview">
         <div class="card">
           <div class="card-head">
-            <h2>SOTA tool discovery &amp; benchmarking</h2>
-            <span class="pill muted">real retrieval</span>
+            <h2 data-i18n="disc.title">Tool discovery &amp; benchmarking</h2>
           </div>
+          <p class="hint" data-i18n="disc.intro">Searches public scientific sources and your configured NeoAG inventory to review analysis tools. It reports what it verified and marks the rest as not verified.</p>
           <div class="row">
-            <label class="lbl">Engine
-              <select id="res-engine">
-                <option value="live">Live retrieval (real sources)</option>
-                <option value="example">Example fixture (testing only)</option>
-              </select></label>
-            <label class="lbl">Scope
+            <label class="lbl"><span data-i18n="disc.scope">Scope</span>
               <select id="res-scope">
-                <option value="targeted">Targeted review</option>
-                <option value="full">Full pipeline review</option>
+                <option value="targeted" data-i18n="disc.scopeT">Targeted review</option>
+                <option value="full" data-i18n="disc.scopeF">Full pipeline review</option>
               </select></label>
-            <button id="res-run" class="btn primary">Start research run</button>
+            <label class="lbl"><span data-i18n="disc.engine">Evidence source</span>
+              <select id="res-engine">
+                <option value="live" data-i18n="disc.engL">Live sources</option>
+                <option value="example" data-i18n="disc.engE">Example data (testing)</option>
+              </select></label>
+            <button id="res-run" class="btn primary" data-i18n="disc.run">Start review</button>
           </div>
           <div class="block">
-            <label class="lbl">Targets <span class="hint" id="res-target-hint"></span></label>
+            <label class="lbl"><span data-i18n="disc.targets">Targets</span> <span class="hint" id="res-target-hint"></span></label>
             <div id="res-targets" class="stages"></div>
-            <label class="lbl">Custom target (not in the pipeline inventory)</label>
-            <input id="res-custom" type="text"
+            <label class="lbl"><span data-i18n="disc.custom">Custom target</span></label>
+            <input id="res-custom" type="text" data-i18n-ph="disc.customPh"
               placeholder="e.g. neoantigen clonality scoring">
           </div>
-          <p class="hint">Live mode queries real public sources (Europe PMC, PubMed,
-            OpenAlex, GitHub, PyPI, bio.tools) and the code-grounded inventory of the
-            configured NeoAG repository. It verifies existence, version and license
-            and quotes benchmark claims at abstract level - it does NOT execute or
-            benchmark anything, and unverified fields stay <b>Not verified</b>.
-            Example fixture mode is a fixed testing dataset, never real evidence.</p>
           <div id="res-list"></div>
         </div>
         <div id="res-report"></div>
@@ -211,17 +194,11 @@
       <section id="view-skills" class="wview">
         <div class="card">
           <div class="card-head">
-            <h2>Agent skills</h2>
-            <span class="pill muted" id="skill-activation-note">advisory only</span>
+            <h2 data-i18n="skill.title">Agent skills</h2>
           </div>
-          <p class="hint">Skills are <b>advisory instructions</b> the agent loads when a
-            chat starts. They cannot change the execution gate, the policies, the
-            thresholds or the approvals - those live elsewhere and stay enforced.
-            A saved skill is written for the agent automatically:
-            <b>changes apply to new chats</b>; a chat already in progress keeps what it
-            loaded.</p>
+          <p class="hint" data-i18n="skill.intro">Skills are advisory instructions the agent reads when a chat starts. They guide wording and style; they cannot change approvals, safety gates or scientific settings. Changes apply to new chats.</p>
           <div class="btnrow">
-            <button id="skill-new" class="btn ghost">New skill</button>
+            <button id="skill-new" class="btn ghost" data-i18n="skill.new">New skill</button>
           </div>
           <div id="skill-list"></div>
         </div>
@@ -231,7 +208,7 @@
       <section id="view-help" class="wview">
         <div class="card">
           <div class="card-head">
-            <h2>Help &amp; documentation</h2>
+            <h2 data-i18n="help.title">Help</h2>
             <div class="chiprow" id="help-tabs"></div>
           </div>
           <div id="help-doc" class="helpdoc"></div>

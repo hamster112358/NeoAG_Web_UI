@@ -35,6 +35,7 @@ import hashlib
 import json
 import os
 import shlex
+import stat
 import subprocess
 import threading
 import time
@@ -576,6 +577,47 @@ def authorized_dir(data_dir: str):
             return real, ""
     return "", ("not an authorized input location - input directories "
                 "must live under: " + ", ".join(AUTHORIZED_INPUT_ROOTS))
+
+
+def native_tree(data_dir: str, sub: str = "") -> dict:
+    """M9 §5.3: ONE directory level listed from the real filesystem for
+    the input-review tree (lazy loading keeps large directories cheap).
+    Web-layer listing only - scientific roles come exclusively from the
+    native detector (discover_inputs), never from this listing.
+    Read-only; confined to the authorized directory (no escaping
+    sub-paths, symlinks are listed but never followed)."""
+    real, err = authorized_dir(data_dir)
+    if err:
+        return {"ok": False, "error": err}
+    sub = (sub or "").strip().strip("/")
+    if ".." in [p for p in sub.split("/") if p]:
+        return {"ok": False, "error": "invalid subdirectory"}
+    target = os.path.realpath(os.path.join(real, sub) if sub else real)
+    if target != real and not target.startswith(
+            real.rstrip(os.sep) + os.sep):
+        return {"ok": False, "error": "path escapes the scanned directory"}
+    if not os.path.isdir(target):
+        return {"ok": False, "error": "not a directory"}
+    MAX = 500
+    try:
+        names = sorted(os.listdir(target))
+    except OSError as e:
+        return {"ok": False, "error": f"directory not readable: {e}"}
+    entries, n_total = [], len(names)
+    for name in names[:MAX]:
+        p = os.path.join(target, name)
+        try:
+            stt = os.stat(p, follow_symlinks=False)
+        except OSError:
+            continue
+        isdir = stat.S_ISDIR(stt.st_mode)
+        entries.append({"name": name, "dir": bool(isdir),
+                        "size": 0 if isdir else stt.st_size,
+                        "rel": (sub + "/" + name).lstrip("/")})
+    entries.sort(key=lambda e: (not e["dir"], e["name"].lower()))
+    return {"ok": True, "data_dir": real, "sub": sub,
+            "entries": entries, "n_total": n_total,
+            "truncated": n_total > MAX}
 
 
 def native_scan(data_dir: str) -> dict:
