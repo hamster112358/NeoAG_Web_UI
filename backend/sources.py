@@ -424,7 +424,13 @@ def bioconductor_package(name: str, max_results: int = 1):
                f"{pkg}.html")
         raw = None
         path = f"/packages/{repo}/bioc/html/{pkg}.html"
-        for attempt in (1, 2):  # bounded: one retry on a cold hang
+        for attempt in (1, 2, 3):  # bounded: two retries on a cold hang
+                                  # (2026-11-17 run: ascat and STGBench
+                                  # each stalled BOTH of two attempts;
+                                  # re-probing 2026-11-18 answered the
+                                  # same URLs in ~3 s - the stalls are
+                                  # transient, so one more bounded try
+                                  # is worth the honest status)
             # http.client + gzip, measured 2026-11-17: the CDN stalls
             # urllib's default identity-encoded requests from this
             # host (hangs at 15-28 s, twice reproduced) while
@@ -451,7 +457,7 @@ def bioconductor_package(name: str, max_results: int = 1):
                 raw = body.decode("utf-8", "replace")
                 break
             except Exception as e:
-                if attempt == 1:
+                if attempt < 3:
                     continue
                 return ([], f"{type(e).__name__}: {str(e)[:150]}", {})
         if raw is None:
