@@ -50,7 +50,12 @@ STATE_DIR = "/data1/neoag/agents/remote_access/tunnels"
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 LOCK_PATH = os.path.join(STATE_DIR, "lock")
 
-URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+# The hostname of the live quick tunnel. Note: the registration FAILURE
+# line printed by cloudflared embeds https://api.trycloudflare.com/tunnel -
+# that host is the registration API, never a tunnel hostname, so it is
+# excluded here (a mid-registration status read once mistook it for the
+# URL on 2026-11-18).
+URL_RE = re.compile(r"https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com")
 # Cloudflare edge error codes meaning "the request never reached your app":
 CF_ERROR_CODES = (502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 530)
 # Anycast edge addresses used for the host-level network probe. This host's
@@ -285,11 +290,17 @@ def activate_url(t, url):
 
 
 def verify_url_new(name, url, tries=URL_TRIES):
+    """A hostname is only adopted after the APP behind it answers with an
+    expected code (200/401). Any other HTTP answer - even a reachable
+    one - is not evidence: on 2026-11-18 a mid-registration status read
+    matched https://api.trycloudflare.com (registration API, replies
+    405) from a failure log line and adopted it as the tunnel URL."""
     detail = ""
     for i in range(tries):
-        ok, detail = public_reach(name, url)
-        if ok:
-            return True, detail
+        code = http_code(url, timeout=15) if dns_ok(url) else 0
+        if code in TUNNELS[name]["public_ok"]:
+            return True, f"HTTP {code}"
+        detail = f"HTTP {code}" if code else "unreachable"
         if i < tries - 1:
             time.sleep(URL_TRY_SLEEP)
     return False, detail
