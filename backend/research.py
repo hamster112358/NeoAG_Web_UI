@@ -272,6 +272,15 @@ def run_live(rid, scope, targets, store, resume):
     prog.pop("status", None)
     done = set(prog.get("done_queries") or [])
     queries_log = prog.get("queries") or []
+    # Resume durability (measured 2026-11-18): a skipped query is
+    # only safe when its RECORDS come back with the skip. The
+    # resumed dc8da8 run skipped persisted queries but rebuilt the
+    # conclusion from freshly fetched records only - PureCN/CNVkit
+    # vanished from the candidate set while the status said
+    # 'completed'. Retrieval records are now persisted per query
+    # and restored on resume; a done query without persisted
+    # records is re-run instead of skipped.
+    lit_records = dict(prog.get("lit_records") or {})
     resolved_targets = prog.get("targets") or [
         {"id": t, "label": t} for t in targets]
     with store.lock:
@@ -324,9 +333,15 @@ def run_live(rid, scope, targets, store, resume):
     for target in resolved_targets:
         if cancelled():
             break
-        plan = _literature_plan(target, done)
+        plan = _literature_plan(target, set())
         lit_by_target.setdefault(target["id"], [])
         for q in plan:
+            qkey = f"{q['source']}|{q['query']}"
+            if qkey in done and qkey in lit_records:
+                # resume: restore the evidence, do not just skip
+                lit_by_target[target["id"]].extend(
+                    lit_records[qkey])
+                continue
             adapter = sources.ALL_ADAPTERS.get(q["source"])
             recs, err, meta = ([], "unknown source", {})
             if adapter:
@@ -345,13 +360,15 @@ def run_live(rid, scope, targets, store, resume):
                                  "query": q["query"], "error": err})
             else:
                 per_source[q["source"]]["ok"] += 1
-                done.add(f"{q['source']}|{q['query']}")
+                done.add(qkey)
+                lit_records[qkey] = recs
                 lit_by_target[target["id"]].extend(recs)
             _step(store, publish, rid,
                   f"[{target['id']}] {q['source']}: '{q['query'][:60]}' -> "
                   + (f"{len(recs)} records" if not err else f"FAILED {err}"),
                   prog, {"done_queries": sorted(done),
                          "queries": queries_log,
+                         "lit_records": lit_records,
                          "coverage": {"per_source": per_source,
                                       "failures": failures}})
     if cancelled():
@@ -421,10 +438,13 @@ def run_live(rid, scope, targets, store, resume):
             lit_by_target.get(tid, []), prof)
         gh_query = target["label"].split("(")[0].strip()
         tool_hits = []
+        gh_key = f"github|{gh_query}"
+        if gh_key in done and gh_key in lit_records:
+            tool_hits.extend(lit_records[gh_key])  # resume restore
         for q in ([{"source": "github", "query": gh_query,
                     "purpose": "task-named repositories (suggestions "
                                "only - screened like everything else)"}]
-                  if f"github|{gh_query}" not in done else []):
+                  if gh_key not in done else []):
             recs, err, _ = sources.github_repo_search(q["query"], 4)
             entry = {"source": "github", "query": q["query"], "target": tid,
                      "purpose": q["purpose"], "count": len(recs),
@@ -436,12 +456,15 @@ def run_live(rid, scope, targets, store, resume):
                 failures.append(entry)
             else:
                 per_source["github"]["ok"] += 1
-                done.add(f"github|{gh_query}")
+                done.add(gh_key)
+                lit_records[gh_key] = recs
                 tool_hits.extend(recs)
             _step(store, publish, rid,
                   f"[{tid}] github repos for task: -> "
                   + (f"{len(recs)}" if not err else f"FAILED {err}"),
                   prog, {"queries": queries_log,
+                         "done_queries": sorted(done),
+                         "lit_records": lit_records,
                          "coverage": {"per_source": per_source,
                                       "failures": failures}})
         names += [{"name": h["id"], "origin": f"GitHub task-search "
@@ -487,7 +510,8 @@ def run_live(rid, scope, targets, store, resume):
                               fb=followup_budget, task=task, prof=prof,
                               known_names=[x["name"] for x in uniq],
                               baseline_names=baseline_tool_names,
-                              docs_by_name=row_docs)
+                              docs_by_name=row_docs,
+                              lit_records=lit_records)
         done_targets.add(tid)
     if cancelled():
         # a cancel after candidate work still publishes what was
@@ -1128,7 +1152,7 @@ def _deepen_candidate(c, target, citations, per_source, failures,
                       queries_log, done, cid_keys, store, publish, rid,
                       budget=None, fb=None, task=None, prof=None,
                       known_names=(), baseline_names=(),
-                      docs_by_name=None):
+                      docs_by_name=None, lit_records=None):
     """M8 investigation loop: execute one row's RECORDED follow-up
     queries (bounded per run). New literature naming the candidate
     grows its document set; claims are re-extracted and RE-VERIFIED;
@@ -1141,6 +1165,38 @@ def _deepen_candidate(c, target, citations, per_source, failures,
     name = c["name"]
     key_l = name.lower()
     still_open, executed, new_recs_all = [], [], []
+
+    def _ingest(recs_):
+        """Take one query's records into this candidate's citation
+        set and (when the text names it) its document set. Shared by
+        the execute path and the resume-restore path, so a resumed
+        run sees the SAME grown evidence the original run grew."""
+        for rec in recs_ or []:
+            if not (rec.get("id") or rec.get("url")):
+                continue
+            cid = _canon_cid(rec)
+            if cid in cid_keys:
+                continue
+            cid_keys.add(cid)
+            cc = {**rec, "targets": [tid], "cid": cid}
+            citations.append(cc)
+            new_recs_all.append(cc)
+            blob = ((cc.get("title") or "") + " " +
+                    (cc.get("abstract") or "")).lower()
+            if key_l in blob:
+                docs_g = (docs_by_name or {}).setdefault(key_l, [])
+                text = (((cc.get("title") or "") + ". " +
+                         (cc.get("abstract") or "")).strip())
+                if text.strip(" ."):
+                    docs_g.append({"doc_cid": cid,
+                                   "kind": "citation-abstract",
+                                   "text": text,
+                                   "citation": {
+                                       "title": cc.get("title"),
+                                       "year": cc.get("year"),
+                                       "url": cc.get("url"),
+                                       "id": cc.get("id"),
+                                       "source": cc.get("source")}})
     for q in c.get("followups") or []:
         src = q.get("source") or "europepmc"
         qtext = str(q.get("query") or "")
@@ -1151,9 +1207,18 @@ def _deepen_candidate(c, target, citations, per_source, failures,
                                             "exhausted"})
             continue
         if qkey in done:
-            still_open.append({**q, "status": "identical query already "
-                                           "run this run - no new "
-                                           "records"})
+            restored = (lit_records or {}).get(qkey) or []
+            if restored:
+                _ingest(restored)
+                still_open.append({**q,
+                                   "status": "already run - "
+                                             "persisted records "
+                                             "restored (resume)"})
+            else:
+                still_open.append({**q,
+                                   "status": "identical query "
+                                             "already run this run - "
+                                             "no new records"})
             continue
         recs, err = [], None
         if src == "github":
@@ -1187,34 +1252,11 @@ def _deepen_candidate(c, target, citations, per_source, failures,
                          "records": len(recs or []), "error": err})
         if err is None:
             done.add(qkey)
+            if lit_records is not None:
+                lit_records[qkey] = recs or []
             if fb is not None:
                 fb["n"] = fb.get("n", 0) - 1
-        for rec in recs or []:
-            if not (rec.get("id") or rec.get("url")):
-                continue
-            cid = _canon_cid(rec)
-            if cid in cid_keys:
-                continue
-            cid_keys.add(cid)
-            cc = {**rec, "targets": [tid], "cid": cid}
-            citations.append(cc)
-            new_recs_all.append(cc)
-            blob = ((cc.get("title") or "") + " " +
-                    (cc.get("abstract") or "")).lower()
-            if key_l in blob:
-                docs = (docs_by_name or {}).setdefault(key_l, [])
-                text = (((cc.get("title") or "") + ". " +
-                         (cc.get("abstract") or "")).strip())
-                if text.strip(" ."):
-                    docs.append({"doc_cid": cid,
-                                 "kind": "citation-abstract",
-                                 "text": text,
-                                 "citation": {
-                                     "title": cc.get("title"),
-                                     "year": cc.get("year"),
-                                     "url": cc.get("url"),
-                                     "id": cc.get("id"),
-                                     "source": cc.get("source")}})
+        _ingest(recs)
     # did NEW literature introduce this name as a method? (the cue
     # grammar decides, not a count)
     mi = {}
@@ -1296,7 +1338,9 @@ def _deepen_candidate(c, target, citations, per_source, failures,
           f"[{tid}] {name}: deepening executed {len(executed)} "
           f"follow-up query(ies), {len(new_recs_all)} new records -> "
           f"{c['eligibility']} ({c['research_state']})",
-          store.research_progress(rid), {})
+          store.research_progress(rid),
+          {"done_queries": sorted(done),
+           "lit_records": lit_records or {}})
 
 
 def _record(per_source, failures, queries_log, source, query, count, err,

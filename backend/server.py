@@ -707,6 +707,14 @@ class Handler(BaseHTTPRequestHandler):
             r = store.research_get(rid)
             if not r:
                 return self._json(404, {"error": "no such report"})
+            # lit_records is the resume-durability store (verbatim
+            # retrieved records) - needed by the engine's progress,
+            # never displayed; strip it from the polled response
+            prog = r.get("progress")
+            if isinstance(prog, dict) and "lit_records" in prog:
+                prog = dict(prog)
+                prog.pop("lit_records")
+                r = {**r, "progress": prog}
             return self._json(200, r)
         if path.startswith("/api/jobs/"):
             jid = path.strip("/").split("/")[2]  # api/jobs/<id>[/events]

@@ -711,15 +711,26 @@ def _e2e():
         rep = row["report"]
         if isinstance(rep, str):
             rep = json.loads(rep)
+        # ---- durable resume: the resumed pass must conclude from
+        # the RESTORED evidence base, not a starved one (defect
+        # found live 2026-11-18: skipped-on-resume queries kept
+        # their skip but not their records, so PureCN/CNVkit
+        # vanished while the status said 'completed') ----
+        research.run_live(rid, "targeted", ["purity_cnv"], st,
+                          resume=True)
+        row2 = st.research_get(rid)
+        rep2 = row2["report"]
+        if isinstance(rep2, str):
+            rep2 = json.loads(rep2)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    return rep
+    return rep, rep2
 
 
 try:
-    rep = _e2e()
+    rep, rep2 = _e2e()
 except Exception as exc:  # noqa: BLE001
-    rep = None
+    rep = rep2 = None
     chk("E2E run_live completes with faked sources", False,
         f"{type(exc).__name__}: {exc}")
 if rep is not None:
@@ -779,6 +790,25 @@ if rep is not None:
     chk("E2E every citation carries a canonical cid",
         all(c.get("cid") for c in rep["literature_citations"]),
         rep["literature_citations"][:3])
+if rep is not None and rep2 is not None:
+    names1 = {c["name"] for c in rep["candidates"]}
+    names2 = {c["name"] for c in rep2["candidates"]}
+    chk("E2E resume restores the full candidate set (no starved "
+        "evidence base)", names1 == names2,
+        f"lost: {sorted(names1 - names2)}")
+    lit2 = {c["name"]: c["eligibility"] for c in rep2["candidates"]}
+    chk("E2E resume keeps literature-only CNVkit as a screened "
+        "candidate", "CNVkit" in lit2, sorted(lit2))
+    chk("E2E resume re-derives CNVkit with the same identity verdict",
+        ({c["name"]: c["identity"].get("status")
+          for c in rep2["candidates"]}).get("CNVkit")
+        == {c["name"]: c["identity"].get("status")
+            for c in rep["candidates"]}.get("CNVkit"))
+    chk("E2E resume keeps the same citation count",
+        len(rep2["literature_citations"])
+        == len(rep["literature_citations"]),
+        f"{len(rep2['literature_citations'])} vs "
+        f"{len(rep['literature_citations'])}")
 
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed"
       + (f" - FAILURES: {FAIL}" if FAIL else " - ALL PASS"))
