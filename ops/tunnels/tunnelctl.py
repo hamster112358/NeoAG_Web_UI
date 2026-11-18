@@ -60,31 +60,27 @@ CF_ERROR_CODES = (502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 530)
 # one most relevant to tunnel health.
 CF_EDGE_IPS = ("198.41.200.13", "198.41.192.47", "198.41.200.9")
 
+# 2026-11-18: the gateway tunnel (gw) was RETIRED after dependency audit:
+# NeoAG Web reaches the gateway over loopback, the frontend makes no
+# external calls, no config/script/cron references any gateway public
+# hostname, and the operator uses CodeBuddy via SSH/tmux (local PTY, never
+# touches :7890). units/neoag-tunnel-gw.service is kept for reference; to
+# re-adopt, re-add a TUNNELS entry and reinstall (README_TUNNELS.md).
 TUNNELS = {
     "web": {
         "unit": "neoag-tunnel-web.service",
         "target": "http://127.0.0.1:8712",
+        # App layer = "the local process answers HTTP at all": any status
+        # code proves the app is up (401 on a protected endpoint is proof,
+        # not an outage); only a transport failure (0) means it is down.
+        # Rotating a public URL cannot fix a broken app.
         "upstream_probe": "http://127.0.0.1:8712/api/bootstrap",
-        # Basic auth is ON: 401 = app responding. 200 also fine.
-        "app_ok": (200, 401),
         # Public unauthenticated probe expects the same app-level answer:
         # a 401 THROUGH the tunnel proves route + authentication alive.
         "public_ok": (200, 401),
         "log": os.path.join(STATE_DIR, "web.log"),
         "label": "NeoAG Web",
         "client": "operator browser (Basic-auth protected app)",
-    },
-    "gw": {
-        "unit": "neoag-tunnel-gw.service",
-        "target": "http://127.0.0.1:7890",
-        # The gateway's own health endpoint (same one NeoAG Web probes via
-        # GET /api/native/gateway): {"status":"OK"}.
-        "upstream_probe": "http://127.0.0.1:7890/health",
-        "app_ok": (200,),
-        "public_ok": (200, 403),
-        "log": os.path.join(STATE_DIR, "gw.log"),
-        "label": "CodeBuddy Gateway",
-        "client": "operator browser (direct CodeBuddy chat UI)",
     },
 }
 
@@ -250,10 +246,11 @@ def load_state():
     try:
         with open(STATE_PATH) as f:
             st = json.load(f)
-        # forward-compat: fill in any new tunnel keys
+        # forward-compat: fill in new tunnel keys; also PRUNE tunnels that
+        # are no longer supervised (e.g. the retired gateway entry)
         base = default_state()
-        for n, t in base["tunnels"].items():
-            st["tunnels"].setdefault(n, t)
+        st["tunnels"] = {n: st["tunnels"].get(n) or t
+                         for n, t in base["tunnels"].items()}
         return st
     except FileNotFoundError:
         return default_state()
@@ -517,7 +514,7 @@ def cmd_probe(name):
     print(f"== {name} layered probe ==")
     print(f"unit     : {u}")
     print(f"app      : HTTP {http_code(c['upstream_probe'], 8)} "
-          f"(ok codes {c['app_ok']})")
+          f"(0 = app down; any code = responding)")
     print(f"network  : edge TCP/7844 reachable: {network_up()}")
     pid = int(u.get("MainPID") or 0)
     print(f"edgeconn : {edge_conns(pid)} established dport-7844 for pid {pid}")

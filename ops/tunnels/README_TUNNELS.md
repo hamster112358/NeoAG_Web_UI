@@ -25,40 +25,43 @@ hostname and NO uptime guarantee - this tooling's job is to notice fast,
 recover automatically, verify the new URL for real, and tell you what it
 is via `tunnel-status.sh`.
 
-## Topology (final, 2026-11-18)
+## Topology (final, 2026-11-18 evening - single tunnel)
 
 ```
-browser --HTTPS--> [quick tunnel #1] cloudflared (neoag-tunnel-web.service)
+browser --HTTPS--> [quick tunnel] cloudflared (neoag-tunnel-web.service)
                        |
                        +--> NeoAG Web  http://127.0.0.1:8712   (Basic auth ON)
                                 |
                                 +--> CodeBuddy Gateway http://127.0.0.1:7890
                                      (loopback only, backend/codebuddy_client.py)
-
-operator browser --HTTPS--> [quick tunnel #2] cloudflared (neoag-tunnel-gw.service)
-                       --Host: localhost:7890--> CodeBuddy Gateway :7890
 ```
 
-Two tunnels are kept, deliberately:
+ONE public entry point. The second (gateway-facing) quick tunnel that
+existed on 2026-11-18 morning was RETIRED the same day after a
+dependency audit: the demo backend reaches the gateway over loopback,
+the frontend makes no external calls, no script/cron/config/systemd
+unit on the host references a gateway public hostname, the gateway's
+own settings carry no tunnel configuration, its public URL logged zero
+incoming requests, and the operator uses CodeBuddy via SSH/tmux (local
+PTY sessions that never touch :7890) plus NeoAG Web. With no client
+left, that tunnel was disabled and uninstalled while the localhost
+gateway process was left untouched (verified same pid before/after).
+`units/neoag-tunnel-gw.service` remains here for reference with
+re-adoption instructions; if ever re-adopted, note that a plain probe
+of the gateway's API-guarded endpoints (e.g. `GET /health` without
+`x-codebuddy-request`) answers 403 - use `GET /` (login page, 200) as
+the app probe, and remember the `--http-host-header localhost:7890`
+requirement.
 
-* NeoAG Web does NOT need the gateway's public URL: the demo backend
-  talks to the gateway over loopback, and the frontend makes no external
-  calls. One entry point would be enough for the app itself.
-* The gateway tunnel's only client is the operator's browser opening the
-  CodeBuddy chat UI directly - a separate surface the demo does not proxy
-  (its acceptance testing is still open). Deleting that access would be a
-  product decision, so the dependency is documented and preserved.
-
-Nothing else binds any new port; both cloudflared processes are outbound-
-only (TCP/7844 to the Cloudflare edge, http2 because UDP is blocked
-host-wide).
+Nothing else binds any new port; cloudflared is outbound-only (TCP/7844
+to the Cloudflare edge, http2 because UDP is blocked host-wide).
 
 ## Components
 
 | path | role |
 |---|---|
 | `units/neoag-tunnel-web.service` | cloudflared -> 8712, foreground, `Restart=always`, burst 5/600 s |
-| `units/neoag-tunnel-gw.service`  | cloudflared -> 7890 with `--http-host-header localhost:7890` (required by the gateway's DNS-rebinding middleware) |
+| `units/neoag-tunnel-gw.service`  | RETIRED 2026-11-18 (see Topology) - reference only, not installed, not monitored |
 | `units/neoag-tunnel-health.{service,timer}` | one recovery cycle per minute |
 | `tunnelctl.py`                   | all probe/recovery/status logic |
 | `tunnel_health.sh`               | ExecStart wrapper for the timer |
@@ -69,14 +72,16 @@ Runtime state lives OUTSIDE the repo (URLs are rotating, semi-secret):
 
 * `/data1/neoag/agents/remote_access/tunnels/state.json` - 0600, atomic,
   the single authority for "what is the current URL"
-* `web.log` / `gw.log` - cloudflared output, 0600
+* `web.log` - cloudflared output, 0600 (`gw.log` is a frozen artifact of
+  the retired gateway tunnel)
 
 ## Layered health checks (recover only the failing layer)
 
 1. **unit**: systemd `ActiveState=active` with a `MainPID`.
-2. **app**: local upstream answers. NeoAG Web expects **401** (Basic auth
-   is on - a 401 proves the app is serving; it is not an outage). Gateway
-   uses its designed `GET /health` endpoint (HTTP 200).
+2. **app**: the local upstream answers HTTP at all. ANY status code
+   proves the app process is serving (a 401 from the Basic-auth-protected
+   demo is proof, not an outage); only a transport failure counts as
+   app-down, because rotating a public URL cannot fix a broken app.
 3. **network**: TCP/7844 to Cloudflare anycast edge IPs - this host's
    firewall opens exactly that transport, so it is the relevant probe.
    While the host has no outbound, NO tunnel is rotated: a local network
@@ -119,7 +124,7 @@ Cloudflare rate-limits quick-tunnel creation (HTTP 429) from one IP.
 ## Operations
 
 * Current URL / health: `./tunnel-status.sh`
-* Unit status: `systemctl --user status neoag-tunnel-web.service neoag-tunnel-gw.service neoag-tunnel-health.timer`
+* Unit status: `systemctl --user status neoag-tunnel-web.service neoag-tunnel-health.timer`
 * Supervisor reasoning: `journalctl --user -u neoag-tunnel-health.service`
 * Manual cycle now (instead of waiting for the timer):
   `systemctl --user start neoag-tunnel-health.service`
@@ -128,8 +133,8 @@ Cloudflare rate-limits quick-tunnel creation (HTTP 429) from one IP.
 * Boot persistence: user-level systemd + `loginctl enable-linger caojingqi`
   (done 2026-11-18; without linger, user units stop when the last login
   session closes and do not come back after a reboot).
-* Log growth: truncate `web.log` / `gw.log` any time; the supervisor
-  reads them lazily and tolerates truncation.
+* Log growth: truncate `web.log` any time; the supervisor
+  reads it lazily and tolerates truncation.
 
 ## Failure-mode quick table
 

@@ -13,8 +13,12 @@ set -euo pipefail
 cd "$(dirname "$0")"
 UNITS_DIR="${HOME}/.config/systemd/user"
 STATE_DIR=/data1/neoag/agents/remote_access/tunnels
-UNITS=(neoag-tunnel-web.service neoag-tunnel-gw.service
+UNITS=(neoag-tunnel-web.service
        neoag-tunnel-health.service neoag-tunnel-health.timer)
+# neoag-tunnel-gw.service is RETIRED (2026-11-18, dependency audit: no
+# external client of the gateway; see README_TUNNELS.md). Its unit file
+# remains under units/ for reference only and is intentionally NOT
+# installed, enabled or monitored.
 
 if [ "${1:-}" = "--uninstall" ]; then
   for u in "${UNITS[@]}"; do
@@ -49,10 +53,9 @@ done
 systemctl --user daemon-reload
 systemctl --user enable --now neoag-tunnel-health.timer
 systemctl --user enable --now neoag-tunnel-web.service
-systemctl --user enable --now neoag-tunnel-gw.service
 sleep 2
 systemctl --user --no-pager --full \
-  status neoag-tunnel-web.service neoag-tunnel-gw.service \
+  status neoag-tunnel-web.service \
   neoag-tunnel-health.timer | grep -E '^\s*\*|●|Active:|Elapsed:|state:' \
   || true
 echo

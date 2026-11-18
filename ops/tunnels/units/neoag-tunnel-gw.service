@@ -1,4 +1,12 @@
 [Unit]
+# RETIRED 2026-11-18 - kept for reference only, NOT installed or monitored.
+# Dependency audit found no external client of the CodeBuddy Gateway:
+# NeoAG Web talks to it over loopback, the frontend makes no external
+# calls, nothing on the host references a gateway public hostname, and
+# the operator uses CodeBuddy through SSH/tmux. To re-adopt: copy to
+# ~/.config/systemd/user, re-add a "gw" TUNNELS entry in tunnelctl.py,
+# daemon-reload + enable --now. Original rationale below.
+#
 # Quick Tunnel for the CodeBuddy Gateway: Cloudflare edge -> 127.0.0.1:7890.
 # Kept separate from the Web tunnel on purpose: its client is the operator's
 # browser opening the CodeBuddy chat UI directly (NeoAG Web itself reaches
