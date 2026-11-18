@@ -1,0 +1,26 @@
+[Unit]
+# Quick Tunnel for the CodeBuddy Gateway: Cloudflare edge -> 127.0.0.1:7890.
+# Kept separate from the Web tunnel on purpose: its client is the operator's
+# browser opening the CodeBuddy chat UI directly (NeoAG Web itself reaches
+# the gateway over loopback and never uses this URL). --http-host-header is
+# REQUIRED: the gateway's DNS-rebinding middleware only accepts Host values
+# on its allow-list (localhost:7890), and quick-tunnel requests would
+# otherwise be rejected 403. Do not weaken the middleware instead.
+Description=CodeBuddy Gateway quick tunnel (Cloudflare -> 127.0.0.1:7890)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/data1/neoag/agents/cloudflared/bin/cloudflared tunnel --no-autoupdate --protocol http2 --http-host-header localhost:7890 --url http://127.0.0.1:7890
+Restart=always
+RestartSec=10
+TimeoutStopSec=20
+UMask=0077
+StandardOutput=append:/data1/neoag/agents/remote_access/tunnels/gw.log
+StandardError=append:/data1/neoag/agents/remote_access/tunnels/gw.log
+
+[Install]
+WantedBy=default.target

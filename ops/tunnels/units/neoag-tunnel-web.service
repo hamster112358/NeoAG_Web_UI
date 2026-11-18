@@ -1,0 +1,25 @@
+[Unit]
+# Quick Tunnel for NeoAG Web: Cloudflare edge -> 127.0.0.1:8712.
+# cloudflared runs in the FOREGROUND here; systemd owns the lifecycle
+# (Restart=always covers process exit). The "alive but hostname expired"
+# failure is handled by neoag-tunnel-health.timer, not by this unit.
+# The public URL rotates on every fresh registration - read it with
+# ops/tunnels/tunnel-status.sh, never from this file.
+Description=NeoAG Web quick tunnel (Cloudflare -> 127.0.0.1:8712)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/data1/neoag/agents/cloudflared/bin/cloudflared tunnel --no-autoupdate --protocol http2 --url http://127.0.0.1:8712
+Restart=always
+RestartSec=10
+TimeoutStopSec=20
+UMask=0077
+StandardOutput=append:/data1/neoag/agents/remote_access/tunnels/web.log
+StandardError=append:/data1/neoag/agents/remote_access/tunnels/web.log
+
+[Install]
+WantedBy=default.target

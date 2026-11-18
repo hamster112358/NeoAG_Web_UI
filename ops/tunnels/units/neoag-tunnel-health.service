@@ -1,0 +1,10 @@
+[Unit]
+# One recovery cycle: layered health probes for both tunnels + state file
+# update + bounded, backoff-gated restarts. See tunnelctl.py header.
+Description=NeoAG tunnel health check and recovery cycle
+
+[Service]
+Type=oneshot
+ExecStart=/data1/neoag/agents/neoag-web-demo/ops/tunnels/tunnel_health.sh
+TimeoutStartSec=300
+UMask=0077
