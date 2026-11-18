@@ -34,10 +34,14 @@ The deployment's purity/CNV stage names four tools
 "purple"]`). These are reported to the engine as the baseline, each
 carrying its own evidence pointer (workflow config / install
 manifest), and every run lists them as "current baseline (not an
-alternative)" - visible in all three runs above.
+alternative)" - visible in every run listed above.
 
 Registry-verified current versions (run 45dc58, S5 read-only probe,
-bioconda preferred because the deployment installs from bioconda):
+bioconda preferred because the deployment installs from bioconda;
+final run 96774e re-checked on 2026-11-18 and confirmed ascat =
+3.2.0 "stable; bioconda current version", while sequenza/purple/
+facets honestly print "Not verified" until their identity resolves
+- never a borrowed number):
 
 - ascat: 3.2.0 - "stable; bioconda current version; checked
   2026-11-17". This corrects the before-run, which reported the PyPI
