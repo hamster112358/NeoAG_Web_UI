@@ -227,6 +227,18 @@ class Store:
                 "TEXT DEFAULT ''",
                 "ALTER TABLE conversations ADD COLUMN activity "
                 "TEXT DEFAULT ''",
+                # M11 P1-9: task-management flags. pinned promotes a
+                # task in the lists; locked protects the RECORD (the
+                # API refuses trashing and purging while set);
+                # trashed moves the RECORD out of the normal lists
+                # with a trashed_at stamp for the retention display.
+                # NONE of them touches files: trashing and even
+                # purging delete records only - run directories,
+                # artifacts and originals are never removed here.
+                "ALTER TABLE jobs ADD COLUMN pinned INTEGER DEFAULT 0",
+                "ALTER TABLE jobs ADD COLUMN locked INTEGER DEFAULT 0",
+                "ALTER TABLE jobs ADD COLUMN trashed INTEGER DEFAULT 0",
+                "ALTER TABLE jobs ADD COLUMN trashed_at TEXT DEFAULT ''",
             ):
                 try:
                     self.db.execute(stmt)
@@ -336,10 +348,49 @@ class Store:
             row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         return dict(row) if row else None
 
+    def job_purge(self, job_id: str) -> dict | None:
+        """M11 P1-9: delete one job's RECORD and its execution detail
+        rows (events, decisions, output-manifest registry, start
+        snapshot). FILES ARE NEVER TOUCHED - run directories,
+        artifact files and originals survive a purge untouched, which
+        also means an artifact referenced by another record keeps
+        working. Approvals and the audit trail stay: a past human
+        decision and the history of what happened are not the job's
+        mutable property. Returns the snapshot of what was removed
+        (the caller stores it in the audit before deleting it)."""
+        with self.lock:
+            row = self.db.execute(
+                "SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not row:
+                return None
+            row = dict(row)
+            removed = {}
+            for tbl in ("job_events", "decisions", "artifacts",
+                        "run_snapshots"):
+                removed[tbl] = self.db.execute(
+                    f"DELETE FROM {tbl} WHERE job_id=?",
+                    (job_id,)).rowcount
+            self.db.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+            self.db.commit()
+        return {"id": job_id, "kind": row.get("kind"),
+                "state": row.get("state"),
+                "sample_id": row.get("sample_id"),
+                "display_title": row.get("display_title"),
+                "created_at": row.get("created_at"),
+                "removed_rows": removed}
+
     def job_list(self, limit: int = 50, conv_id: str | None = None,
-                 kinds: list[str] | None = None) -> list[dict]:
+                 kinds: list[str] | None = None,
+                 trash: str = "normal") -> list[dict]:
+        # P1-9: trash is a RECORD-level listing dimension -
+        # "normal" = live records only (the default everywhere),
+        # "only" = the trash view, "all" = both.
         q = "SELECT * FROM jobs"
         where, args = [], []
+        if trash == "normal":
+            where.append("trashed=0")
+        elif trash == "only":
+            where.append("trashed=1")
         if conv_id:
             where.append("conv_id=?")
             args.append(conv_id)

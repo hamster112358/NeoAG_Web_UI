@@ -157,6 +157,22 @@
               <button class="chip" data-kind="diagnostic" data-i18n="filter.diagnostic">Diagnostics</button>
             </div>
           </div>
+          <!-- M11 P1-9: task management - search, sort and the trash
+               view. Trash is RECORD-level: no action here ever deletes
+               files, and removal is always a manual, confirmed step. -->
+          <div class="tm-bar">
+            <input id="tm-search" type="search" data-i18n-ph="tm.search"
+              placeholder="Search tasks...">
+            <select id="tm-sort">
+              <option value="new" data-i18n="tm.sortNew">Newest</option>
+              <option value="old" data-i18n="tm.sortOld">Oldest</option>
+              <option value="name" data-i18n="tm.sortName">Name</option>
+            </select>
+            <button class="chip" id="tm-trash-toggle"
+              data-i18n="tm.showTrash">Trash</button>
+            <span class="count" id="tm-trash-count"></span>
+          </div>
+          <div id="tm-bulk" class="tm-bulk" hidden></div>
           <div id="job-list" class="joblist"></div>
           <details class="adv" id="history-block">
             <summary><span data-i18n="run.history">Task history</span> <span id="history-count" class="count"></span></summary>

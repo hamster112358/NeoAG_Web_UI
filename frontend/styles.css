@@ -535,6 +535,27 @@ details.adv .fold-pad { padding: 4px 16px 16px; }
   border-radius: 999px; transition: width .3s ease; }
 .job-row .jr-bar { width: 90px; }
 .jr-bar.wide { width: 100%; max-width: 460px; margin-top: 8px; }
+
+/* ---------- P1-9 task management ---------- */
+.tm-bar { display: flex; gap: 8px; align-items: center; margin: 6px 0 4px; }
+.tm-bar input[type="search"] { flex: 1; min-width: 0; font-size: 12.5px; }
+.tm-bar select { font-size: 12.5px; }
+.tm-bulk { display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+  background: var(--surface-2, rgba(23, 42, 70, .05));
+  border: 1px solid var(--border); border-radius: var(--r-md);
+  padding: 6px 8px; margin-bottom: 6px; }
+.jr-check { width: 14px; height: 14px; margin: 2px 8px 0 0; flex: none;
+  accent-color: var(--accent); cursor: pointer; }
+.jr-flag { display: inline-block; font-size: 10px; line-height: 1;
+  padding: 2px 5px; border-radius: 999px; border: 1px solid var(--border);
+  color: var(--text-3); vertical-align: 1px; }
+.jr-flag.lock { border-color: var(--warn, #b7791f); color: var(--warn, #b7791f); }
+.jr-flag.trash { border-style: dashed; }
+.tm-row-acts { margin-top: 6px; }
+.job-row.trashed { opacity: .82; }
+.tm-note { margin-bottom: 8px; font-size: 12.5px; }
+.tm-flags { margin-top: 6px; }
+.tm-purge-box { margin-top: 8px; flex-wrap: wrap; }
 .job-row .jr-err { color: var(--danger); font-size: 12px; max-width: 240px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #job-list .job-row + .job-row { }

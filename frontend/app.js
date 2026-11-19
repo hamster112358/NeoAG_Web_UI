@@ -171,6 +171,43 @@ const I18N = {
     "run.title": "Running & recent", "run.history": "Task history",
     "run.none": "Nothing is running yet. Prepare an analysis above, or ask the agent in chat.",
     "run.histnone": "No finished tasks yet.",
+    /* M11 P1-9: task management (pin/lock/trash, search/sort, bulk) */
+    "tm.search": "Search tasks...",
+    "tm.sortNew": "Newest", "tm.sortOld": "Oldest", "tm.sortName": "Name",
+    "tm.showTrash": "Trash", "tm.backToList": "Back to tasks",
+    "tm.trashEmpty": "Trash is empty.",
+    "tm.trashNote": "Trash holds RECORDS only. Nothing here deletes "
+      + "files; removal is always a manual, confirmed step.",
+    "tm.trashAge": "moved to trash {d}",
+    "tm.retentionHint": "Retention: records are kept here {d} days; "
+      + "nothing is ever removed automatically - the choice stays "
+      + "with the operator.",
+    "tm.pin": "Pin", "tm.unpin": "Unpin",
+    "tm.lock": "Lock", "tm.unlock": "Unlock",
+    "tm.trashBtn": "Trash", "tm.restore": "Restore",
+    "tm.lockedTag": "locked", "tm.pinnedTag": "pinned",
+    "tm.trashedTag": "trashed",
+    "tm.cancelFirst": "active task - cancel it before trashing",
+    "tm.lockedFirst": "locked - unlock it first",
+    "tm.purge": "Delete record forever", "tm.purgeBtn": "Delete record",
+    "tm.purgeNote": "This deletes the task RECORD (its events, "
+      + "decisions and output-manifest rows). Files under the run "
+      + "directory are NEVER removed, and anything referencing them "
+      + "keeps working. This cannot be undone - type the task id to "
+      + "confirm.",
+    "tm.bulkN": "{n} selected", "tm.bulkClear": "Clear",
+    "tm.pinned": "Task pinned", "tm.unpinned": "Task unpinned",
+    "tm.locked": "Task locked - it is now protected from trash and "
+      + "record deletion",
+    "tm.unlocked": "Task unlocked",
+    "tm.trashed": "Moved to trash (record only - files untouched)",
+    "tm.restored": "Task restored",
+    "tm.purged": "Record deleted; files were not touched",
+    "tm.trashRowClick": "Trashed record - restore it to open, or "
+      + "delete the record below (files are never removed)",
+    "tm.purgeMismatch": "Type the exact task id to confirm",
+    "tm.bulkDone": "{ok} task(s) updated",
+    "tm.bulkPart": "{ok} updated, {ref} refused (last reason: {why})",
     "dr.close": "Close", "dr.rename": "Rename", "dr.renameSave": "Save",
     "dr.renameCancel": "Cancel", "dr.renamed": "Title updated",
     "dr.id": "Task ID", "dr.created": "Created", "dr.finished": "Finished",
@@ -502,6 +539,39 @@ const I18N = {
     "run.title": "进行中与最近", "run.history": "任务历史",
     "run.none": "目前没有进行中的任务。可在上方准备新分析，或在对话中询问智能体。",
     "run.histnone": "暂无已完成的任务。",
+    /* M11 P1-9：任务管理（置顶/锁定/回收站、搜索排序、批量） */
+    "tm.search": "搜索任务…",
+    "tm.sortNew": "最新", "tm.sortOld": "最早", "tm.sortName": "名称",
+    "tm.showTrash": "回收站", "tm.backToList": "返回任务列表",
+    "tm.trashEmpty": "回收站为空。",
+    "tm.trashNote": "回收站只保存记录。此处不会删除任何文件；"
+      + "彻底移除始终是手动、需确认的步骤。",
+    "tm.trashAge": "移入回收站 {d}",
+    "tm.retentionHint": "保留期：记录在此保存 {d} 天；系统绝不会自动删除，"
+      + "决定权始终在操作者手中。",
+    "tm.pin": "置顶", "tm.unpin": "取消置顶",
+    "tm.lock": "锁定", "tm.unlock": "解锁",
+    "tm.trashBtn": "移入回收站", "tm.restore": "恢复",
+    "tm.lockedTag": "已锁定", "tm.pinnedTag": "已置顶",
+    "tm.trashedTag": "回收站",
+    "tm.cancelFirst": "任务进行中 - 请先取消再移入回收站",
+    "tm.lockedFirst": "已锁定 - 请先解锁",
+    "tm.purge": "永久删除记录", "tm.purgeBtn": "删除记录",
+    "tm.purgeNote": "这将删除任务记录（事件、决策与产物清单行）。"
+      + "运行目录中的文件绝不会被删除，引用它们的其它记录继续可用。"
+      + "此操作不可撤销 - 请输入任务 id 确认。",
+    "tm.bulkN": "已选 {n} 项", "tm.bulkClear": "清除",
+    "tm.pinned": "已置顶", "tm.unpinned": "已取消置顶",
+    "tm.locked": "已锁定 - 该任务现在受保护，不能移入回收站或删除记录",
+    "tm.unlocked": "已解锁",
+    "tm.trashed": "已移入回收站（仅记录 - 文件未动）",
+    "tm.restored": "已恢复",
+    "tm.purged": "记录已删除；文件未动",
+    "tm.trashRowClick": "回收站中的记录 - 恢复后才能打开；"
+      + "或在下方删除记录（文件永远不会被删除）",
+    "tm.purgeMismatch": "请输入准确的任务 id 以确认",
+    "tm.bulkDone": "已更新 {ok} 个任务",
+    "tm.bulkPart": "{ok} 项已更新，{ref} 项被拒绝（原因：{why}）",
     "dr.close": "关闭", "dr.rename": "重命名", "dr.renameSave": "保存",
     "dr.renameCancel": "取消", "dr.renamed": "标题已更新",
     "dr.id": "任务 ID", "dr.created": "创建于", "dr.finished": "完成于",
@@ -751,6 +821,11 @@ const state = {
   // choice) - the backend stores the two classes separately.
   techView: false,
   sseDown: true, // until the live stream says otherwise (§6 status)
+  // M11 P1-9: task management. trashMode swaps the sidebar list to
+  // the record-level trash; bulkSel holds ids selected for bulk
+  // flag actions; trashCount is refreshed on the same beats as jobs.
+  taskSearch: "", taskSort: "new", trashMode: false,
+  trashJobs: [], trashCount: null, bulkSel: new Set(),
 };
 try { state.techView = localStorage.getItem("nj_tech") === "1"; }
 catch { /* private mode */ }
@@ -949,6 +1024,9 @@ async function boot() {
     VS.load();
     // P0-8: the selected task survives a reload of the page
     state.resultsJob = VS.get("resultsJob", null);
+    // P1-9: so does the chosen list order
+    state.taskSort = VS.get("taskSort", "new");
+    $("tm-sort").value = state.taskSort;
     renderSidebar();
     await openConv(state.activeCid, true);
     restorePrep();
@@ -1644,6 +1722,13 @@ async function refreshJobs() {
     renderJobs(); renderAttention();
     // finished runs must appear in Results WITHOUT a page reload
     renderResults();
+    // P1-9: keep the open trash view (and its count) honest too
+    if (state.trashMode) {
+      const tr = await api("GET", "/api/jobs?trashed=1");
+      state.trashJobs = tr.jobs || [];
+      state.trashCount = state.trashJobs.length;
+      renderJobs();
+    }
   } catch (e) { /* transient */ }
 }
 
@@ -2791,6 +2876,19 @@ function taskDisplayNameById(id) {
   const j = (state.boot.jobs || []).find((x) => x.id === id);
   return j ? displayName(j) : id;
 }
+function jrFlags(j) {
+  const f = [];
+  if (j.pinned) f.push(`<span class="jr-flag" title="${esc(t("tm.pinnedTag"))}">pin</span>`);
+  if (j.locked) f.push(`<span class="jr-flag lock" title="${esc(t("tm.lockedTag"))}">lock</span>`);
+  if (j.trashed) f.push(`<span class="jr-flag trash" title="${esc(t("tm.trashedTag"))}">trash</span>`);
+  return f.join("");
+}
+function jrCheck(j) {
+  // research rows are not job records (P1-9): no checkbox, no flags
+  if (/^res-/.test(j.id)) return "";
+  return `<input type="checkbox" class="jr-check" data-ck="${esc(j.id)}"`
+    + `${state.bulkSel.has(j.id) ? " checked" : ""}>`;
+}
 function jobRowHtml(j) {
   const running = ACTIVE_STATES.includes(j.state);
   const bar = running && j.progress > 0
@@ -2804,23 +2902,175 @@ function jobRowHtml(j) {
   // human headline on terminal rows; the raw code stays in the tech record
   const tail = j.state === "failed" ? " - " + esc(t("fail.head"))
     : j.error ? " - " + esc(j.error) : "";
-  return `<div class="jr-main">
-      <div class="jr-name">${esc(displayName(j))}</div>
+  return `${jrCheck(j)}<div class="jr-main">
+      <div class="jr-name">${esc(displayName(j))} ${jrFlags(j)}</div>
       <div class="jr-sub">${esc(sub)}${tail}</div>
     </div>
     <div class="jr-side">${bar}${statusPill(j.state, j)}</div>`;
 }
 
+/* P1-9 helpers: search filter, sort order (pinned first in every
+   order), the bulk bar and the record-level trash view. Every
+   destructive word here means RECORDS: no UI path deletes files. */
+function tmMatch(j) {
+  const q = (state.taskSearch || "").toLowerCase();
+  if (!q) return true;
+  return `${displayName(j)} ${j.id} ${j.sample_id || ""}`
+    .toLowerCase().includes(q);
+}
+function tmSort(rows) {
+  const s = state.taskSort;
+  return rows.slice().sort((a, b) => {
+    if ((b.pinned || 0) !== (a.pinned || 0)) return (b.pinned || 0) - (a.pinned || 0);
+    if (s === "old") return (a.created_at || "").localeCompare(b.created_at || "");
+    if (s === "name") return displayName(a).localeCompare(displayName(b));
+    return (b.created_at || "").localeCompare(a.created_at || "");
+  });
+}
+function renderBulk() {
+  const bar = $("tm-bulk");
+  const n = state.bulkSel.size;
+  bar.hidden = !n;
+  if (!n) { bar.innerHTML = ""; return; }
+  const ids = [...state.bulkSel];
+  bar.innerHTML = `<span class="hint">${esc(t("tm.bulkN", { n }))}</span>`
+    + (state.trashMode
+      ? `<button class="btn sm" id="tm-b-restore">${esc(t("tm.restore"))}</button>`
+      : `<button class="btn sm" id="tm-b-pin">${esc(t("tm.pin"))}</button>`
+        + `<button class="btn sm" id="tm-b-lock">${esc(t("tm.lock"))}</button>`
+        + `<button class="btn sm danger" id="tm-b-trash">${esc(t("tm.trashBtn"))}</button>`)
+    + `<button class="btn sm ghost" id="tm-b-clear">${esc(t("tm.bulkClear"))}</button>`;
+  const bulk = async (flags) => {
+    try {
+      const res = await api("POST", "/api/jobs/flags/bulk",
+        { ids, ...flags });
+      const rr = res.results || [];
+      const bad = rr.filter((x) => !x.ok);
+      if (bad.length) {
+        toast(t("tm.bulkPart",
+          { ok: rr.length - bad.length, ref: bad.length,
+            why: bad[bad.length - 1].error || "" }), true);
+      } else {
+        toast(t("tm.bulkDone", { ok: rr.length }));
+      }
+      state.bulkSel.clear();
+      await refreshJobs();
+      if (state.trashMode) await refreshTrash();
+    } catch (e) { toast(e.message, true); }
+  };
+  const wire = (id, fn) => { const b = $(id); if (b) b.addEventListener("click", fn); };
+  wire("tm-b-pin", () => bulk({ pinned: true }));
+  wire("tm-b-lock", () => bulk({ locked: true }));
+  wire("tm-b-trash", () => bulk({ trashed: true }));
+  wire("tm-b-restore", () => bulk({ trashed: false }));
+  wire("tm-b-clear", () => { state.bulkSel.clear(); renderJobs(); });
+}
+
+function mountPurgeConfirm(container, id) {
+  // explicit confirmation: the task id must be TYPED back; the call
+  // repeats it server-side, where the rule is enforced again. Files
+  // are never part of this - the label says so in both languages.
+  container.innerHTML = `<div class="conf-row tm-purge-box">
+    <div class="hint">${esc(t("tm.purgeNote"))}</div>
+    <input class="tm-purge-in" placeholder="${esc(id)}" style="max-width:260px">
+    <button class="btn sm danger tm-purge-go">${esc(t("tm.purgeBtn"))}</button>
+  </div>`;
+  const inEl = container.querySelector(".tm-purge-in");
+  const goEl = container.querySelector(".tm-purge-go");
+  inEl.focus();
+  goEl.addEventListener("click", async (ev) => {
+    ev.stopPropagation();
+    const val = inEl.value.trim();
+    if (val !== id) { toast(t("tm.purgeMismatch"), true); return; }
+    try {
+      await api("POST", `/api/jobs/${encodeURIComponent(id)}/purge`,
+        { confirm: id });
+      toast(t("tm.purged"));
+      state.bulkSel.delete(id);
+      if (state.resultsJob === id) state.resultsJob = null;
+      await refreshTrash();
+      await refreshJobs();
+      renderResults();
+    } catch (e) { toast(e.message, true); }
+  });
+  container.addEventListener("click", (ev) => ev.stopPropagation());
+}
+
+async function refreshTrash() {
+  try {
+    const r = await api("GET", "/api/jobs?trashed=1");
+    state.trashJobs = r.jobs || [];
+    state.trashCount = state.trashJobs.length;
+  } catch { /* transient */ }
+  renderJobs();
+}
+
 function renderJobs() {
+  const host = $("job-list");
+  const tt = $("tm-trash-toggle");
+  tt.textContent = state.trashMode ? t("tm.backToList") : t("tm.showTrash");
+  tt.classList.toggle("active", state.trashMode);
+  $("tm-trash-count").textContent =
+    state.trashCount ? `(${state.trashCount})` : "";
+  if (state.trashMode) {
+    // P1-9 trash: records only, restore always available, and the
+    // one destructive action (record purge) behind a typed
+    // confirmation. Rows do NOT open Results - a trashed record is
+    // restored first, which is also the honest signal of intent.
+    $("history-block").hidden = true;
+    const rows = tmSort((state.trashJobs || []).filter(tmMatch));
+    host.innerHTML = `<div class="alert info tm-note">${esc(t("tm.trashNote"))}
+      ${esc(t("tm.retentionHint", { d: ((state.boot || {}).settings || {})
+        .trash_retention_days || 30 }))}</div>`
+      + (rows.length ? rows.map((j) => `<div class="job-row trashed"
+          data-trash="${esc(j.id)}">${jobRowHtml(j)}
+          ${j.trashed_at ? `<div class="jr-sub hint">${esc(t("tm.trashAge", { d: j.trashed_at }))}</div>` : ""}
+          <div class="btnrow tm-row-acts">
+            <button class="btn sm" data-restore="${esc(j.id)}">${esc(t("tm.restore"))}</button>
+            <button class="btn sm danger" data-purge="${esc(j.id)}">${esc(t("tm.purge"))}</button>
+          </div></div>`).join("")
+        : `<div class="empty">${esc(t("tm.trashEmpty"))}</div>`);
+    document.querySelectorAll("[data-trash]").forEach((el) =>
+      el.addEventListener("click", (ev) => {
+        if (ev.target.closest(".tm-row-acts,.tm-purge-box,.jr-check")) return;
+        toast(t("tm.trashRowClick"));
+      }));
+    document.querySelectorAll("[data-restore]").forEach((b) =>
+      b.addEventListener("click", async (ev) => {
+        ev.stopPropagation();
+        try {
+          await api("POST",
+            `/api/jobs/${encodeURIComponent(b.dataset.restore)}/flags`,
+            { trashed: false });
+          toast(t("tm.restored"));
+          await refreshTrash();
+          await refreshJobs();
+        } catch (e) { toast(e.message, true); }
+      }));
+    document.querySelectorAll("[data-purge]").forEach((b) =>
+      b.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const row = b.closest("[data-trash]");
+        const old = row.querySelector(".tm-purge-wrap");
+        if (old) { old.remove(); return; }
+        const wrap = document.createElement("div");
+        wrap.className = "tm-purge-wrap";
+        row.appendChild(wrap);
+        mountPurgeConfirm(wrap, b.dataset.purge);
+      }));
+    renderBulk();
+    wireChecks();
+    return;
+  }
+  $("history-block").hidden = false;
   const kind = state.kindFilter;
   const all = (state.boot.jobs || []).filter((j) => {
     if (!kind) return true;
     if (kind === "analysis") return j.kind === "analysis" || j.kind === "neoag-native-run";
     return j.kind === kind;
-  });
-  const active = all.filter((j) => ACTIVE_STATES.includes(j.state));
-  const past = all.filter((j) => !ACTIVE_STATES.includes(j.state));
-  const host = $("job-list");
+  }).filter(tmMatch);
+  const active = tmSort(all.filter((j) => ACTIVE_STATES.includes(j.state)));
+  const past = tmSort(all.filter((j) => !ACTIVE_STATES.includes(j.state)));
   const rowCls = (j) => state.resultsJob === j.id ? "selected" : "";
   host.innerHTML = active.length ? active.map((j) =>
     `<div class="job-row ${rowCls(j)}"
@@ -2835,6 +3085,19 @@ function renderJobs() {
   // pointer card there with an explicit "open in Discovery" action.
   document.querySelectorAll("[data-job]").forEach((el) =>
     el.addEventListener("click", () => openJob(el.dataset.job)));
+  renderBulk();
+  wireChecks();
+}
+
+function wireChecks() {
+  document.querySelectorAll(".jr-check").forEach((cb) => {
+    cb.addEventListener("click", (ev) => ev.stopPropagation());
+    cb.addEventListener("change", () => {
+      if (cb.checked) state.bulkSel.add(cb.dataset.ck);
+      else state.bulkSel.delete(cb.dataset.ck);
+      renderBulk();
+    });
+  });
 }
 
 document.querySelectorAll("#kind-filter .chip").forEach((c) =>
@@ -2846,6 +3109,24 @@ document.querySelectorAll("#kind-filter .chip").forEach((c) =>
     VS.set("kindFilter", c.dataset.kind);
     renderJobs();
   }));
+
+/* P1-9 toolbar: search + sort apply to whatever list is shown; the
+   trash toggle swaps the same list to the record-level trash. */
+$("tm-search").addEventListener("input", () => {
+  state.taskSearch = $("tm-search").value.trim();
+  renderJobs();
+});
+$("tm-sort").addEventListener("change", () => {
+  state.taskSort = $("tm-sort").value;
+  VS.set("taskSort", state.taskSort);
+  renderJobs();
+});
+$("tm-trash-toggle").addEventListener("click", () => {
+  state.trashMode = !state.trashMode;
+  state.bulkSel.clear();
+  if (state.trashMode) refreshTrash();
+  else renderJobs();
+});
 
 /* M11 P0-8: ONE place per task. The former drawer is gone - clicking a
    task in Tasks opens Results with that task selected, and Results
@@ -2895,7 +3176,34 @@ function taskHeadHtml(job, task) {
         ${!["completed", "failed", "cancelled"].includes(job.state) ? "" : "disabled"}
         title="${task && task.native && task.native.profile === "gateway" ? esc(t("dr.cancelNote")) : ""}">${esc(t("dr.cancel"))}</button>
     </div>
+    ${taskFlagsRow(job)}
     <div id="th-rename-box"></div>
+    <div id="th-purge-box"></div>
+  </div>`;
+}
+
+/* P1-9: the record-management row. Buttons state WHY they are
+   disabled (cancel-first, locked) instead of silently graying out;
+   the trash action says "record", and the purge confirmation repeats
+   that files are never part of it. */
+function taskFlagsRow(job) {
+  const active = ACTIVE_STATES.includes(job.state);
+  const trashDisabled = job.locked || active || job.trashed;
+  const trashWhy = job.trashed ? ""
+    : job.locked ? t("tm.lockedFirst")
+      : active ? t("tm.cancelFirst") : "";
+  return `<div class="btnrow tm-flags">
+    <button class="btn sm ghost" id="th-pin">${esc(t(job.pinned ? "tm.unpin" : "tm.pin"))}</button>
+    <button class="btn sm ghost" id="th-lock">${esc(t(job.locked ? "tm.unlock" : "tm.lock"))}</button>
+    ${job.trashed
+      ? `<span class="pill warn">${esc(t("tm.trashedTag"))}</span>
+         <button class="btn sm" id="th-restore">${esc(t("tm.restore"))}</button>`
+      : `<button class="btn sm danger" id="th-trash"
+          ${trashDisabled ? "disabled" : ""}
+          title="${esc(trashWhy)}">${esc(t("tm.trashBtn"))}</button>`}
+    ${job.trashed ? `<button class="btn sm danger" id="th-purge"
+        ${job.locked ? "disabled" : ""}
+        title="${job.locked ? esc(t("tm.lockedFirst")) : ""}">${esc(t("tm.purge"))}</button>` : ""}
   </div>`;
 }
 
@@ -2924,6 +3232,33 @@ function wireTaskHead(job) {
   $("th-pause").addEventListener("click", () => api("POST", `/api/jobs/${id}/pause`, {}).then(refreshJobs));
   $("th-resume").addEventListener("click", () => api("POST", `/api/jobs/${id}/resume`, {}).then(refreshJobs));
   $("th-cancel").addEventListener("click", () => api("POST", `/api/jobs/${id}/cancel`, {}).then(refreshJobs));
+  // P1-9: record flags through the same single-rule endpoint the
+  // bulk path uses; the server enforces cancel-first/locked again.
+  const flag = (bid, body, okMsg) => {
+    const b = $(bid);
+    if (!b || b.disabled) return;
+    b.addEventListener("click", async () => {
+      try {
+        await api("POST", `/api/jobs/${encodeURIComponent(id)}/flags`,
+          body);
+        toast(okMsg);
+        await refreshJobs();
+        renderResults();
+      } catch (e) { toast(e.message, true); }
+    });
+  };
+  flag("th-pin", { pinned: !job.pinned },
+    t(job.pinned ? "tm.unpinned" : "tm.pinned"));
+  flag("th-lock", { locked: !job.locked },
+    t(job.locked ? "tm.unlocked" : "tm.locked"));
+  flag("th-trash", { trashed: true }, t("tm.trashed"));
+  flag("th-restore", { trashed: false }, t("tm.restored"));
+  const pb = $("th-purge");
+  if (pb && !pb.disabled) pb.addEventListener("click", () => {
+    const box = $("th-purge-box");
+    if (box.innerHTML) { box.innerHTML = ""; return; }
+    mountPurgeConfirm(box, id);
+  });
 }
 
 /* the former drawer's technical record, kept verbatim in content:

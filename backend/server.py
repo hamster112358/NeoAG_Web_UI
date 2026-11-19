@@ -171,6 +171,12 @@ def job_public(job: dict) -> dict:
     j["spec"] = json.loads(job.get("spec_json") or "{}")
     # M9 §8 presentation fields (derived; id/sample_id stay canonical)
     j["display_title"] = str(job.get("display_title") or "")
+    # M11 P1-9 task-management flags (record metadata; files and the
+    # audit trail are outside their reach by construction)
+    j["pinned"] = int(job.get("pinned") or 0)
+    j["locked"] = int(job.get("locked") or 0)
+    j["trashed"] = int(job.get("trashed") or 0)
+    j["trashed_at"] = str(job.get("trashed_at") or "")
     j.update(task_name_parts(job.get("kind") or "task", j["spec"],
                              job.get("sample_id") or ""))
     return j
@@ -237,6 +243,11 @@ def research_task_rows(store) -> list[dict]:
                     "approval_id": None,
                     "conv_id": r.get("conv_id") or "",
                     "outcome": outcome, "spec": {},
+                    # P1-9: research rows are not job records - the
+                    # management flags do not apply to them (the API
+                    # refuses them by id), the UI hides the controls.
+                    "pinned": 0, "locked": 0, "trashed": 0,
+                    "trashed_at": "",
                     # M9 §8: research rows carry their scope/target as
                     # the display metadata (engine names stay internal)
                     "display_title": str(r.get("display_title") or ""),
@@ -245,13 +256,63 @@ def research_task_rows(store) -> list[dict]:
     return out
 
 
-def unified_tasks(store, limit: int = 50) -> list[dict]:
+def unified_tasks(store, limit: int = 50, trash: str = "normal") -> list[dict]:
     """One chronological list: analyses + partial stages + research,
-    regardless of which interface started them (§1.2)."""
-    rows = [job_public(j) for j in store.job_list(200)]
-    rows += research_task_rows(store)
+    regardless of which interface started them (§1.2). P1-9: trashed
+    records are excluded by default; the trash view asks explicitly.
+    Research rows are never trashed, so they appear in the normal
+    listing only."""
+    rows = [job_public(j) for j in store.job_list(200, trash=trash)]
+    if trash != "only":
+        rows += research_task_rows(store)
     rows.sort(key=lambda x: x.get("created_at") or "", reverse=True)
     return rows[:limit]
+
+
+ACTIVE_TASK_STATES = ("queued", "running", "paused", "blocked")
+
+
+def apply_job_flags(jid: str, body: dict) -> tuple[int, dict]:
+    """M11 P1-9: the ONE flag rule, used by the single-task endpoint
+    and the bulk endpoint alike (bulk must never be laxer than
+    individual). pinned/locked are plain record metadata; trashing is
+    refused while the task is ACTIVE (cancel first - validated, not
+    implicit) and while LOCKED (that is the lock's whole purpose).
+    None of this touches files; every accepted change is audited."""
+    j = store.job_get(jid)
+    if not j:
+        return 404, {"error": "no such job"}
+    fields = {}
+    if "pinned" in body:
+        fields["pinned"] = 1 if body.get("pinned") else 0
+    if "locked" in body:
+        fields["locked"] = 1 if body.get("locked") else 0
+    if "trashed" in body:
+        want = 1 if body.get("trashed") else 0
+        if want:
+            if fields.get("locked", int(j.get("locked") or 0)):
+                return 409, {"error": "locked: unlock the task before "
+                                      "moving it to trash"}
+            if j["state"] in ACTIVE_TASK_STATES:
+                return 409, {"error": "active task: cancel it before "
+                                      "moving it to trash"}
+            fields["trashed"] = 1
+            fields["trashed_at"] = now()
+        else:
+            fields["trashed"] = 0
+            fields["trashed_at"] = ""
+    if not fields:
+        return 400, {"error": "no flags given"}
+    store.job_set(jid, **fields)
+    store.audit("user", "task.flags.set", jid, dict(fields))
+    publish({"type": "job", "id": jid})
+    fresh = store.job_get(jid) or {}
+    return 200, {"ok": True, "id": jid,
+                 "flags": {"pinned": int(fresh.get("pinned") or 0),
+                           "locked": int(fresh.get("locked") or 0),
+                           "trashed": int(fresh.get("trashed") or 0),
+                           "trashed_at": str(fresh.get("trashed_at")
+                                             or "")}}
 
 
 def task_detail(store, job: dict) -> dict:
@@ -737,6 +798,17 @@ class Handler(BaseHTTPRequestHandler):
                            "conv_id": j["conv_id"],
                            "detail_url": f"/api/tasks/{j['id']}"}
                           for j in rows[:lim]]})
+        if path == "/api/jobs":
+            # P1-9: the jobs list with the trash as an explicit
+            # listing dimension (?trashed=1 shows only trashed
+            # records; the default never does). Research rows have no
+            # trash state and are not job records - this endpoint
+            # lists jobs only.
+            tv = (q.get("trashed") or ["0"])[0]
+            trash = {"1": "only", "all": "all"}.get(tv, "normal")
+            rows = [job_public(j) for j in store.job_list(200,
+                                                          trash=trash)]
+            return self._json(200, {"jobs": rows})
         if path == "/api/tasks/active":
             # B2: which run belongs to THIS conversation? Never guess the
             # most-recent job: no conv link -> empty list, not a fallback.
@@ -1467,6 +1539,65 @@ class Handler(BaseHTTPRequestHandler):
                 if not res:
                     return self._json(409, {"error": "mode switch not possible"})
                 return self._json(200, res)
+            if path == "/api/jobs/flags/bulk":
+                # P1-9: bulk is the SAME rule per id, never a laxer
+                # path - the caller gets one honest result line per
+                # requested id (partial success is visible, never
+                # smoothed over).
+                ids = body.get("ids")
+                if not isinstance(ids, list) or not ids:
+                    return self._json(400, {"error": "ids required"})
+                if len(ids) > 100:
+                    return self._json(400, {"error": "too many ids "
+                                                     "(max 100)"})
+                flags_body = {k: v for k, v in body.items()
+                              if k in ("pinned", "locked", "trashed")}
+                if not flags_body:
+                    return self._json(400, {"error": "no flags given"})
+                results = []
+                for i_ in ids[:100]:
+                    st_, pay = apply_job_flags(str(i_), flags_body)
+                    results.append({"id": str(i_), "ok": st_ == 200,
+                                    "status": st_,
+                                    **({} if st_ == 200 else
+                                       {"error": pay.get("error", "")})})
+                return self._json(200, {"results": results})
+            if path.startswith("/api/jobs/") and path.endswith("/flags"):
+                jid = path.split("/")[3]
+                st_, pay = apply_job_flags(jid, body)
+                return self._json(st_, pay)
+            if path.startswith("/api/jobs/") and path.endswith("/purge"):
+                # P1-9: permanent RECORD deletion behind an explicit
+                # confirmation (confirm must repeat the job id - a
+                # bare {confirm:true} is refused). Locked and active
+                # jobs are refused; FILES ARE NEVER TOUCHED, so a
+                # shared artifact keeps its file and its other
+                # references keep working no matter what is purged.
+                jid = path.split("/")[3]
+                j = store.job_get(jid)
+                if not j:
+                    return self._json(404, {"error": "no such job"})
+                if int(j.get("locked") or 0):
+                    return self._json(409, {"error": "locked task: "
+                                                     "unlock first"})
+                if j["state"] in ACTIVE_TASK_STATES:
+                    return self._json(409, {"error": "active task: "
+                                                     "cancel first"})
+                if str(body.get("confirm") or "") != jid:
+                    return self._json(400, {"error": "type the task id "
+                                                     "to confirm; record "
+                                                     "deletion only - "
+                                                     "files are never "
+                                                     "removed"})
+                snap = store.job_purge(jid)
+                if not snap:
+                    return self._json(404, {"error": "no such job"})
+                store.audit("user", "task.purged", jid,
+                            {**snap, "files_touched": False})
+                publish({"type": "job", "id": jid})
+                return self._json(200, {"ok": True, "id": jid,
+                                        "removed": snap["removed_rows"],
+                                        "files_touched": False})
             if path.startswith("/api/jobs/") and path.endswith("/title"):
                 # M9 §8: rename the DISPLAY title only. The job id,
                 # sample_id, spec and audit trail are untouched - this
@@ -1572,7 +1703,11 @@ class Handler(BaseHTTPRequestHandler):
                                      # M9 §3: the chosen UI language
                                      # persists server-side too, so a
                                      # new browser sees the same default
-                                     "language")})
+                                     "language",
+                                     # P1-9: how long the trash view
+                                     # says records are kept; removal
+                                     # is ALWAYS a manual action
+                                     "trash_retention_days")})
                 store.setting_set("ui", cur)
                 store.audit("user", "settings.update", "ui", cur)
                 return self._json(200, cur)
