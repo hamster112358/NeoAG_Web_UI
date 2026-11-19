@@ -281,7 +281,8 @@ class DemoAgent:
             return self._conv.setdefault(
                 conv_id, {"job": None, "busy": False, "seen": set(),
                           "ops": set(), "replies": {}, "delivered": set(),
-                          "kick": None, "stop": False,
+                          "kick": None, "stop": False, "conv": conv_id,
+                          "activity": "",
                           # M7 §6 delivery repair: what this turn must
                           # deliver, and whether it already got its one
                           # automatic session-restore
@@ -458,6 +459,10 @@ class DemoAgent:
                 "Earlier context is available, but the agent process "
                 "itself is new.",
                 {"badges": ["real agent", "integration note"]}, conv_id))
+        # M11 P0-1: the kickoff is EXECUTION bookkeeping (audit row),
+        # the conversation itself stays clean; the live turn (state,
+        # time, meaningful activity label) rides on the conversation
+        # row and renders as the one compact indicator.
         kick = self.store.msg_add(
             "agent",
             f"Real agent {started} (job {str(job_id)[:8]}...). Its tool "
@@ -466,9 +471,10 @@ class DemoAgent:
             "confirmation card before anything changes.",
             {"badges": ["real agent", "streaming"],
              "source": "codebuddy", "job_id": job_id,
-             "turn_state": "streaming"}, conv_id)
+             "turn_state": "streaming"}, conv_id, visibility="audit")
         st["kick"] = kick["id"]
-        msgs.append(kick)
+        st["conv"] = conv_id
+        self.store.conv_set_turn(conv_id, "streaming", "")
         threading.Thread(target=self._turn, args=(conv_id,),
                          daemon=True).start()
         return msgs
@@ -476,19 +482,23 @@ class DemoAgent:
     TURN_MAX_SECONDS = 900   # module-level for testability
 
     def _finish_turn(self, st: dict, turn_state: str) -> None:
-        """Take the turn's kickoff notice out of 'streaming' into an
-        honest terminal state (persisted, so reloads show it too)."""
+        """End the turn honestly: the CONVERSATION row (the live
+        indicator's source) leaves 'streaming' for the terminal state,
+        and the kickoff audit row's meta mirrors it (so the technical
+        view stays truthful after reloads). Both writes persist, so a
+        reload shows the same state."""
+        cid = st.get("conv")
+        if cid:
+            self.store.conv_set_turn(cid, turn_state, "")
         kid = st.get("kick")
-        if not kid:
-            return
-        for m in self.store.msg_list(500):
-            if m["id"] == kid:
+        if kid:
+            m = self.store.msg_get(kid)
+            if m:
                 meta = m["meta"]
                 meta["turn_state"] = turn_state
                 meta["badges"] = [b for b in meta.get("badges", [])
                                   if b != "streaming"] + [turn_state]
                 self.store.msg_set_meta(kid, meta)
-                break
         st["kick"] = None
 
     def _turn(self, conv_id: str, max_seconds: int | None = None) -> None:
@@ -501,6 +511,7 @@ class DemoAgent:
         HTML entities leak into the UI)."""
         from .server import publish
         st = self._cstate(conv_id)
+        st["conv"] = conv_id
         client = self._client
         job_id = st["job"]
         if not job_id:
@@ -625,9 +636,17 @@ class DemoAgent:
                                 "tool_status": status,
                                 "tool_title": title}
                         if kind == "tool_call":
-                            # body stays the short running line; the UI
-                            # renders this collapsed under the title
+                            # body stays the short running line; the
+                            # technical view renders this collapsed
+                            # under the title
                             body = f"[running] {title}"
+                            # one compact live indicator: the meaningful
+                            # activity label rides on the conversation
+                            # (never counts in the default chat)
+                            if title != st.get("activity"):
+                                st["activity"] = title
+                                self.store.conv_set_turn(
+                                    conv_id, "streaming", title)
                         else:
                             raw = u.get("rawOutput")
                             if isinstance(raw, dict):
@@ -638,7 +657,11 @@ class DemoAgent:
                             body = f"[tool {status}] {out}"
                             meta["tool_output"] = out
                             self._scan_gate_confirm(u, conv_id, st)
-                        self.store.msg_add("tool", body, meta, conv_id)
+                        # M11 P0-1: the full per-call execution record
+                        # is persisted as an audit row - durable,
+                        # complete, but NOT conversation noise
+                        self.store.msg_add("tool", body, meta, conv_id,
+                                           visibility="audit")
                         publish({"type": "chat", "conv_id": conv_id})
                     elif kind == "agent_message_chunk":
                         mid = str(u.get("messageId") or "")
@@ -893,8 +916,11 @@ class DemoAgent:
                     "relaying the agent's response.",
                     {"badges": ["real agent", "streaming"],
                      "source": "codebuddy", "job_id": job_id,
-                     "turn_state": "streaming"}, conv_id)
+                     "turn_state": "streaming"}, conv_id,
+                    visibility="audit")
                 st["kick"] = kick["id"]
+                st["conv"] = conv_id
+                self.store.conv_set_turn(conv_id, "streaming", "")
                 threading.Thread(target=self._turn, args=(conv_id,),
                                  daemon=True).start()
         except Exception as e:

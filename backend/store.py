@@ -178,12 +178,67 @@ class Store:
                 "TEXT DEFAULT ''",
                 "ALTER TABLE research ADD COLUMN display_title "
                 "TEXT DEFAULT ''",
+                # Milestone 11 P0-1: conversation vs execution separation.
+                # Every message carries a visibility class: 'chat' rows
+                # are the conversation (user messages, substantive agent
+                # replies, important notices, final outcomes); 'audit'
+                # rows are the execution record (per-tool events, turn
+                # kickoffs) - still persisted, no longer conversation.
+                # The conversation row additionally tracks the LIVE turn
+                # so the interface shows one honest indicator instead of
+                # a wall of tool rows.
+                "ALTER TABLE messages ADD COLUMN visibility "
+                "TEXT DEFAULT 'chat'",
+                "ALTER TABLE conversations ADD COLUMN turn_state "
+                "TEXT DEFAULT ''",
+                "ALTER TABLE conversations ADD COLUMN turn_ts "
+                "TEXT DEFAULT ''",
+                "ALTER TABLE conversations ADD COLUMN activity "
+                "TEXT DEFAULT ''",
             ):
                 try:
                     self.db.execute(stmt)
                 except sqlite3.OperationalError:
                     pass  # column already present
             self.db.commit()
+            self._m11_p01_backfill()
+
+    def _m11_p01_backfill(self) -> None:
+        """One-time migration of pre-M11 rows (idempotent, recorded in
+        settings). Existing tool events and turn kickoffs become audit
+        rows - nothing is deleted, the full audit record is preserved
+        and stays reachable through the technical view. The last
+        persisted turn_state per conversation is mirrored onto the
+        conversation row."""
+        if self.setting("m11_p01_visibility", None) is not None:
+            return
+        with self.lock:
+            self.db.execute(
+                "UPDATE messages SET visibility='audit' WHERE "
+                "json_extract(meta_json,'$.kind')='tool' OR "
+                "json_extract(meta_json,'$.turn_state') IS NOT NULL")
+            # mirror the newest turn_state of each conversation (only
+            # where the conversation row has none yet)
+            for r in self.db.execute(
+                    "SELECT conv_id, MAX(id) AS last_id FROM messages "
+                    "WHERE json_extract(meta_json,'$.turn_state') "
+                    "IS NOT NULL AND conv_id <> '' GROUP BY conv_id"):
+                cur = self.db.execute(
+                    "SELECT c.turn_state AS ts FROM conversations c "
+                    "WHERE c.id=?", (r["conv_id"],)).fetchone()
+                if cur is None or (cur["ts"] or ""):
+                    continue  # unknown conv, or state already present
+                m = self.db.execute(
+                    "SELECT meta_json, ts FROM messages WHERE id=?",
+                    (r["last_id"],)).fetchone()
+                st = json.loads(m["meta_json"] or "{}").get("turn_state")
+                if st:
+                    self.db.execute(
+                        "UPDATE conversations SET turn_state=?, "
+                        "turn_ts=? WHERE id=?", (st, m["ts"],
+                                                 r["conv_id"]))
+            self.db.commit()
+        self.setting_set("m11_p01_visibility", 1)
 
     def n_jobs_in_states(self, states: tuple) -> int:
         q = ("SELECT COUNT(*) AS n FROM jobs WHERE state IN ("
@@ -372,6 +427,24 @@ class Store:
                                 "WHERE id=?", (now(), cid))
             self.db.commit()
 
+    def conv_set_turn(self, cid: str, turn_state: str,
+                      activity: str | None = None) -> None:
+        """Live turn record for one conversation (M11 P0-1): state
+        ('streaming' / terminal label), when it entered this state, and
+        a HUMAN-READABLE activity label (what the agent is working on -
+        a meaningful phrase, never a call count)."""
+        with self.lock:
+            if activity is None:
+                self.db.execute(
+                    "UPDATE conversations SET turn_state=?, turn_ts=? "
+                    "WHERE id=?", (turn_state, now(), cid))
+            else:
+                self.db.execute(
+                    "UPDATE conversations SET turn_state=?, turn_ts=?, "
+                    "activity=? WHERE id=?", (turn_state, now(),
+                                              activity[:120], cid))
+            self.db.commit()
+
     def conv_set_title(self, cid: str, title: str) -> dict | None:
         with self.lock:
             self.db.execute("UPDATE conversations SET title=?, updated_at=? "
@@ -409,17 +482,31 @@ class Store:
 
     # ---------- messages ----------
     def msg_add(self, role: str, text: str, meta: dict | None = None,
-                conv_id: str = "") -> dict:
+                conv_id: str = "", visibility: str = "chat") -> dict:
+        """visibility: 'chat' = part of the conversation the user reads;
+        'audit' = execution record (tool events, turn kickoffs) - stored
+        durably, shown only in the technical view."""
         with self.lock:
             cur = self.db.execute(
-                "INSERT INTO messages(ts,role,text,meta_json,conv_id) "
-                "VALUES(?,?,?,?,?)",
+                "INSERT INTO messages(ts,role,text,meta_json,conv_id,"
+                "visibility) VALUES(?,?,?,?,?,?)",
                 (now(), role, text, json.dumps(meta or {}, ensure_ascii=False),
-                 conv_id))
+                 conv_id, visibility))
             self.db.commit()
             mid = cur.lastrowid
         return {"id": mid, "ts": now(), "role": role, "text": text,
-                "meta": meta or {}, "conv_id": conv_id}
+                "meta": meta or {}, "conv_id": conv_id,
+                "visibility": visibility}
+
+    def msg_get(self, msg_id: int) -> dict | None:
+        with self.lock:
+            row = self.db.execute("SELECT * FROM messages WHERE id=?",
+                                  (msg_id,)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["meta"] = json.loads(d.pop("meta_json") or "{}")
+        return d
 
     def msg_set_meta(self, msg_id: int, meta: dict) -> None:
         """Replace one message's meta (used to take a real-agent kickoff
@@ -431,9 +518,11 @@ class Store:
             self.db.commit()
 
     def msg_sweep_stale_streaming(self) -> int:
-        """Startup honesty sweep: any persisted message still labelled
+        """Startup honesty sweep: any persisted turn still labelled
         'streaming' belongs to a relay that died with the previous
-        server process - mark it terminal, do not resurrect it."""
+        server process - mark it terminal, do not resurrect it. Covers
+        both the audit kickoff rows and the conversation-level turn
+        (M11 P0-1: the live indicator reads the conversation row)."""
         n = 0
         with self.lock:
             for r in self.db.execute(
@@ -448,15 +537,32 @@ class Store:
                         "UPDATE messages SET meta_json=? WHERE id=?",
                         (json.dumps(meta, ensure_ascii=False), r["id"]))
                     n += 1
+            for r in self.db.execute(
+                    "SELECT id FROM conversations "
+                    "WHERE turn_state='streaming'").fetchall():
+                self.db.execute(
+                    "UPDATE conversations SET turn_state=?, turn_ts=?, "
+                    "activity='' WHERE id=?",
+                    ("interrupted by server restart", now(), r["id"]))
+                n += 1
             self.db.commit()
         return n
 
-    def msg_list(self, limit: int = 200, conv_id: str | None = None) -> list[dict]:
+    def msg_list(self, limit: int = 200, conv_id: str | None = None,
+                 visibility: str | None = "chat") -> list[dict]:
+        """visibility='chat' (default) returns only conversation rows;
+        None returns everything incl. the audit/execution rows (the
+        technical view and internal relay logic use this)."""
         q = "SELECT * FROM messages"
-        args: list = []
+        where, args = [], []
         if conv_id is not None:
-            q += " WHERE conv_id=?"
+            where.append("conv_id=?")
             args.append(conv_id)
+        if visibility is not None:
+            where.append("visibility=?")
+            args.append(visibility)
+        if where:
+            q += " WHERE " + " AND ".join(where)
         q += " ORDER BY id DESC LIMIT ?"
         args.append(limit)
         with self.lock:

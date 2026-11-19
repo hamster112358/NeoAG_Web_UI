@@ -82,7 +82,9 @@ def new_conv(title):
 
 
 def texts(cid):
-    return [m["text"] for m in store.msg_list(500)
+    # raw storage: this suite tests relay behavior across BOTH
+    # visibility classes (M11 P0-1 stores tool/kick rows as 'audit')
+    return [m["text"] for m in store.msg_list(500, visibility=None)
             if m.get("conv_id") == cid]
 
 

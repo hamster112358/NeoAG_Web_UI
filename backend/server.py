@@ -643,8 +643,15 @@ class Handler(BaseHTTPRequestHandler):
             conv = store.conv_get(cid)
             if not conv or conv.get("deleted"):
                 return self._json(404, {"error": "no such conversation"})
-            return self._json(200, {"conversation": conv,
-                                    "messages": store.msg_list(400, cid)})
+            # M11 P0-1: the conversation the user reads vs the execution
+            # record behind it. ?include=audit is the optional technical
+            # view; the default payload is the conversation only.
+            want_audit = "audit" in (q.get("include") or [])
+            return self._json(200, {
+                "conversation": conv,
+                "messages": store.msg_list(
+                    1000 if want_audit else 400, cid,
+                    visibility=None if want_audit else "chat")})
         if path == "/api/help":
             return self._json(200, {"docs": [
                 {"name": k, "title": v["title"],

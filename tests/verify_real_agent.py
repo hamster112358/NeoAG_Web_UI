@@ -131,31 +131,37 @@ def wait_gate_card(cl, cid, timeout=480, min_created=""):
     return None
 
 
-def wait_kick_state(cl, cid, kick_id, timeout=120):
-    """REGRESSION helper: poll until the turn's kickoff message leaves
-    'streaming'. The stalled-chat bug = this never happening."""
+def wait_kick_state(cl, cid, kick_id=None, timeout=120):
+    """REGRESSION helper (M11 P0-1 contract): poll until the
+    conversation's LIVE TURN leaves 'streaming' - turn state now lives
+    on the conversation row, not on a kickoff message. The stalled-chat
+    bug = this never happening."""
     t0 = time.time()
     while time.time() - t0 < timeout:
         time.sleep(2)
-        for m in cl.req("GET", f"/api/conversations/{cid}")["messages"]:
-            if m["id"] == kick_id:
-                ts = m["meta"].get("turn_state")
-                if ts and ts != "streaming":
-                    return ts
+        conv = cl.req("GET", f"/api/conversations/{cid}")["conversation"]
+        ts = conv.get("turn_state") or ""
+        if ts and ts != "streaming":
+            return ts
     return "TIMEOUT_STILL_STREAMING"
 
 
-def kick_of(resp):
-    k = [m for m in resp["messages"]
-         if (m.get("meta") or {}).get("turn_state") == "streaming"]
-    return k[-1]["id"] if k else -1
+def max_id(cl, cid):
+    """Highest stored message id INCLUDING audit rows (the execution
+    record) - the 'before this turn' cursor for wait_tool_running."""
+    msgs = cl.req("GET", f"/api/conversations/{cid}?include=audit")[
+        "messages"]
+    return max([m["id"] for m in msgs], default=0)
 
 
-def wait_tool_running(cl, cid, since, timeout=90):
+def wait_tool_running(cl, cid, since=0, timeout=90):
+    # M11 P0-1: per-call tool events are the opt-in execution record.
     t0 = time.time()
     while time.time() - t0 < timeout:
         time.sleep(2)
-        for m in cl.req("GET", f"/api/conversations/{cid}")["messages"]:
+        for m in cl.req(
+                "GET", f"/api/conversations/{cid}?include=audit")[
+                "messages"]:
             if m["role"] == "tool" and m["id"] > since and "[running]" in m["text"]:
                 return True
     return False
@@ -303,15 +309,20 @@ def main():
             "text": "Use Bash right now, no questions: run exactly "
                     "'sleep 45 && echo SLEPT-9' and then report its "
                     "output."})
-        r7_cid, r7_kick = r7["conv_id"], kick_of(r7)
-        check("R7 streaming kickoff carries turn_state", r7_kick > 0)
-        r7_job = cl.req("GET", f"/api/conversations/{r7_cid}")[
-            "conversation"]["job_id"]
+        r7_cid = r7["conv_id"]
+        r7_view = cl.req("GET", f"/api/conversations/{r7_cid}")
+        check("R7 live turn: turn_state on the conversation (M11 P0-1)",
+              r7_view["conversation"].get("turn_state") == "streaming",
+              str(r7_view["conversation"].get("turn_state")))
+        check("R7 conversation rows carry NO execution rows (M11 P0-1)",
+              all(m.get("visibility", "chat") == "chat"
+                  for m in r7_view["messages"]))
+        r7_job = r7_view["conversation"]["job_id"]
         CLEANUP_JOBS.add(r7_job)
-        started = wait_tool_running(cl, r7_cid, r7_kick)
+        started = wait_tool_running(cl, r7_cid, max_id(cl, r7_cid))
         check("R7 agent job started working (repro precondition)", started)
         gw.stop(r7_job)          # hard-stop the live job mid-turn
-        ts = wait_kick_state(cl, r7_cid, r7_kick)
+        ts = wait_kick_state(cl, r7_cid)
         check("R7 stopped job -> honest terminal (never stalls)",
               ts in ("cancelled", "failed", "connection lost"), f"ts={ts}")
         r7msgs = cl.req("GET", f"/api/conversations/{r7_cid}")["messages"]
@@ -374,15 +385,14 @@ def main():
             "text": "Use Bash right now, no questions: run exactly "
                     "'sleep 35 && echo RESTART-TEST-7', then report "
                     "its output."})
-        r8_kick = kick_of(r8)
         CLEANUP_JOBS.add(cl.req("GET", f"/api/conversations/{cid}")[
             "conversation"]["job_id"])
-        started = wait_tool_running(cl, cid, r8_kick)
+        started = wait_tool_running(cl, cid, max_id(cl, cid))
         check("R8 job working before kill (repro precondition)", started)
         stop_server(srv)          # relay dies mid-turn - exactly the bug
         srv = start_server()
         check("R8 server back up after mid-turn kill", cl.wait_up())
-        ts = wait_kick_state(cl, cid, r8_kick, timeout=30)
+        ts = wait_kick_state(cl, cid, timeout=30)
         check("R8 orphaned streaming msg -> interrupted (never stalls)",
               ts == "interrupted by server restart", f"ts={ts}")
         since = last_id(cl, cid)

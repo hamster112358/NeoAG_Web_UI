@@ -23,6 +23,9 @@ const I18N = {
   en: {
     "brand.tag": "Agent-assisted neoantigen analysis",
     "chat.new": "New chat", "chat.stop": "Stop",
+    "chat.tech": "Technical view",
+    "chat.chat": "Conversation view",
+    "chat.techTip": "Show the full per-call execution record",
     "chat.ph": "Message…",
     "chat.send": "Send",
     "chat.busySend": "The agent is still answering - one exchange at a time.",
@@ -65,7 +68,7 @@ const I18N = {
     "gate.approve": "Approve once", "gate.deny": "Deny",
     "act.waitappr": "Waiting for your approval",
     "act.reconnect": "Reconnecting - the last recorded state is shown below",
-    "act.tools": "Running tools", "act.think": "Thinking",
+    "act.doing": "Working on", "act.think": "Thinking",
     "act.lastturn": "Last turn",
     "act.tools1": "Agent activity - 1 tool call",
     "act.toolsN": "Agent activity - {n} tool calls",
@@ -321,6 +324,9 @@ const I18N = {
   zh: {
     "brand.tag": "智能体辅助新抗原分析平台",
     "chat.new": "新建对话", "chat.stop": "停止",
+    "chat.tech": "技术视图",
+    "chat.chat": "对话视图",
+    "chat.techTip": "显示完整的逐次执行记录",
     "chat.ph": "发送消息…",
     "chat.send": "发送",
     "chat.busySend": "智能体正在回复——请等本轮回答结束后再发送下一条。",
@@ -363,7 +369,7 @@ const I18N = {
     "gate.approve": "批准一次", "gate.deny": "拒绝",
     "act.waitappr": "等待你的批准",
     "act.reconnect": "连接中断，正在重连——以下显示最后记录的状态",
-    "act.tools": "正在执行工具", "act.think": "思考中",
+    "act.doing": "正在处理", "act.think": "思考中",
     "act.lastturn": "上一轮：",
     "act.tools1": "智能体活动——1 次工具调用",
     "act.toolsN": "智能体活动——{n} 次工具调用",
@@ -680,8 +686,14 @@ const state = {
   resultsMock: false,
   manifest: null, agentMode: "mock",
   convs: [], activeCid: null, convMsgs: [],
+  // M11 P0-1: the conversation shows the CONVERSATION (chat rows);
+  // the per-call execution record is opt-in (technical view, persisted
+  // choice) - the backend stores the two classes separately.
+  techView: false,
   sseDown: true, // until the live stream says otherwise (§6 status)
 };
+try { state.techView = localStorage.getItem("nj_tech") === "1"; }
+catch { /* private mode */ }
 
 /* ---------------- API ---------------- */
 async function api(method, path, body) {
@@ -1053,12 +1065,17 @@ async function openNextConv() {
   await openConv(state.convs.length ? state.convs[0].id : null);
 }
 
+function convFetchPath(cid) {
+  return `/api/conversations/${cid}` +
+    (state.techView ? "?include=audit" : "");
+}
+
 async function openConv(cid, quiet) {
   state.activeCid = cid;
   renderSidebar();
   if (!cid) { state.convMsgs = []; renderChat(); return; }
   try {
-    const d = await api("GET", `/api/conversations/${cid}`);
+    const d = await api("GET", convFetchPath(cid));
     state.convMsgs = d.messages;
     state.convObj = d.conversation;
   } catch (e) {
@@ -1071,7 +1088,7 @@ async function openConv(cid, quiet) {
 async function refreshConv() {
   if (!state.activeCid) return;
   try {
-    const d = await api("GET", `/api/conversations/${state.activeCid}`);
+    const d = await api("GET", convFetchPath(state.activeCid));
     state.convMsgs = d.messages;
     state.convObj = d.conversation;
     renderChat();
@@ -1086,11 +1103,11 @@ async function refreshConv() {
    itself once the turn honestly ends. */
 setInterval(() => {
   if (!state.activeCid) return;
-  const inflight = (state.convMsgs || []).slice(-8).some((m) => {
-    const mt = m.meta || {};
-    return mt.turn_state === "streaming" || (mt.badges || []).includes("streaming");
-  });
-  if (inflight) refreshConv();
+  // M11 P0-1: the live turn lives on the conversation row (one honest
+  // indicator), not on message-tail bookkeeping; stop polling once the
+  // turn state is terminal.
+  const st = (state.convObj || {}).turn_state;
+  if (st === "streaming") refreshConv();
 }, 3000);
 
 $("new-chat").addEventListener("click", async () => {
@@ -1279,6 +1296,13 @@ function renderChat() {
   const conv = state.convObj;
   $("chat-title").textContent =
     (conv && (conv.title || t("chat.new"))) || t("chat.new");
+  const tt = $("tech-toggle");
+  if (tt) {
+    tt.textContent = t(state.techView ? "chat.chat" : "chat.tech");
+    tt.title = t("chat.techTip");
+    tt.setAttribute("aria-pressed", state.techView ? "true" : "false");
+    tt.classList.toggle("active", state.techView);
+  }
   const st = conv && conv.job_state;
   const chip = $("chat-state");
   if (st === "working" || st === "blocked") {
@@ -1333,11 +1357,14 @@ function renderChat() {
 
 /* activity line right above the composer - what the agent is doing
    right now, for how long, and a Stop control for the live turn. */
+/* M11 P0-1: one compact live indicator, fed by the conversation row.
+   The label is the agent's CURRENT WORK (the real tool title the
+   gateway reported), not a call count. */
 function currentTurn() {
-  const msgs = state.convMsgs || [];
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    const mt = msgs[i].meta || {};
-    if (mt.turn_state) return { state: mt.turn_state, ts: msgs[i].ts };
+  const conv = state.convObj || {};
+  if (conv.turn_state) {
+    return { state: conv.turn_state, ts: conv.turn_ts || conv.updated_at,
+             activity: conv.activity || "" };
   }
   return null;
 }
@@ -1352,19 +1379,17 @@ function updateActivity(gatePending) {
   state.turnSince = turn && working ? new Date(turn.ts).getTime() : null;
   // honest at a glance: waiting for approval is never shown as
   // "thinking", a lost connection is never shown as work in progress,
-  // and "thinking" only shows while no tool is executing.
+  // and "thinking" only shows while no work label is available.
   const blocked = state.convObj && state.convObj.job_state === "blocked";
   let label = "";
   if (working && (gatePending || blocked)) {
     label = t("act.waitappr");
   } else if (working && state.sseDown) {
     label = t("act.reconnect");
+  } else if (working && turn.activity) {
+    label = t("act.doing") + ": " + turn.activity;
   } else if (working) {
-    const tools = (state.convMsgs || []).slice(-4).some(
-      (m) => (m.meta || {}).kind === "tool" &&
-             !["completed", "failed"].includes((m.meta || {})
-               .tool_status || ""));
-    label = tools ? t("act.tools") : t("act.think");
+    label = t("act.think");
   } else if (gatePending || blocked) {
     label = t("act.waitappr");
   } else if (turn) {
@@ -1435,6 +1460,16 @@ $("chat-input").addEventListener("keydown", (ev) => {
     ev.preventDefault();
     $("chat-form").requestSubmit();
   }
+});
+
+/* M11 P0-1: the per-call execution record is an OPT-IN technical view
+   over the same durably-stored data (server-side visibility class),
+   never a hide-the-DOM toggle. */
+$("tech-toggle").addEventListener("click", async () => {
+  state.techView = !state.techView;
+  try { localStorage.setItem("nj_tech", state.techView ? "1" : "0"); }
+  catch { /* private mode */ }
+  await refreshConv();
 });
 
 async function refreshJobs() {

@@ -716,13 +716,15 @@ def _unit_turn(client, cid, seen={"x"}):
     try:
         k = _ts.msg_add("agent", "kick",
                         {"badges": ["real agent", "streaming"],
-                         "turn_state": "streaming"}, cid)
+                         "turn_state": "streaming"}, cid,
+                        visibility="audit")
         st = _ag._cstate(cid)
         st.update({"job": "unitjob", "kick": k["id"], "seen": set(seen),
-                   "busy": True})
+                   "busy": True, "conv": cid})
         _ag._client = client
         _ag._turn(cid, max_seconds=60)
-        msgs = _ts.msg_list(500, conv_id=cid)
+        # the unit asserts read the RAW store (both visibility classes)
+        msgs = _ts.msg_list(500, conv_id=cid, visibility=None)
         kick = [m for m in msgs if m["id"] == k["id"]][0]
         return kick["meta"].get("turn_state"), msgs
     finally:
@@ -752,16 +754,18 @@ check("66b transcript-seeding failure also ends honestly (never stuck)",
       str(_ts3b))
 _k = _ts.msg_add("agent", "orphan",
                  {"badges": ["real agent", "streaming"],
-                  "turn_state": "streaming"}, "u-sweep")
+                  "turn_state": "streaming"}, "u-sweep",
+                 visibility="audit")
 _n = _ts.msg_sweep_stale_streaming()
-_kr = [m for m in _ts.msg_list(500, conv_id="u-sweep")
+_kr = [m for m in _ts.msg_list(500, conv_id="u-sweep", visibility=None)
        if m["id"] == _k["id"]][0]
 check("67 startup sweep: orphaned streaming -> interrupted",
       _n >= 1 and _kr["meta"].get("turn_state")
       == "interrupted by server restart")
 _appjs = (ROOT / "frontend" / "app.js").read_text()
 check("68 frontend reaches terminal WITHOUT SSE: watchdog + reopen catch-up",
-      "Streaming watchdog" in _appjs and "inflight" in _appjs and
+      "Streaming watchdog" in _appjs and
+      'turn_state === "streaming"' in _appjs and
       "Reconnect catch-up" in _appjs and
       "refreshConv(); refreshSidebar(); refreshJobs()" in _appjs)
 del os.environ["NEOAG_DEMO_DB"]
