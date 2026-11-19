@@ -4,7 +4,7 @@
    Data comes from /api/bootstrap + per-conversation fetches + SSE.
    All writes go through the API; the browser only renders
    server-persisted state. Layout contract: nothing at page level
-   scrolls - sidebar, chat log, work body and the drawer each own
+   scrolls - sidebar, chat log and work body each own
    their scroll; the composer stays pinned at the bottom. */
 "use strict";
 
@@ -742,7 +742,7 @@ const VS = {
 
 const state = {
   boot: null, params: null, view: "tasks", kindFilter: "",
-  jobDetail: null, resultsJob: null, resultsStrategy: null,
+  resultsJob: null, resultsStrategy: null,
   resultsMock: false,
   manifest: null, agentMode: "mock",
   convs: [], activeCid: null, convMsgs: [],
@@ -947,6 +947,8 @@ async function boot() {
     $("lang-select").value = LANG;
     applyStaticI18n();
     VS.load();
+    // P0-8: the selected task survives a reload of the page
+    state.resultsJob = VS.get("resultsJob", null);
     renderSidebar();
     await openConv(state.activeCid, true);
     restorePrep();
@@ -1015,7 +1017,7 @@ function connectSSE() {
     else if (ev.type === "conversations") refreshSidebar();
     else if (ev.type === "job" || ev.type === "approval") {
       refreshJobs(); renderAttention(); refreshConv();
-      if (state.jobDetail) openJob(state.jobDetail, true);
+      if (state.resultsJob) renderResults();
     } else if (ev.type === "research" || ev.type === "research_changed") {
       refreshDiscovery();
       refreshJobs(); // research rows are unified task rows too (§1.2)
@@ -2799,7 +2801,7 @@ function jobRowHtml(j) {
       ? t("concl." + j.outcome) : "" : "";
   const sub = [j.id, fmtDT(j.created_at), j.stage || "", concl]
     .filter(Boolean).join(" · ");
-  // human headline on terminal rows; the raw code stays in the drawer
+  // human headline on terminal rows; the raw code stays in the tech record
   const tail = j.state === "failed" ? " - " + esc(t("fail.head"))
     : j.error ? " - " + esc(j.error) : "";
   return `<div class="jr-main">
@@ -2819,28 +2821,20 @@ function renderJobs() {
   const active = all.filter((j) => ACTIVE_STATES.includes(j.state));
   const past = all.filter((j) => !ACTIVE_STATES.includes(j.state));
   const host = $("job-list");
+  const rowCls = (j) => state.resultsJob === j.id ? "selected" : "";
   host.innerHTML = active.length ? active.map((j) =>
-    `<div class="job-row ${state.jobDetail === j.id ? "selected" : ""}"
+    `<div class="job-row ${rowCls(j)}"
       data-job="${esc(j.id)}">${jobRowHtml(j)}</div>`).join("")
     : `<div class="empty">${esc(t("run.none"))}</div>`;
   $("history-count").textContent = past.length ? `(${past.length})` : "";
   $("history-list").innerHTML = past.length ? past.map((j) =>
-    `<div class="job-row" data-job="${esc(j.id)}">${jobRowHtml(j)}</div>`).join("")
+    `<div class="job-row ${rowCls(j)}" data-job="${esc(j.id)}">${jobRowHtml(j)}</div>`).join("")
     : `<div class="empty">${esc(t("run.histnone"))}</div>`;
+  // P0-8: every task row - job or research - opens the ONE place for
+  // that task: Results with the task selected. Research rows get a
+  // pointer card there with an explicit "open in Discovery" action.
   document.querySelectorAll("[data-job]").forEach((el) =>
-    el.addEventListener("click", () => {
-      const id = el.dataset.job;
-      if (/^res-/.test(id)) {
-        // a research task row -> its report lives in the Discovery
-        // workspace; jump there instead of opening the job drawer
-        const tab = document.querySelector(
-          '.wtab[data-view="discovery"]');
-        if (tab) tab.click();
-        showReport(id);
-        return;
-      }
-      openJob(id);
-    }));
+    el.addEventListener("click", () => openJob(el.dataset.job)));
 }
 
 document.querySelectorAll("#kind-filter .chip").forEach((c) =>
@@ -2853,131 +2847,144 @@ document.querySelectorAll("#kind-filter .chip").forEach((c) =>
     renderJobs();
   }));
 
-async function openJob(id, quiet) {
-  let detail = [], task = null;
-  try { detail = await api("GET", `/api/jobs/${id}/events`); }
-  catch (e) { if (!quiet) toast(t("toast.openFail", { e: e.message }), true); return; }
-  try { task = await api("GET", `/api/tasks/${id}`); } catch { /* older row */ }
+/* M11 P0-8: ONE place per task. The former drawer is gone - clicking a
+   task in Tasks opens Results with that task selected, and Results
+   renders EVERY state: running (progress + controls), blocked,
+   cancelled, failed (confirmed reason + partial outputs) and
+   completed. The task head below is the drawer's identity, state
+   pair and controls, merged into the Results view. */
+function openJob(id) {
   const job = (state.boot.jobs || []).find((j) => j.id === id);
-  if (!job) return;
-  state.jobDetail = id;
-  VS.set("jobDetail", id);
+  if (!job) { toast(t("toast.openFail", { e: id }), true); return; }
+  state.resultsJob = id;
+  state.resultsStrategy = null;
+  VS.set("resultsJob", id);
+  switchView("results");
   renderJobs();
-  const decisions = (task && task.decisions) || [];
-  const jobEl = $("job-detail");
-  const running = job.state === "running";
-  jobEl.classList.remove("hidden");
-  const arts = (task && task.artifacts) || [];
-  // §8.1: execution state and scientific conclusion shown side by side,
-  // never merged into one label.
+  renderResults();
+}
+
+/* task head: name + rename, identity, execution/conclusion pair,
+   progress and the control row - visible for EVERY state, because
+   every state deserves controls (cancel a running one, rename a
+   finished one). */
+function taskHeadHtml(job, task) {
+  const running = ACTIVE_STATES.includes(job.state);
+  const bar = running && job.progress > 0
+    ? `<div class="jr-bar wide"><i style="width:${
+        Math.min(95, job.progress)}%"></i></div>` : "";
   const conclHtml = job.kind === "discovery" && job.outcome
     ? `<span class="pill ${job.outcome === "decision_ready" ? "ok" : "warn"}">${esc(t("concl." + job.outcome) !== "concl." + job.outcome ? t("concl." + job.outcome) : job.outcome)}</span>`
     : job.outcome ? `<span class="pill ${job.outcome === "delivered" ? "ok" : "warn"}">${esc(job.outcome.replace(/_/g, " "))}</span>` : "";
-  jobEl.innerHTML = `
-    <button class="btn sm ghost close" id="jd-close">${esc(t("dr.close"))}</button>
+  return `<div class="task-head">
     <div class="dr-title-row">
-      <h2 id="jd-title">${esc(displayName(job))}</h2>
-      <button class="btn sm ghost" id="jd-rename">${esc(t("dr.rename"))}</button>
+      <h2 class="th-title">${esc(displayName(job))}</h2>
+      <button class="btn sm ghost" id="th-rename">${esc(t("dr.rename"))}</button>
     </div>
-    <div id="jd-rename-box"></div>
-    <div class="dr-sub">${esc(t("dr.created"))}: ${esc(fmtDT(job.created_at))}</div>
-    <div class="dr-id">${esc(t("dr.id"))}: ${esc(job.id)}</div>
-    <div class="state-pair">
-      <span>${esc(t("dr.exec"))}:</span> ${statusPill(job.state, job)} ${conclHtml}
-    </div>
-    ${task && task.failure ? `<section><h3>${esc(t("fail.head"))}</h3>
-      ${failureBodyHtml(task.failure, task.completed_before_failure,
-                        task.partial_artifacts)}</section>` : ""}
-    <section><h3>${esc(t("dr.controls"))}</h3><div class="btnrow">
-      <button class="btn sm" id="jd-pause"
+    <div class="dr-sub">${esc(t("dr.created"))}: ${esc(fmtDT(job.created_at))}
+      &nbsp;·&nbsp; ${esc(t("dr.id"))}: ${esc(job.id)}</div>
+    <div class="state-pair"><span>${esc(t("dr.exec"))}:</span>
+      ${statusPill(job.state, job)} ${conclHtml}</div>
+    ${bar}
+    <div class="btnrow" style="margin-top:8px">
+      <button class="btn sm" id="th-pause"
         ${running && !(task && task.native) ? "" : "disabled"}
         title="${task && task.native ? esc(t("dr.noPause")) : ""}">${esc(t("dr.pause"))}</button>
-      <button class="btn sm" id="jd-resume" ${job.state === "paused" ? "" : "disabled"}>${esc(t("dr.resume"))}</button>
-      <button class="btn sm danger" id="jd-cancel"
+      <button class="btn sm" id="th-resume" ${job.state === "paused" ? "" : "disabled"}>${esc(t("dr.resume"))}</button>
+      <button class="btn sm danger" id="th-cancel"
         ${!["completed", "failed", "cancelled"].includes(job.state) ? "" : "disabled"}
         title="${task && task.native && task.native.profile === "gateway" ? esc(t("dr.cancelNote")) : ""}">${esc(t("dr.cancel"))}</button>
-    </div></section>
-    ${arts.length ? `<section><h3>${esc(t("dr.artifacts"))}</h3>
-      ${artifactRows(arts, id)}</section>` : ""}
-    <section><h3>${esc(t("dr.tech"))}</h3>
-      <details class="adv"><summary>${esc(t("dr.reqcfg"))}</summary>
-        <div class="kv">${Object.entries((job.spec &&
-          job.spec.requested_config) || {})
-          .map(([k, v]) => `<div class="k">${esc(k)}</div><div>${esc(v)}</div>`).join("") ||
-          `<div class="hint">${esc(t("dr.defOnly"))}</div>`}</div></details>
-      ${task && task.native ? `<details class="adv"><summary>native execution</summary>
-        <div class="kv">
-          <div class="k">engine</div><div>native ${esc(task.native.engine_version || "")} (${esc(task.native.profile || "")})</div>
-          <div class="k">inputs</div><div><code>${esc(JSON.stringify(task.native.native_params || {}))}</code></div>
-          <div class="k">outdir</div><div><code>${esc(task.native.outdir || "-")}</code></div>
-          ${task.native.failure_code ? `<div class="k">failure</div><div>${esc(task.native.failure_code)}</div>` : ""}
-        </div>
-        ${task.native.plan && (task.native.plan.steps || []).length
-          ? `<details open><summary class="hint">${esc(t("plan.runplan"))}</summary><ul>${
-            (task.native.plan.steps || []).map((s) => `<li><b>${esc(s.step_id || "")} ${esc(s.name || "")}</b>: ${esc(s.status || "")}${s.detail ? " - " + esc(String(s.detail).slice(0, 140)) : ""}</li>`).join("")
-          }</ul></details>` : ""}
-      </details>` : ""}
-      <details class="adv"><summary>${esc(t("dr.decisions"))}</summary><div class="timeline">${decisions.map((d) => `
-        <div class="tl-row"><span class="tl-ts">${esc(d.ts || "")}</span>
-          <span class="tl-kind">${esc(d.key || d.decision_type || "")}</span>
-          <span>${esc(d.question || "")} -> <b>${esc(d.chosen || "pending")}</b>
-          <span class="hint">(${esc(d.decided_by || "")}, ${esc(d.policy_id || "")}${
-            d.policy_version ? " v" + esc(d.policy_version) : ""})</span>
-          ${d.downstream && d.downstream.applied_effect
-            ? `<div class="hint">effect applied: ${esc(
-                JSON.stringify(d.downstream.applied_effect))}</div>` : ""}</span>
-        </div>`).join("") || `<div class="hint">${esc(t("dr.noDec"))}</div>`}</div></details>
-      <details class="adv"><summary>${esc(t("dr.snapshot"))}</summary>
-        <div id="jd-snapshot"><div class="hint">…</div></div></details>
-      <details class="adv"><summary>${esc(t("dr.events"))}</summary>
-        <div class="logview">${detail.slice(0, 120)
-          .map((e) => `${esc(e.ts || "")} ${esc(e.kind || "")} ${esc(e.text || "")}`)
-          .join("\n")}</div></details>
-    </section>`;
-  $("jd-close").addEventListener("click", () => {
-    jobEl.classList.add("hidden");
-    state.jobDetail = null; VS.drop("jobDetail"); renderJobs();
-  });
-  $("jd-rename").addEventListener("click", () => {
-    const box = $("jd-rename-box");
+    </div>
+    <div id="th-rename-box"></div>
+  </div>`;
+}
+
+function wireTaskHead(job) {
+  const id = job.id;
+  $("th-rename").addEventListener("click", () => {
+    const box = $("th-rename-box");
     box.innerHTML = `<div class="conf-row">
-      <input id="jd-title-in" value="${esc(displayName(job))}" style="max-width:340px">
-      <button class="btn primary sm" id="jd-title-save">${esc(t("dr.renameSave"))}</button>
-      <button class="btn ghost sm" id="jd-title-cancel">${esc(t("dr.renameCancel"))}</button></div>`;
-    $("jd-title-in").focus();
-    $("jd-title-cancel").addEventListener("click", () => { box.innerHTML = ""; });
-    $("jd-title-save").addEventListener("click", async () => {
-      const title = $("jd-title-in").value.trim();
+      <input id="th-title-in" value="${esc(displayName(job))}" style="max-width:340px">
+      <button class="btn primary sm" id="th-title-save">${esc(t("dr.renameSave"))}</button>
+      <button class="btn ghost sm" id="th-title-cancel">${esc(t("dr.renameCancel"))}</button></div>`;
+    $("th-title-in").focus();
+    $("th-title-cancel").addEventListener("click", () => { box.innerHTML = ""; });
+    $("th-title-save").addEventListener("click", async () => {
+      const title = $("th-title-in").value.trim();
       if (!title) return;
       try {
         await api("POST", `/api/jobs/${encodeURIComponent(id)}/title`, { title });
         box.innerHTML = "";
         toast(t("toast.renamed"));
         await refreshJobs();
-        openJob(id, true);
+        renderResults();
       } catch (e) { toast(e.message, true); }
     });
   });
-  $("jd-pause").addEventListener("click", () => api("POST", `/api/jobs/${id}/pause`, {}).then(refreshJobs));
-  $("jd-resume").addEventListener("click", () => api("POST", `/api/jobs/${id}/resume`, {}).then(refreshJobs));
-  $("jd-cancel").addEventListener("click", () => api("POST", `/api/jobs/${id}/cancel`, {}).then(refreshJobs));
-  api("GET", `/api/tasks/${id}/snapshot`).then((snap) => {
-    const s = snap.snapshot || {};
-    $("jd-snapshot").innerHTML = `
-      <div class="kv">${Object.entries({ job: s.job_id, engine: s.engine_version,
-        policy: s.policy_version, started: snap.created_at,
-        execution_mode_at_start: s.execution_mode_at_start,
-        dataset: s.dataset_version,
-        seed: s.seed,
-        stage_plan: (s.stage_plan || []).join(", ") })
-        .map(([k, v]) => `<div class="k">${esc(k)}</div><div>${esc(
-          typeof v === "object" ? JSON.stringify(v) : v)}</div>`).join("")}</div>
-      <details class="adv"><summary>${esc(t("dr.snapFull"))}</summary>
-        <pre class="tool-out">${esc(JSON.stringify(s, null, 1))}</pre></details>
-      <div class="hint">${esc(t("dr.snapNote"))}</div>`;
-  }).catch(() => {
-    $("jd-snapshot").innerHTML = `<div class="hint">-</div>`;
-  });
+  $("th-pause").addEventListener("click", () => api("POST", `/api/jobs/${id}/pause`, {}).then(refreshJobs));
+  $("th-resume").addEventListener("click", () => api("POST", `/api/jobs/${id}/resume`, {}).then(refreshJobs));
+  $("th-cancel").addEventListener("click", () => api("POST", `/api/jobs/${id}/cancel`, {}).then(refreshJobs));
+}
+
+/* the former drawer's technical record, kept verbatim in content:
+   requested config, native execution, decisions, snapshot, events */
+function taskTechHtml(job, task, detail) {
+  const decisions = (task && task.decisions) || [];
+  return `<details class="adv" id="res-tech-fold">
+    <summary>${esc(t("dr.tech"))}</summary>
+    <details class="adv"><summary>${esc(t("dr.reqcfg"))}</summary>
+      <div class="kv">${Object.entries((job.spec &&
+        job.spec.requested_config) || {})
+        .map(([k, v]) => `<div class="k">${esc(k)}</div><div>${esc(v)}</div>`).join("") ||
+        `<div class="hint">${esc(t("dr.defOnly"))}</div>`}</div></details>
+    ${task && task.native ? `<details class="adv"><summary>native execution</summary>
+      <div class="kv">
+        <div class="k">engine</div><div>native ${esc(task.native.engine_version || "")} (${esc(task.native.profile || "")})</div>
+        <div class="k">inputs</div><div><code>${esc(JSON.stringify(task.native.native_params || {}))}</code></div>
+        <div class="k">outdir</div><div><code>${esc(task.native.outdir || "-")}</code></div>
+        ${task.native.failure_code ? `<div class="k">failure</div><div>${esc(task.native.failure_code)}</div>` : ""}
+      </div>
+      ${task.native.plan && (task.native.plan.steps || []).length
+        ? `<details open><summary class="hint">${esc(t("plan.runplan"))}</summary><ul>${
+          (task.native.plan.steps || []).map((s) => `<li><b>${esc(s.step_id || "")} ${esc(s.name || "")}</b>: ${esc(s.status || "")}${s.detail ? " - " + esc(String(s.detail).slice(0, 140)) : ""}</li>`).join("")
+        }</ul></details>` : ""}
+    </details>` : ""}
+    <details class="adv"><summary>${esc(t("dr.decisions"))}</summary><div class="timeline">${decisions.map((d) => `
+      <div class="tl-row"><span class="tl-ts">${esc(d.ts || "")}</span>
+        <span class="tl-kind">${esc(d.key || d.decision_type || "")}</span>
+        <span>${esc(d.question || "")} -> <b>${esc(d.chosen || "pending")}</b>
+        <span class="hint">(${esc(d.decided_by || "")}, ${esc(d.policy_id || "")}${
+          d.policy_version ? " v" + esc(d.policy_version) : ""})</span>
+        ${d.downstream && d.downstream.applied_effect
+          ? `<div class="hint">effect applied: ${esc(
+              JSON.stringify(d.downstream.applied_effect))}</div>` : ""}</span>
+      </div>`).join("") || `<div class="hint">${esc(t("dr.noDec"))}</div>`}</div></details>
+    <details class="adv"><summary>${esc(t("dr.snapshot"))}</summary>
+      <div id="th-snapshot"><div class="hint">…</div></div></details>
+    <details class="adv"><summary>${esc(t("dr.events"))}</summary>
+      <div class="logview">${(detail || []).slice(0, 120)
+        .map((e) => `${esc(e.ts || "")} ${esc(e.kind || "")} ${esc(e.text || "")}`)
+        .join("\n")}</div></details>
+  </details>`;
+}
+
+function fillTaskSnapshot(jid, snap) {
+  const el = $("th-snapshot");
+  if (!el || state.resultsJob !== jid) return;
+  const s = snap.snapshot || {};
+  el.innerHTML = `
+    <div class="kv">${Object.entries({ job: s.job_id, engine: s.engine_version,
+      policy: s.policy_version, started: snap.created_at,
+      execution_mode_at_start: s.execution_mode_at_start,
+      dataset: s.dataset_version,
+      seed: s.seed,
+      stage_plan: (s.stage_plan || []).join(", ") })
+      .filter(([, v]) => v !== undefined && v !== "")
+      .map(([k, v]) => `<div class="k">${esc(k)}</div><div>${esc(
+        typeof v === "object" ? JSON.stringify(v) : v)}</div>`).join("")}</div>
+    <details class="adv"><summary>${esc(t("dr.snapFull"))}</summary>
+      <pre class="tool-out">${esc(JSON.stringify(s, null, 1))}</pre></details>
+    <div class="hint">${esc(t("dr.snapNote"))}</div>`;
 }
 
 function renderTasks() {
@@ -3012,9 +3019,9 @@ function candTable(rows) {
    reviews, whose reports stay owned by that workspace. Legacy
    simulation history is hidden by default but never deleted. */
 function clearResultsPanes() {
-  ["res-findings", "res-warnings", "res-artifacts", "res-strategy",
-   "res-table", "res-meta", "res-manifest"].forEach(
-    (id) => { $(id).innerHTML = ""; });
+  ["res-task", "res-tech", "res-findings", "res-warnings",
+   "res-artifacts", "res-strategy", "res-table", "res-meta",
+   "res-manifest"].forEach((id) => { $(id).innerHTML = ""; });
 }
 
 function artifactRows(arts, jid) {
@@ -3033,7 +3040,9 @@ function artifactRows(arts, jid) {
     }</tbody></table></div>`;
 }
 
-function renderResults() {
+let resultsSeq = 0;
+async function renderResults() {
+  const seq = ++resultsSeq; // late async fills must not overwrite a newer selection
   const jobs = (state.boot?.jobs || []).filter((j) => !/^res-/.test(j.id));
   const research = state.boot?.research || [];
   const isMock = (j) => !j.spec || j.spec.engine === "mock";
@@ -3056,8 +3065,10 @@ function renderResults() {
     return;
   }
   if (!state.resultsJob ||
-      !opts.includes(`value="${state.resultsJob}"`))
+      !opts.includes(`value="${state.resultsJob}"`)) {
     state.resultsJob = $("res-job").options[0].value;
+    VS.set("resultsJob", state.resultsJob);
+  }
   $("res-job").value = state.resultsJob;
   const jid = state.resultsJob;
   if (/^res-/.test(jid)) {
@@ -3077,6 +3088,22 @@ function renderResults() {
   }
   const job = jobs.find((j) => j.id === jid);
   clearResultsPanes();
+  if (job) {
+    // P0-8: the task head (identity, state pair, progress, controls)
+    // and the technical record render for EVERY state - the former
+    // drawer content, now inline where the results live.
+    let task = null;
+    let detail = [];
+    try { detail = await api("GET", `/api/jobs/${jid}/events`); } catch { /* older row */ }
+    if (seq !== resultsSeq) return;
+    try { task = await api("GET", `/api/tasks/${jid}`); } catch { /* older row */ }
+    if (seq !== resultsSeq) return;
+    $("res-task").innerHTML = taskHeadHtml(job, task);
+    wireTaskHead(job);
+    $("res-tech").innerHTML = taskTechHtml(job, task, detail);
+    api("GET", `/api/tasks/${jid}/snapshot`)
+      .then((s) => fillTaskSnapshot(jid, s)).catch(() => {});
+  }
   if (job && ["queued", "running", "paused", "blocked"].includes(job.state)) {
     const st = t("st." + job.state) !== "st." + job.state ? t("st." + job.state) : job.state;
     $("res-outcome").innerHTML = alertHtml("info", displayName(job),
@@ -3093,6 +3120,7 @@ function renderResults() {
     $("res-outcome").innerHTML = `<div class="prep-progress">
       <span class="spin"></span></div>`;
     api("GET", `/api/results/${jid}`).then((res) => {
+      if (seq !== resultsSeq) return;
       const arts = res.artifacts || [];
       $("res-outcome").innerHTML =
         `<div class="outcome danger"><b>${esc(
@@ -3114,6 +3142,7 @@ function renderResults() {
     return;
   }
   api("GET", `/api/results/${jid}`).then((res) => {
+    if (seq !== resultsSeq) return;
     const outcome = res.outcome || "no_artifacts";
     $("res-outcome").innerHTML = `
       <div class="outcome ${esc(OUTCOME_CLS[outcome] || "muted")}">
@@ -3240,6 +3269,7 @@ function renderResults() {
 $("res-job").addEventListener("change", () => {
   state.resultsJob = $("res-job").value;
   state.resultsStrategy = null;
+  VS.set("resultsJob", state.resultsJob);
   renderResults();
 });
 $("res-mock").addEventListener("change", () => {
@@ -3846,7 +3876,7 @@ document.addEventListener("click", async (ev) => {
     return;
   }
   const oj = ev.target.closest("[data-openjob]");
-  if (oj) { switchView("tasks"); openJob(oj.dataset.openjob); }
+  if (oj) { openJob(oj.dataset.openjob); }
 });
 
 boot();

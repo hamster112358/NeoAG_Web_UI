@@ -163,8 +163,9 @@
             <div id="history-list" class="joblist"></div>
           </details>
         </div>
-
-        <div id="job-detail" class="drawer hidden"></div>
+        <!-- M11 P0-8: the job drawer is gone. A task's state, failure
+             reason, controls and technical record live in Results,
+             which renders every state - one place per task. -->
       </section>
 
       <section id="view-results" class="wview">
@@ -176,6 +177,9 @@
             <label class="lbl inline" id="res-mock-wrap" hidden>
               <input type="checkbox" id="res-mock"> <span data-i18n="res.showMock">Show simulation history</span></label>
           </div>
+          <!-- M11 P0-8: merged task head (title/rename, state pair,
+               controls) - every state of every task lives here. -->
+          <div id="res-task"></div>
           <div id="res-outcome"></div>
           <div id="res-findings"></div>
           <div id="res-warnings"></div>
@@ -183,6 +187,9 @@
           <div id="res-strategy"></div>
           <div id="res-table"></div>
           <div id="res-meta"></div>
+          <!-- the former drawer's technical record: native execution,
+               decisions, snapshot, events (M11 P0-8) -->
+          <div id="res-tech"></div>
           <details class="adv" id="res-manifest-wrap">
             <summary data-i18n="res.prov">Output manifest, decisions and provenance</summary>
             <div id="res-manifest"></div>

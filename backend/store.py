@@ -302,12 +302,23 @@ class Store:
     def job_create(self, job_id: str, kind: str, sample_id: str, spec: dict,
                    state: str, approval_id: str | None,
                    conv_id: str = "") -> None:
+        # M11 P0-8: every task gets a readable default name AT CREATION
+        # (server clock, host timezone - "Analysis - 2026-11-19 20:30"),
+        # so lists never show bare ids or "· task" fragments. A rename
+        # overwrites display_title; the id, sample_id, spec and audit
+        # trail are never touched by naming.
+        ts = now()
+        prefix = {"discovery": "Discovery",
+                  "diagnostic": "Diagnostic"}.get(kind, "Analysis")
+        default_title = f"{prefix} - {ts[:10]} {ts[11:16]}"
         with self.lock:
             self.db.execute(
                 "INSERT INTO jobs(id,created_at,updated_at,state,kind,sample_id,"
-                "spec_json,approval_id,conv_id) VALUES(?,?,?,?,?,?,?,?,?)",
-                (job_id, now(), now(), state, kind, sample_id,
-                 json.dumps(spec, ensure_ascii=False), approval_id, conv_id))
+                "spec_json,approval_id,conv_id,display_title) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (job_id, ts, ts, state, kind, sample_id,
+                 json.dumps(spec, ensure_ascii=False), approval_id, conv_id,
+                 default_title))
             self.db.commit()
 
     def job_set(self, job_id: str, **fields) -> None:
@@ -888,14 +899,21 @@ class Store:
     def research_add(self, rid: str, scope: str, target: str,
                      engine: str = "example", conv_id: str = "",
                      targets: list[str] | None = None) -> None:
+        # M11 P0-8: same naming contract as jobs - a readable default at
+        # creation ("Discovery - 2026-11-19 20:30"), overwritable by a
+        # rename; the id, scope and target are never touched by naming.
+        ts = now()
+        default_title = f"Discovery - {ts[:10]} {ts[11:16]}"
         with self.lock:
             self.db.execute(
-                "INSERT INTO research(id,created_at,status,scope,target,engine,"
-                "conv_id,progress_json) VALUES(?,?, 'queued', ?,?,?,?,?)",
-                (rid, now(), scope, target, engine, conv_id,
+                "INSERT INTO research(id,created_at,status,scope,target,"
+                "engine,conv_id,progress_json,display_title) "
+                "VALUES(?,?, 'queued', ?,?,?,?,?,?)",
+                (rid, ts, scope, target, engine, conv_id,
                  json.dumps({"steps": [], "targets": targets or [target],
                              "sources_done": [], "note": "queued"},
-                            ensure_ascii=False)))
+                            ensure_ascii=False),
+                 default_title))
             self.db.commit()
 
     def research_set(self, rid: str, status: str, report: dict | None = None,
