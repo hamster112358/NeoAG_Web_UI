@@ -765,7 +765,12 @@ check("67 startup sweep: orphaned streaming -> interrupted",
 _appjs = (ROOT / "frontend" / "app.js").read_text()
 check("68 frontend reaches terminal WITHOUT SSE: watchdog + reopen catch-up",
       "Streaming watchdog" in _appjs and
-      'turn_state === "streaming"' in _appjs and
+      # M11 P0-1: the live turn moved onto the conversation row, so the
+      # watchdog now keys off convObj.turn_state instead of the old
+      # message-tail bookkeeping - same contract (poll while streaming,
+      # stop once the server stamps a terminal state), new data source.
+      '(state.convObj || {}).turn_state' in _appjs and
+      'st === "streaming"' in _appjs and
       "Reconnect catch-up" in _appjs and
       "refreshConv(); refreshSidebar(); refreshJobs()" in _appjs)
 del os.environ["NEOAG_DEMO_DB"]

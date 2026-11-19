@@ -1011,7 +1011,11 @@ class Handler(BaseHTTPRequestHandler):
                     cid = conv["id"]
                 if not (conv.get("title") or "").strip():
                     store.conv_set_title(cid, agent.title_from(text))
-                store.audit("user", "chat.send", cid, {"text": text[:120]})
+                # log field is an explicitly-named preview; the FULL
+                # text is persisted as the message row itself
+                store.audit("user", "chat.send", cid,
+                            {"text_head": text[:120],
+                             "chars": len(text)})
                 msgs = [store.msg_add("user", text, {}, cid)]
                 mode = store.setting("agent_mode", "mock")
                 if mode == "real":

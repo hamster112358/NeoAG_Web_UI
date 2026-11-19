@@ -483,16 +483,19 @@ class Store:
             self.db.commit()
         return cur.rowcount > 0
 
-    def conv_recent_text(self, cid: str, n: int = 12) -> list[str]:
-        """Recent user/agent turns as 'role: text' lines (context
-        reconstruction after an agent job expired)."""
+    def conv_transcript(self, cid: str) -> list[dict]:
+        """The saved conversation: user/agent chat rows in order, with
+        their durable message ids and FULL text (M11 P0-4 context
+        restoration). This never truncates - callers that abbreviate
+        must label it and cite the message id, so an abbreviated
+        preview can never masquerade as the conversation itself."""
         with self.lock:
             rows = self.db.execute(
-                "SELECT role, text FROM messages WHERE conv_id=? "
-                "AND role IN ('user','agent') ORDER BY id DESC LIMIT ?",
-                (cid, n)).fetchall()
-        return [f"{r['role']}: {(r['text'] or '')[:200]}"
-                for r in reversed(rows)]
+                "SELECT id, role, text FROM messages WHERE conv_id=? "
+                "AND role IN ('user','agent') AND visibility='chat' "
+                "ORDER BY id", (cid,)).fetchall()
+        return [{"id": r["id"], "role": r["role"], "text": r["text"] or ""}
+                for r in rows]
 
     # ---------- messages ----------
     def msg_add(self, role: str, text: str, meta: dict | None = None,

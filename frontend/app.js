@@ -1100,8 +1100,33 @@ function convFetchPath(cid) {
     (state.techView ? "?include=audit" : "");
 }
 
+/* M11 P0-4 recoverable drafts: an un-sent message belongs to the chat
+   it was written in. Switching chats parks the draft (localStorage,
+   keyed by conversation) and restores the target chat's own draft, so
+   text is never lost and never silently follows the user into a
+   different conversation. */
+const DRAFT_KEY = "nj_drafts";
+function draftsAll() {
+  try { return JSON.parse(localStorage.getItem(DRAFT_KEY) || "{}"); }
+  catch { return {}; }
+}
+function draftSave(cid) {
+  if (!cid) return;
+  const all = draftsAll();
+  const v = $("chat-input").value;
+  if (v) all[cid] = v; else delete all[cid];
+  try { localStorage.setItem(DRAFT_KEY, JSON.stringify(all)); }
+  catch { /* quota / private mode: composer still holds it live */ }
+}
+function draftLoad(cid) {
+  const all = draftsAll();
+  $("chat-input").value = (cid && all[cid]) || "";
+}
+
 async function openConv(cid, quiet) {
+  draftSave(state.activeCid);
   state.activeCid = cid;
+  draftLoad(cid);
   renderSidebar();
   if (!cid) { state.convMsgs = []; renderChat(); return; }
   try {
@@ -1507,6 +1532,7 @@ $("chat-form").addEventListener("submit", async (ev) => {
     const r = await api("POST", "/api/chat",
                         { text, conv_id: state.activeCid || "" });
     state.activeCid = r.conv_id;
+    draftSave(state.activeCid);   // sent: its parked draft is no more
     await refreshConv();
     await refreshSidebar();
     await refreshJobs();
@@ -1516,10 +1542,13 @@ $("chat-form").addEventListener("submit", async (ev) => {
     // is never lost on a failed send, and surface the server's own
     // explanation rather than a bare "HTTP 413".
     if (!$("chat-input").value) $("chat-input").value = text;
+    draftSave(state.activeCid);
     const detail = (e.data && (e.data.detail || e.data.error)) || e.message;
     toast(t("toast.sendFail", { e: detail }), true);
   }
 });
+$("chat-input").addEventListener("input",
+                                 () => draftSave(state.activeCid));
 $("chat-input").addEventListener("keydown", (ev) => {
   if (ev.key === "Enter" && !ev.shiftKey) {
     ev.preventDefault();

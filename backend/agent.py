@@ -41,6 +41,11 @@ APPROVALS_DIR = AGENT_WS + "/.neoag-approvals"
 # revocable; enforced by gate.py itself, not by the UI hiding cards.
 SCOPE_GRANTS_FILE = "scope-grants.json"
 SCOPE_TTL_SECONDS = 4 * 3600
+# M11 P0-4: tool outputs are stored COMPLETE in the execution record
+# (the old [:600] cap silently deleted evidence). This bound exists
+# only so one pathological output cannot bloat the store unbounded;
+# if it ever engages it leaves an explicit marker + the true size.
+TOOL_OUTPUT_STORE_MAX = 200_000
 # NEOAG_TASKQ_DIR isolates the deployed task-query helper for
 # verification batteries (fresh DB => fresh token; the live workspace
 # token for the :8712 server must not be overwritten).
@@ -476,6 +481,71 @@ class DemoAgent:
         "starting open-ended tool exploration. The "
         "user's message follows.\n\n")
 
+    # M11 P0-4 context restoration budget: at most this many characters
+    # of rolling transcript ride along with a recovery dispatch. Older
+    # turns are not dropped or silently clipped - they are marked
+    # ABBREVIATED with their message id, and the FULL text of every
+    # message is written to a workspace file the fresh session can read.
+    RECOVERY_CTX_BUDGET = 16_000
+    CONV_CTX_SUBDIR = ".neoag-chat"
+
+    def _recovery_context(self, conv_id: str, hist: list[dict]) -> str:
+        """Build the recovery context for a fresh agent session.
+
+        Three parts, per the message-integrity requirement: durable
+        message references (every line cites its stored message id),
+        reliable history retrieval (full transcript file inside the
+        agent workspace, written atomically, survives restarts), and
+        explicit context budgeting (a line that had to be shortened
+        here announces it instead of masquerading as the message)."""
+        if not hist:
+            return ""
+        rel = ""
+        try:
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", conv_id) or "conv"
+            d = os.path.join(AGENT_WS, self.CONV_CTX_SUBDIR, safe)
+            os.makedirs(d, exist_ok=True)
+            lines = ["# Saved NeoAG Web conversation " + conv_id, "",
+                     "Every stored chat message, oldest first, in full.",
+                     ""]
+            for m in hist:
+                lines += [f"## message {m['id']} ({m['role']}, "
+                          f"{len(m['text'])} chars)", "",
+                          m["text"], ""]
+            tmp = os.path.join(d, "transcript.md.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            os.replace(tmp, os.path.join(d, "transcript.md"))
+            rel = f"{self.CONV_CTX_SUBDIR}/{safe}/transcript.md"
+        except Exception:
+            rel = ""  # best-effort file copy; window below still labels itself
+        out, used, trimming = [], 0, False
+        for m in reversed(hist):
+            full = f"[{m['role']} #{m['id']}]: {m['text']}"
+            if trimming or used + len(full) > self.RECOVERY_CTX_BUDGET:
+                trimming = True
+                head = m["text"].replace("\n", " ")[:180]
+                where = (f"read message {m['id']} in '{rel}'" if rel
+                         else "full text is in the interface's message store")
+                out.append(f"[{m['role']} #{m['id']} ABBREVIATED here - "
+                           f"{len(m['text'])} chars stored; for the full "
+                           f"text, {where}] {head}...")
+            else:
+                used += len(full) + 1
+                out.append(full)
+        out.reverse()
+        hdr = ("Saved transcript of this conversation from the NeoAG Web "
+               "interface (fresh agent session - the previous one ended). "
+               "Lines marked ABBREVIATED are truncated previews, NOT the "
+               "full message"
+               + (f"; the complete text of every stored message is at "
+                  f"'{rel}' in your workspace (one '## message <id>' "
+                  "section per message) - read it before relying on "
+                  "anything a preview cuts off" if rel else "")
+               + ".\n\n")
+        return hdr + "\n".join(out) + \
+            "\n\nThe user's current message follows verbatim.\n\n"
+
     def handle_real(self, text: str, conv_id: str,
                     recovering: bool = False) -> list[dict]:
         """Route one user turn to the conversation's real agent job
@@ -532,17 +602,18 @@ class DemoAgent:
                                       "err": str(r.get("error")
                                                  or r)[:200]})
             if started is None:
-                # durable-history recovery: rebuild context from saved
-                # messages, then dispatch a fresh job. The "previous
-                # session ended" notice is only honest when a real
-                # agent session actually existed for this chat before.
-                hist = [ln for ln in self.store.conv_recent_text(conv_id, 14)]
-                ctx = ""
-                if hist:
-                    ctx = ("Rolling transcript of this conversation "
-                           "(fresh agent session - the previous one ended; "
-                           "saved history rides along):\n"
-                           + "\n".join(f"- {h}" for h in hist) + "\n\n")
+                # durable-history recovery (M11 P0-4): rebuild context
+                # from the stored message rows themselves - durable
+                # message references + a file-backed full transcript +
+                # an explicitly budgeted recent window. Nothing is ever
+                # silently shortened here: every abbreviated line says
+                # so and cites its message id. The user's current
+                # message is appended VERBATIM (codebuddy_client raises
+                # over transport limits, it never slices). The
+                # "previous session ended" notice is only honest when a
+                # real agent session actually existed for this chat.
+                hist = self.store.conv_transcript(conv_id)
+                ctx = self._recovery_context(conv_id, hist)
                 try:
                     ensure_task_gateway(self.store)
                 except Exception:
@@ -815,10 +886,32 @@ class DemoAgent:
                             if isinstance(raw, dict):
                                 raw = raw.get("text") or json.dumps(
                                     raw, ensure_ascii=False)
-                            # stored RAW: frontend escapes once at render
-                            out = str(raw or "")[:600]
+                            # M11 P0-4: the execution record keeps the
+                            # FULL tool output - the old silent [:600]
+                            # cap deleted the evidence it claimed to
+                            # preserve. The one-line body is a preview,
+                            # marked as such; meta carries the complete
+                            # text (bounded storage, with an explicit
+                            # marker + original size if the cap ever
+                            # engages).
+                            full = str(raw or "")
+                            stored = full
+                            if len(full) > TOOL_OUTPUT_STORE_MAX:
+                                stored = (
+                                    full[:TOOL_OUTPUT_STORE_MAX]
+                                    + f"\n[END OF STORED RECORD at "
+                                      f"{TOOL_OUTPUT_STORE_MAX} chars: "
+                                      f"{len(full)} chars were produced, "
+                                      f"the tail is not stored]")
+                            meta["tool_output"] = stored
+                            meta["tool_output_chars"] = len(full)
+                            if len(stored) != len(full):
+                                meta["tool_output_truncated"] = True
+                            out = (full if len(full) <= 600 else
+                                   full[:600] +
+                                   f" ... [preview of {len(full)} chars; "
+                                   "full output in the record]")
                             body = f"[tool {status}] {out}"
-                            meta["tool_output"] = out
                             self._scan_gate_confirm(u, conv_id, st)
                         # M11 P0-1: the full per-call execution record
                         # is persisted as an audit row - durable,
@@ -874,7 +967,13 @@ class DemoAgent:
                         # purpose; the honest terminal below stands.
                         return
                     else:
-                        live = str(detail.get("detail") or "")[:200]
+                        _det = str(detail.get("detail") or "")
+                        # shown inside a user-visible message: if it
+                        # must be shortened (M11 P0-4) say so, never
+                        # clip silently
+                        live = (_det if len(_det) <= 200 else
+                                _det[:200] + f"... [gateway detail "
+                                f"trimmed from {len(_det)} chars]")
                         label = {"done": "no reply recorded",
                                  "failed": "failed",
                                  "stopped": "cancelled"}[state]
