@@ -362,17 +362,29 @@ SCIENCE_CONTROLS = [
      "evidence": f"{RUN_CLI} run.add_argument('--automatic-tool-policy', "
                  "choices=[all-available, balanced, minimal])"},
     {"id": "skip_dna_sv", "section": "structural_variants",
-     "label": "Disable the DNA SV calling branch",
-     "control": "checkbox", "native_default": False,
-     "affects": "The run produces no SV-derived peptide events at all; "
-                "supplying an SV VCF input is then pointless.",
-     "evidence": f"{RUN_CLI} run.add_argument('--skip-dna-sv')"},
+     "label": "DNA structural-variant branch",
+     "control": "checkbox", "run_row": True, "web_run_default": False,
+     "native_default": False,
+     "affects": "This interface starts the SV branch OFF: the run then "
+                "explicitly records DNA_SV_UNASSESSED and produces no "
+                "SV-derived events. Tick to RUN the branch (it then "
+                "needs an SV VCF or a tumor/normal DNA BAM pair). "
+                "Switching it off does NOT touch the RNA side - "
+                "fusion and splice evidence come from the RNA branch "
+                "alone and keep running.",
+     "evidence": f"{RUN_CLI} run.add_argument('--skip-dna-sv') + "
+                 "scripts/generate_production_from_results_manifest.py "
+                 "(skip_dna_sv gates only the dna_sv stage; RNA fusion "
+                 "evidence is added independently)"},
     {"id": "skip_bam_matcher", "section": "structural_variants",
-     "label": "Skip the tumor/normal identity check",
-     "control": "checkbox", "native_default": False,
-     "affects": "Turns off the BAM sample-identity (contamination/swap) "
-                "guard. Only tick when identity was verified elsewhere - "
-                "this weakens a safety check.",
+     "label": "Tumor/normal identity check (sample guard)",
+     "control": "checkbox", "run_row": True, "web_run_default": True,
+     "guarded": True, "native_default": False,
+     "affects": "This is a SAFETY guard, not an analysis preference. "
+                "It stays ON unless you deliberately turn it off, which "
+                "additionally requires an explicit written confirmation "
+                "that identity was verified elsewhere; the confirmation "
+                "is recorded with the job.",
      "evidence": f"{RUN_CLI} run.add_argument('--skip-bam-matcher')"},
     {"id": "event_top_n", "section": "ranking_reporting",
      "label": "Event top-N",

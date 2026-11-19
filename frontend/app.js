@@ -289,10 +289,12 @@ const I18N = {
     "mode.ctrl": "Controlled",
     "mode.help": "Autonomous: planning runs, and the planner's own pass leads straight to execution under the authorization you give below. Controlled: after planning, the plan waits for your explicit Run/Abort decision.",
     "opt.title": "Analysis options",
-    "opt.note": "Required steps always run and cannot be switched off. Optional steps run unless you switch them off here. Steps marked not applicable come from the planner's own verdict on this data.",
+    "opt.note": "Native stages in the RUN direction: required steps always run and cannot be switched off. Optional branches state what runs - the DNA SV branch is OFF by default here, tick to run it; the sample-identity guard stays on unless deliberately disabled. Steps marked not applicable come from the planner's own verdict on this data.",
     "opt.req": "Always runs",
     "opt.runs": "Runs",
     "opt.off": "Skipped this run",
+    "opt.offDefault": "Off by default here",
+    "opt.guardAck": "I confirm the tumor/normal sample identity was verified outside this run; turning the guard off is recorded with the job.",
     "opt.na": "Not applicable this run",
     "rdy.title": "Readiness check",
     "rdy.run": "Check the whole workflow now",
@@ -603,10 +605,12 @@ const I18N = {
     "mode.ctrl": "受控",
     "mode.help": "自主：完成规划后，在你下方给出的授权范围内直接进入执行。受控：规划完成后，运行计划会先等待你明确选择「执行」或「中止」。",
     "opt.title": "分析项目",
-    "opt.note": "必需项目始终执行，不能关闭。可选项目默认开启；如需跳过请在此关闭。「不适用」来自规划器对本批数据的实际判定。",
+    "opt.note": "按原生阶段、以「执行方向」列出：必需项目始终执行，不能关闭。可选分支表示本次是否运行——DNA 结构变异（SV）分支在本界面默认关闭，勾选后才运行；样本身份核验（安全检查）默认开启，除非刻意关闭。「不适用」来自规划器对本批数据的实际判定。",
     "opt.req": "始终执行",
     "opt.runs": "本次执行",
     "opt.off": "本次已跳过",
+    "opt.offDefault": "本界面默认关闭",
+    "opt.guardAck": "我确认肿瘤/正常样本身份已在别处核实；关闭该安全检查将随任务一并记录。",
     "opt.na": "本次不适用",
     "rdy.title": "就绪检查",
     "rdy.run": "立即检查完整流程",
@@ -1585,8 +1589,23 @@ $("tech-toggle").addEventListener("click", async () => {
   state.techView = !state.techView;
   try { localStorage.setItem("nj_tech", state.techView ? "1" : "0"); }
   catch { /* private mode */ }
+  // technical view also governs the raw planner dump (M11 P0-6)
+  showPlanBlock($("plan-block") &&
+                $("plan-block").dataset.hasplan === "1");
   await refreshConv();
 });
+
+/* M11 P0-6: the raw native planning dump is TECHNICAL detail - gated
+   behind the same technical-view toggle as the execution record, never
+   a section of the normal page. Options/readiness stay visible because
+   they state what WILL run in plain terms. */
+function showPlanBlock(hasPlan, open) {
+  const el = $("plan-block");
+  if (!el) return;
+  el.dataset.hasplan = hasPlan ? "1" : "";
+  el.hidden = !(hasPlan && state.techView);
+  if (open && state.techView) el.open = true;
+}
 
 async function refreshJobs() {
   try {
@@ -1692,6 +1711,14 @@ function restoreView() {
    out of this view - the API keeps serving them for audit. */
 let planDebounce = null;
 
+/* M11 P0-6 run-rows: a checkbox row states a scientific BRANCH or
+   GUARD in RUN direction (checked = it runs). Each row carries
+   web_run_default: what THIS interface submits when untouched. The SV
+   branch defaults OFF here even though native defaults to running it
+   - so the payload states skip_dna_sv explicitly (see
+   nativeParamsPayload), while this function returns only the user's
+   DEVIATIONS from the interface defaults (what the "N changed" badge
+   and Restore-defaults act on). */
 function scienceOverrides() {
   const cfg = {};
   if (!state.params) return cfg;
@@ -1699,9 +1726,9 @@ function scienceOverrides() {
     const el = document.querySelector(`[data-param="${CSS.escape(c.id)}"]`);
     if (!el) return;
     if (c.control === "checkbox") {
-      // option rows are "runs" checkboxes: unchecked = skip this run,
-      // which is exactly the skip_* override the native CLI applies
-      if (!el.checked) cfg[c.id] = true;
+      const defaultSkip = !(c.web_run_default !== false);
+      const skip = !el.checked;
+      if (skip !== defaultSkip) cfg[c.id] = skip;
     } else if (c.control === "number") {
       const v = parseInt(el.value, 10);
       if (!isNaN(v) && v !== Number(c.native_default)) cfg[c.id] = v;
@@ -1761,8 +1788,8 @@ function scLabelZh(id) {
   return {
     rna_quant_method: "转录本定量后端",
     automatic_tool_policy: "替代工具策略",
-    skip_dna_sv: "跳过 DNA 结构变异识别",
-    skip_bam_matcher: "跳过肿瘤/正常样本一致性检查",
+    skip_dna_sv: "DNA 结构变异（SV）分支",
+    skip_bam_matcher: "肿瘤/正常样本身份核验（安全检查）",
     event_top_n: "事件排名数量上限",
     candidate_top_n: "候选肽排名数量上限",
     genome_build: "基因组版本",
@@ -1772,8 +1799,8 @@ function scHintZh(id) {
   return {
     rna_quant_method: "决定用哪个定量工具产生表达证据。",
     automatic_tool_policy: "主工具不可用时允许改用哪些替代证据来源。",
-    skip_dna_sv: "勾选后本次运行不再产生 SV 来源的肽段事件。",
-    skip_bam_matcher: "关闭样本身份（污染/混淆）安全检查——仅当已在别处核实身份时才勾选。",
+    skip_dna_sv: "本界面默认关闭该分支（运行记录会明确标注 DNA_SV_UNASSESSED）；勾选后才会运行 SV 识别（需 SV VCF 或肿瘤/正常 DNA BAM 配对）。关闭它不影响 RNA 侧——融合与剪接证据只来自 RNA 分支，照常执行。",
+    skip_bam_matcher: "这是安全检查（污染/样本混淆核验），不是分析偏好。默认保持开启；如需关闭必须另行书面确认身份已在别处核实，该确认将随任务记录。",
     event_top_n: "最终排名保留的事件级行数（1-500）。",
     candidate_top_n: "每条分析线保留的肽-HLA 候选数（1-2000）。",
     genome_build: "参考序列与注释资产必须与之一致。",
@@ -1873,7 +1900,7 @@ function renderPrepFlow() {
     $("prep-flow").innerHTML = "";
     $("prep-actions").hidden = true;
     $("sci-block").hidden = true;
-    $("plan-block").hidden = true;
+    showPlanBlock(false);
     $("options-block").hidden = true;
     $("ready-block").hidden = true;
     $("approval-note").hidden = true;
@@ -2214,7 +2241,7 @@ function renderConfirmed() {
     (p.inputs || []).length + " " + esc(t("inv.recognized", { n: "" }).trim()));
   $("prep-flow").appendChild(card);
   $("sci-block").hidden = false;
-  $("plan-block").hidden = false;
+  showPlanBlock(true);
   $("options-block").hidden = false;
   $("ready-block").hidden = false;
   $("prep-actions").hidden = false;
@@ -2232,8 +2259,7 @@ async function loadPlan() {
   if (!m || m.status !== "confirmed") return;
   prep.planState = "loading";
   const body = $("plan-body");
-  $("plan-block").hidden = false;
-  $("plan-block").open = true;
+  showPlanBlock(true, true);
   body.innerHTML = `<div class="prep-progress"><span class="spin"></span>
     <span>${esc(t("plan.loading"))}</span></div>`;
   try {
@@ -2269,6 +2295,7 @@ function renderOptions() {
     return;
   }
   block.hidden = false;
+  state.guardAck = state.guardAck || {};
   $("options-note").textContent = t("opt.note");
   const ov = state.requestedConfig || {};
   const rows = [];
@@ -2276,13 +2303,26 @@ function renderOptions() {
     .filter((c) => c.control === "checkbox")
     .forEach((c) => {
       const id = esc(c.id);
-      const on = !ov[c.id];            // default: the step runs
+      // RUN-direction row: default from the interface's stated product
+      // default (SV branch off, identity guard on), deviation applied
+      const on = ov[c.id] !== undefined
+        ? !ov[c.id] : (c.web_run_default !== false);
       const name = LANG === "zh" ? scLabelZh(c.id) : c.label;
       const hint = LANG === "zh" ? scHintZh(c.id) : "";
-      rows.push(`<div class="opt-row${on ? "" : " off"}">
+      const tag = on ? t("opt.runs")
+        : (ov[c.id] === undefined ? t("opt.offDefault") : t("opt.off"));
+      let ack = "";
+      if (c.guarded && !on) {
+        // skipping a safety guard takes a SEPARATE written
+        // confirmation - a deliberate act, recorded with the job
+        ack = `<label class="chk ack-row"><input type="checkbox"
+          data-ack="${id}"${state.guardAck[c.id] ? " checked" : ""}>
+          <span>${esc(t("opt.guardAck"))}</span></label>`;
+      }
+      rows.push(`<div class="opt-row${on ? "" : " off"}${c.guarded ? " guarded" : ""}">
         <label class="chk"><input type="checkbox" data-param="${id}"
           ${on ? "checked" : ""}><span>${esc(name)}</span></label>
-        <span class="opt-tag">${esc(on ? t("opt.runs") : t("opt.off"))}</span>
+        <span class="opt-tag">${esc(tag)}</span>${ack}
         ${hint ? `<div class="sc-hint">${esc(hint)}</div>` : ""}</div>`);
     });
   const plan = prep.plan;
@@ -2300,8 +2340,15 @@ function renderOptions() {
   });
   $("options-body").innerHTML = rows.join("") ||
     `<div class="hint">${esc(t("plan.loading"))}</div>`;
-  document.querySelectorAll("#options-body input[data-param]")
+  document.querySelectorAll(
+    "#options-body input[data-param], #options-body input[data-ack]")
     .forEach((el) => el.addEventListener("change", () => {
+      if (el.dataset.ack) {
+        state.guardAck[el.dataset.ack] = el.checked;
+      } else if (el.checked && el.dataset.param) {
+        // guard switched back ON: the written confirmation is moot
+        delete state.guardAck[el.dataset.param];
+      }
       updateSciState();
       renderOptions();
       renderScience();     // keep the fold's "changed" count in sync
@@ -2448,9 +2495,27 @@ function nativeParamsPayload() {
   const sci = scienceOverrides();
   const fwd = {};
   ["event_top_n", "candidate_top_n", "genome_build",
-   "rna_quant_method", "automatic_tool_policy",
-   "skip_dna_sv", "skip_bam_matcher"].forEach((k) => {
+   "rna_quant_method", "automatic_tool_policy"].forEach((k) => {
     if (sci[k] !== undefined && sci[k] !== "") fwd[k] = sci[k];
+  });
+  // run-rows are ALWAYS explicit (never absent): this interface's
+  // default differs from native's on the SV branch, so silence would
+  // mean the opposite of what the UI shows. A guarded skip (identity
+  // check off) is only submitted together with its separate written
+  // confirmation - the server rejects the pair incomplete.
+  ((state.params || {}).science || []).forEach((c) => {
+    if (c.control !== "checkbox") return;
+    const el = document.querySelector(`[data-param="${CSS.escape(c.id)}"]`);
+    if (!el) return;
+    if (c.guarded && !el.checked) {
+      const ack = document.querySelector(
+        `[data-ack="${CSS.escape(c.id)}"]`);
+      if (!(ack && ack.checked)) return;   // unconfirmed: guard stays on
+      fwd[c.id] = true;
+      fwd.identity_verified_elsewhere = true;  // web-layer ack, audited
+      return;
+    }
+    fwd[c.id] = !el.checked;
   });
   return fwd;
 }

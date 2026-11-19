@@ -153,6 +153,18 @@ def validate_scientific(params):
         v = params.get(k)
         if v not in (None, "", True, False):
             errs.append(f"{k} must be true or false")
+    # M11 P0-6: the sample-identity guard is not casually skippable.
+    # Turning it off is a deliberate, recorded decision: it is accepted
+    # only together with an explicit acknowledgement (which the Web UI
+    # can only produce by a second, separate confirmation click). The
+    # ack itself is a Web-layer field - it is NOT in the forwarding
+    # whitelist, so it never reaches a native command.
+    if params.get("skip_bam_matcher") is True and \
+            params.get("identity_verified_elsewhere") is not True:
+        errs.append(
+            "skip_bam_matcher turns off the tumor/normal sample-identity "
+            "guard and is only accepted with an explicit "
+            "identity_verified_elsewhere confirmation")
     return errs
 
 
