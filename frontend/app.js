@@ -943,6 +943,22 @@ function renderAll() {
   renderPrepFlow();
 }
 
+/* M11 P0-5: coalesce chat-event refetches. While a real-agent turn is
+   live, chat events arrive constantly (and SSE reconnect replays a
+   burst); each one used to fire its own full conversation GET and
+   sidebar re-render. One fetch per short window carries the same
+   state - and the streaming watchdog remains the delivery guarantee
+   when events never arrive at all. */
+let chatRefreshT = null;
+function chatRefreshSoon(convId) {
+  if (convId && convId !== state.activeCid) { refreshSidebar(); return; }
+  if (chatRefreshT) return;
+  chatRefreshT = setTimeout(() => {
+    chatRefreshT = null;
+    refreshConv(); refreshSidebar();
+  }, 150);
+}
+
 let es = null;
 function connectSSE() {
   if (es) es.close();
@@ -965,10 +981,8 @@ function connectSSE() {
   es.onmessage = (m) => {
     let ev = {};
     try { ev = JSON.parse(m.data); } catch { return; }
-    if (ev.type === "chat") {
-      if (!ev.conv_id || ev.conv_id === state.activeCid) refreshConv();
-      refreshSidebar();
-    } else if (ev.type === "conversations") refreshSidebar();
+    if (ev.type === "chat") chatRefreshSoon(ev.conv_id);
+    else if (ev.type === "conversations") refreshSidebar();
     else if (ev.type === "job" || ev.type === "approval") {
       refreshJobs(); renderAttention(); refreshConv();
       if (state.jobDetail) openJob(state.jobDetail, true);
@@ -1429,8 +1443,16 @@ function renderChat() {
       <div class="es">${esc(t("chat.emptySub"))}</div>
     </div>`;
   }
-  log.innerHTML = html;
-  log.scrollTop = log.scrollHeight;
+  // M11 P0-5: identical content must not touch the DOM. The watchdog
+  // and duplicate SSE events redraw the same conversation constantly;
+  // each blind innerHTML write rebuilt every node and yanked the
+  // scroll position back to the bottom.
+  const sig = (state.activeCid || "") + "\u0000" + html;
+  if (sig !== renderChat._sig) {
+    renderChat._sig = sig;
+    log.innerHTML = html;
+    log.scrollTop = log.scrollHeight;
+  }
 }
 
 /* activity line right above the composer - what the agent is doing

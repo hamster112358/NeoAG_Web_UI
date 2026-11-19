@@ -115,7 +115,25 @@ CREATE TABLE IF NOT EXISTS exports(
   filename TEXT, path TEXT, bytes INTEGER, sha256 TEXT, source_hash TEXT,
   version INTEGER, created_at TEXT, meta_json TEXT
 );
+
 """
+
+# M11 P0-5: every hot read is a conversation- or job-scoped range query,
+# and the DB only grows (every tool event is a stored row). Before these
+# indexes each of them was a FULL SCAN - conv_list even ran one message
+# full scan PER conversation on every sidebar refresh. They live HERE,
+# after the ALTER migrations (a pre-P0-1 messages table has no conv_id
+# column until the migration tuple runs), and IF NOT EXISTS makes them
+# an idempotent in-place upgrade for every existing database.
+MIGRATION_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_messages_conv "
+    "ON messages(conv_id, visibility)",
+    "CREATE INDEX IF NOT EXISTS idx_conversations_open "
+    "ON conversations(deleted, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_decisions_job ON decisions(job_id)",
+    "CREATE INDEX IF NOT EXISTS idx_researchevents "
+    "ON research_events(research_id, id)",
+)
 
 JOB_STATES = {"queued", "running", "paused", "blocked", "completed", "failed",
               "cancelled"}
@@ -214,6 +232,11 @@ class Store:
                     self.db.execute(stmt)
                 except sqlite3.OperationalError:
                     pass  # column already present
+            for stmt in MIGRATION_INDEXES:
+                try:
+                    self.db.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass  # table not present yet
             self.db.commit()
             self._m11_p01_backfill()
 

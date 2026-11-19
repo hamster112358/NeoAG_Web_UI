@@ -853,6 +853,7 @@ class DemoAgent:
                         return
                 else:
                     dead_ticks = 0
+                dirty = False
                 for u in items:
                     kind = str(u.get("sessionUpdate") or "")
                     if kind in ("tool_call", "tool_call_update"):
@@ -918,12 +919,19 @@ class DemoAgent:
                         # complete, but NOT conversation noise
                         self.store.msg_add("tool", body, meta, conv_id,
                                            visibility="audit")
-                        publish({"type": "chat", "conv_id": conv_id})
+                        dirty = True
                     elif kind == "agent_message_chunk":
                         mid = str(u.get("messageId") or "")
                         txt = (u.get("content") or {}).get("text") or ""
                         if mid and txt.strip():
                             st["replies"][mid] = txt
+                # M11 P0-5: publish at most ONE chat event per poll cycle,
+                # not one per tool event. A busy 60-call turn used to fire
+                # 60 SSE refetches every poll, each a full conversation
+                # reload on every connected client; the data is identical
+                # regardless of how many rows this batch wrote.
+                if dirty:
+                    publish({"type": "chat", "conv_id": conv_id})
                 if (not stall_noted and
                         time.time() - last_move > self.STALL_NOTICE_SECONDS):
                     # M11 P0-3: an honest WAITING notice is not a fake
