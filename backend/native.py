@@ -156,11 +156,68 @@ def validate_scientific(params):
     return errs
 
 
+TOOLS_ENV_SCRIPT = os.path.join(NATIVE_ROOT, "conf", "tools.env.sh")
+TOOLS_MANIFEST = os.path.join(NATIVE_ROOT, "configs", "tools",
+                              "tools_manifest.yaml")
+REFERENCE_MANIFEST = os.path.join(NATIVE_ROOT, "configs", "references",
+                                  "reference_manifest.yaml")
+
+_source_cache = {"ts": 0.0, "env": None}
+
+
+def _sourced_tools_env():
+    """Deployment environment exactly as every NeoAG stage command sees it:
+    the result of sourcing conf/tools.env.sh (which also sources the site
+    overlay tools.env.local.sh). Without this the capability planner's
+    shutil.which() ran on the server's bare PATH and marked every installed
+    tool UNAVAILABLE (2026-11-19 incident, TEST001 job
+    job-20261119-092608-9e9740). Returns None on any failure - callers then
+    fall back to the plain inherited environment. Cached briefly."""
+    now = time.time()
+    with _lock:
+        if _source_cache["env"] is not None and now - _source_cache["ts"] < 300:
+            return _source_cache["env"]
+    env = None
+    if os.path.isfile(TOOLS_ENV_SCRIPT):
+        try:
+            r = subprocess.run(
+                ["/bin/bash", "-c",
+                 'source "%s" >/dev/null 2>&1 && env -0' % TOOLS_ENV_SCRIPT],
+                capture_output=True, timeout=90)
+            if r.returncode == 0 and r.stdout:
+                env = {}
+                for item in r.stdout.split(b"\0"):
+                    if not item:
+                        continue
+                    k, sep, v = item.partition(b"=")
+                    if not sep:
+                        continue
+                    key = k.decode(errors="replace")
+                    if key in ("SHLVL", "_", "PS1", "SHELLOPTS", "BASHOPTS"):
+                        continue
+                    env[key] = v.decode(errors="replace")
+                if not env.get("PATH"):
+                    env = None
+        except Exception:                              # noqa: BLE001
+            env = None
+    with _lock:
+        _source_cache.update(ts=now, env=env)
+    return env
+
+
 def _env():
-    e = os.environ.copy()
+    sourced = _sourced_tools_env()
+    # the sourced deployment env is a superset of the server env (the bash
+    # subshell inherits it and tools.env.sh only adds/overrides), so when
+    # present it is the correct base; fall back to the bare copy only if
+    # sourcing failed
+    e = dict(sourced) if sourced else os.environ.copy()
     src = os.path.join(NATIVE_ROOT, "src")
     e["PYTHONPATH"] = src + (":" + e["PYTHONPATH"] if e.get("PYTHONPATH") else "")
     e.setdefault("NEOAG_TOOLS_ROOT", NATIVE_ROOT)
+    # OPEN_NEO_REFERENCE_ROOT (needed by reference_manifest.yaml resolution)
+    # comes from the sourced deployment env; in fallback mode the plain
+    # os.environ copy already carries it if the operator exported it.
     # the deployed tree is frozen/read-only from our side: never let an
     # import write __pycache__ into it
     e["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -222,6 +279,17 @@ def probe(force=False):
                       "cache_version": VEP_CACHE_VERSION},
         "vep_plugins": {"path": VEP_PLUGINS, "present": os.path.isdir(VEP_PLUGINS)},
         "demo_fixtures": {"present": demo_available()},
+    }
+    # honest discovery wiring (2026-11-19): does the deployment toolchain
+    # env actually reach our subprocesses?
+    out["tools_env"] = {
+        "script": TOOLS_ENV_SCRIPT,
+        "present": os.path.isfile(TOOLS_ENV_SCRIPT),
+        "sourced_ok": _sourced_tools_env() is not None,
+        "tools_manifest": {"path": TOOLS_MANIFEST,
+                           "present": os.path.isfile(TOOLS_MANIFEST)},
+        "reference_manifest": {"path": REFERENCE_MANIFEST,
+                               "present": os.path.isfile(REFERENCE_MANIFEST)},
     }
     out["cancel_supported_by_native_gateway"] = False  # verified: no such route
     with _lock:
@@ -339,6 +407,14 @@ def build_plan_argv(params, outdir):
                 argv += ["--" + k.replace("_", "-"), str(item)]
         else:
             argv += ["--" + k.replace("_", "-"), str(v)]
+    # 2026-11-19: without the manifests the planner has no refs dict and no
+    # command_template access, so facets/sequenza/purple/spechla-loh rows all
+    # degrade to UNAVAILABLE/TEMPLATE_REQUIRED. Both flags exist on the
+    # deployed run subparser (cli.py:145-146).
+    for flag, path in (("--tools-manifest", TOOLS_MANIFEST),
+                       ("--reference-manifest", REFERENCE_MANIFEST)):
+        if os.path.isfile(path):
+            argv += [flag, path]
     return argv
 
 
@@ -403,6 +479,13 @@ def build_execute_payload(params, outdir, stub=False, timeout=EXEC_TIMEOUT_DEFAU
             continue
         payload[k] = (list(v) if k == "hla_alleles" and not isinstance(v, str)
                       else v)
+    # same rationale as build_plan_argv: /open/run ROUTE_SPECS carries
+    # tools_manifest/reference_manifest (verified against gateway source
+    # 2026-11-19) and run_open_neo forwards them to the capability planner.
+    if os.path.isfile(TOOLS_MANIFEST):
+        payload["tools_manifest"] = TOOLS_MANIFEST
+    if os.path.isfile(REFERENCE_MANIFEST):
+        payload["reference_manifest"] = REFERENCE_MANIFEST
     if stub:
         payload["stub"] = True
     return payload
