@@ -1711,9 +1711,14 @@ function restorePrep() {
 }
 
 function renderPrepFlow() {
+  /* #prep-error is deliberately NOT touched here. A previous version
+     cleared it on every rebuild, which silently deleted discovery
+     failure cards seconds after they appeared (incident 2026-11-19:
+     eight clicks on an unauthorized directory, every 400 answered by
+     the backend, every error erased before it could be read). The
+     error lives until the next discovery attempt or an explicit reset. */
   if (!prep.disc) {
     $("prep-flow").innerHTML = "";
-    $("prep-error").innerHTML = "";
     $("prep-actions").hidden = true;
     $("sci-block").hidden = true;
     $("plan-block").hidden = true;
@@ -1766,12 +1771,15 @@ $("prep-discover").addEventListener("click", async () => {
     if (req !== discReq) return;
     const msg = e.timeout
       ? t("prep.timeout")
-      : String((e.data && (e.data.error || e.data.detail)) || e.message);
-    $("prep-error").innerHTML = alertHtml("blocking", t("prep.failTitle"),
-      esc(msg), t("prep.failFix"));
+      : String((e.data && (e.data.error || e.data.detail)) || e.message) +
+        (e.status ? ` (HTTP ${e.status})` : "");
     prep.disc = null; prep.manifest = null;
     prepPersist();
-    renderPrepFlow();
+    renderPrepFlow();          // rebuild the entry area FIRST...
+    /* ...and only then place the failure card, so no rebuild path can
+       ever erase it again (see renderPrepFlow note, 2026-11-19). */
+    $("prep-error").innerHTML = alertHtml("blocking", t("prep.failTitle"),
+      esc(msg), t("prep.failFix"));
   } finally {
     clearInterval(tick);
     if (req === discReq) discoverBtnState(false);
@@ -1854,6 +1862,7 @@ function renderInvCard() {
   if (rc) rc.addEventListener("click", () => {
     prep.disc = null; prep.manifest = null; prep.plan = null; prep.planState = "idle";
     prep.ready = null; prep.readyState = "idle";
+    $("prep-error").innerHTML = "";   // explicit fresh start clears the old card
     VS.drop("picks"); prepPersist(); renderPrepFlow();
     $("prep-dir").focus();
   });
@@ -2344,6 +2353,7 @@ $("nj-submit").addEventListener("click", async () => {
     prep.disc = null; prep.manifest = null; prep.plan = null;
     prep.planState = "idle"; state.requestedConfig = {};
     prep.ready = null; prep.readyState = "idle";
+    $("prep-error").innerHTML = "";   // submitted: the old failure card is moot
     VS.drop("prep");
     renderPrepFlow(); renderScience();
     switchView("tasks");
