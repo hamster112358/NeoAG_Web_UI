@@ -228,6 +228,30 @@ PATH_TOKEN_RE = re.compile(
     r"|[\w.-]*/[^\s'\"`;|&)<>]*")
 REDIR_RE = re.compile(r">>?\s*([\"']?)(~?/[^\s'\"`;|&<>]+)\1")
 
+# M11 P0-2: file-descriptor plumbing is NOT data writing.
+# `ls /path 2>/dev/null`, `cmd 2>&1`, `cmd >&2`, `cmd &>/dev/null` are
+# read-only diagnostics wired to /dev/null or between descriptors; they
+# used to match the redirect-write pattern and raise a DESTRUCTIVE
+# confirmation for pure reads. Only these two exact shapes are removed,
+# and only from the write-classification view (the original command
+# stays the approval identity):
+#   - any `N>`, `N>>`, `&>` / `&>>` whose target is exactly /dev/null
+#   - fd dups: `N>&M`, `N>&>M` (e.g. 2>&1, >&2, 1>&0)
+# A redirect to any other path (`2>err.log`, `&>out.txt`) keeps
+# counting as a write exactly as before - nothing else is weakened.
+FD_NULL_REDIRECT_RE = re.compile(
+    r"(?:^|[\s;&|(])(?:\d*|&)\s*>{1,2}\s*[\"']?/dev/null\b[\"']?")
+FD_DUP_REDIRECT_RE = re.compile(
+    r"(?:^|[\s;&|(])(?:\d+|&)\s*>\s*&>?\s*\d+\b")
+
+
+def strip_fd_redirects(cmd: str) -> str:
+    """Command text with fd plumbing removed, for WRITE CLASSIFICATION
+    only. Redirects to real files are untouched."""
+    cmd = FD_NULL_REDIRECT_RE.sub(" ", cmd)
+    cmd = FD_DUP_REDIRECT_RE.sub(" ", cmd)
+    return cmd
+
 
 def norm(path: str) -> str:
     p = os.path.expanduser(path)
@@ -375,12 +399,16 @@ def decide(ev: dict):
                     {"tool": "Bash", "command": cmd,
                      "class": "dataset_download", "dataset": label,
                      "operation": "download", "destination": dest})
-        dele = bool(DELETE_RE.search(cmd))
-        force = bool(FORCE_RE.search(cmd))
-        mut = bool(WRITE_BASH_RE.search(cmd))
+        # write CLASSIFICATION runs on the fd-plumbing-stripped command
+        # (strip_fd_redirects: 2>/dev/null / 2>&1 are reads, not writes);
+        # dataset detection and deny checks above stay on the RAW cmd
+        cmd_w = strip_fd_redirects(cmd)
+        dele = bool(DELETE_RE.search(cmd_w))
+        force = bool(FORCE_RE.search(cmd_w))
+        mut = bool(WRITE_BASH_RE.search(cmd_w))
         if not (dele or force or mut):
             return None                    # read-only diagnostics
-        wt = write_targets(cmd)
+        wt = write_targets(cmd_w)
         # frozen trees: never a write destination (reads/copies-out OK)
         if any(DENY_FROZEN_RE.search(norm(p)) for p in wt):
             return ("deny",
@@ -392,7 +420,7 @@ def decide(ev: dict):
                     "is fine and needs no approval.",
                     "NeoAG gate: immutable-by-invariant write target")
         if dele:
-            bad = [p for p in PATH_TOKEN_RE.findall(cmd)
+            bad = [p for p in PATH_TOKEN_RE.findall(cmd_w)
                    if not in_allowed(p)]
             if bad:
                 return ("confirm",
