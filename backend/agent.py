@@ -31,8 +31,16 @@ from . import mock_data
 from .policies import POLICY_BY_ID
 from .store import new_id
 
-AGENT_WS = "/data1/neoag/agents/neoag_agent_ws"
+# NEOAG_AGENT_WS relocates the agent workspace (and therefore the
+# grant/scope-grant files the gate reads) for verification batteries;
+# the live server keeps the default path untouched.
+AGENT_WS = os.environ.get("NEOAG_AGENT_WS",
+                          "/data1/neoag/agents/neoag_agent_ws")
 APPROVALS_DIR = AGENT_WS + "/.neoag-approvals"
+# "always allow within this scope" grants (M11 P0-2): narrow, dated,
+# revocable; enforced by gate.py itself, not by the UI hiding cards.
+SCOPE_GRANTS_FILE = "scope-grants.json"
+SCOPE_TTL_SECONDS = 4 * 3600
 # NEOAG_TASKQ_DIR isolates the deployed task-query helper for
 # verification batteries (fresh DB => fresh token; the live workspace
 # token for the :8712 server must not be overwritten).
@@ -71,6 +79,30 @@ def gate_consequence(note: str) -> dict:
                        "reversibility depends on the exact command shown")
     return {"target_paths": targets[:8], "effect_kind": kind,
             "consequence": consequence}
+
+
+_NETWORK_RE = re.compile(
+    r"(^|[\s;&|])(curl|wget|scp|rsync|sftp|ftp|nc)(\s|$)")
+
+
+def effect_classes(note: str, structured: dict) -> list[str]:
+    """M11 P0-2: read/write/delete/network classification derived from
+    the recorded command text. Conservative: anything not confidently
+    parsed is reported as UNDETERMINED, never as safe."""
+    if structured.get("class") == "dataset_download":
+        return ["network-read"]
+    out = []
+    n = note or ""
+    if _DESTRUCTIVE_RE.search(n):
+        out.append("delete")
+    if _OVERWRITE_RE.search(n):
+        out.append("overwrite")
+    if _NETWORK_RE.search(n):
+        out.append("network")
+    if not out:
+        out = ["write-or-execute" if _ABS_PATH_RE.search(n)
+               else "undetermined"]
+    return out
 
 # Official task-query helper (B1 + Milestone 5 routing): the agent
 # queries the SAME backend records the UI shows, through the API,
@@ -604,6 +636,10 @@ class DemoAgent:
                          "job_id": job_id}, conv_id)
                     st["stop"] = False
                     self._finish_turn(st, "cancelled (user interrupt)")
+                    # the session this card belonged to is ended by the
+                    # user - the card can no longer unlock anything
+                    # (M11 P0-2: cancel invalidates stale approvals)
+                    self.store.approval_invalidate_conv(conv_id)
                     publish({"type": "chat", "conv_id": conv_id})
                     return
                 # zombie guard (M7 §6): the gateway no longer has a live
@@ -760,6 +796,13 @@ class DemoAgent:
         op, note = m.group(1), m.group(2)[:300]
         if op in st["ops"]:
             return
+        # durable dedup (M11 P0-2): the same operation already has a
+        # live card - possibly presented before a server restart, which
+        # wiped the old in-memory set and re-asked. Never two cards
+        # for one operation; distinct operations still get their own.
+        if self.store.approval_pending_op("gate_op", op):
+            st["ops"].add(op)
+            return
         st["ops"].add(op)
         from .server import publish
         # structured consent card (Milestone 5 PART 3): the gate writes
@@ -778,6 +821,13 @@ class DemoAgent:
         detail = {"op": op, "conv_id": conv_id, "note": note,
                   "job_id": st["job"]}
         detail.update(gate_consequence(note))
+        detail["effect_classes"] = effect_classes(note, structured)
+        detail["reversibility"] = (
+            "not reversible from this interface"
+            if detail.get("effect_kind") == "delete" else
+            "previous file content may be lost"
+            if detail.get("effect_kind") == "overwrite" else
+            "depends on the exact command shown - no automatic undo")
         # what each answer does - statements about this app's verified
         # grant mechanism, identical for every card:
         detail["approve_effect"] = (
@@ -799,10 +849,48 @@ class DemoAgent:
         aid = new_id("apm")
         self.store.approval_create(
             aid, "", "gate_op", risk,
-            json.dumps(detail, ensure_ascii=False))
+            json.dumps(detail, ensure_ascii=False),
+            op=op, conv_id=conv_id)
         self.store.audit("gate", "gate.confirm_required", aid,
                          {"op": op, "conv": conv_id})
         publish({"type": "approval", "id": aid})
+
+    def rewrite_scope_grants(self) -> None:
+        """Materialise the live scoped grants for gate.py (atomic:
+        tmp file + rename, 0600). Revocation / expiry re-runs this,
+        so 'revoke' has an immediate effect on what the gate allows."""
+        import tempfile
+        grants = [{"id": g["id"], "roots": g["roots"],
+                   "expires": g["expires"]}
+                  for g in self.store.scope_grants_active()]
+        try:
+            os.makedirs(APPROVALS_DIR, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=APPROVALS_DIR)
+            with os.fdopen(fd, "w") as fh:
+                json.dump(grants, fh)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, os.path.join(APPROVALS_DIR,
+                                         SCOPE_GRANTS_FILE))
+        except OSError:
+            pass
+
+    def scope_roots_for(self, detail: dict) -> list[str]:
+        """Narrow roots for an 'always allow within this scope' grant,
+        DERIVED from the recorded target paths: the parent directory
+        of each written target. Refuses anything broad (< 3 path
+        segments, or more than 3 distinct roots) - a grant that would
+        effectively cover the filesystem is not a scope."""
+        roots = []
+        for p in detail.get("target_paths") or []:
+            parent = str(p).rsplit("/", 1)[0] or "/"
+            if parent not in roots:
+                roots.append(parent)
+        if not roots or len(roots) > 3:
+            return []
+        for r in roots:
+            if r.count("/") < 3:      # e.g. /tmp, /data1 - too broad
+                return []
+        return roots
 
     def on_gate_decision(self, appr: dict, approve: bool,
                          decision: str = "", scope_note: str = "") -> None:
@@ -877,15 +965,38 @@ class DemoAgent:
                                            op + ".json"))
                 except OSError:
                     pass
+        if decision == "approve_scope" and op:
+            roots = self.scope_roots_for(info)
+            if roots:
+                gid = new_id("scg")
+                self.store.scope_grant_add(
+                    gid, time.time() + SCOPE_TTL_SECONDS, roots,
+                    appr["id"], op, "writes under these roots only")
+                self.rewrite_scope_grants()
+                self.store.audit("user", "scope.granted", appr["id"],
+                                 {"roots": roots, "op": op,
+                                  "ttl_hours": SCOPE_TTL_SECONDS // 3600})
+            else:
+                # nothing NARROW can be derived from the recorded
+                # targets - degrade honestly to approve-once instead
+                # of inventing a broad grant
+                decision = "approve"
         try:
             client = self._ensure_client()
             if job_id:
                 msg = (
-                    "The user APPROVED this exact operation on the "
-                    "confirmation card. Retry the identical tool call "
-                    "now - the approval unlocks it exactly once - then "
-                    "report the outcome."
-                    if approve else
+                    ("The user APPROVED this exact operation AND "
+                     "auto-approves further writes under: "
+                     + ", ".join(self.scope_roots_for(info))
+                     + " (4 hours, revocable in the interface). Retry "
+                       "the identical tool call now - then report the "
+                       "outcome.")
+                    if decision == "approve_scope" else
+                    ("The user APPROVED this exact operation on the "
+                     "confirmation card. Retry the identical tool call "
+                     "now - the approval unlocks it exactly once - then "
+                     "report the outcome."
+                     if approve else
                     ("The user LIMITS THE SCOPE of this request: "
                      + (scope_note[:300] or "(no detail given)")
                      + ". Do NOT retry the original command. Redo the "
@@ -899,7 +1010,7 @@ class DemoAgent:
                      if decision == "literature_only" else
                      "The user DECLINED the operation on the confirmation "
                      "card. Do not retry it; briefly explain the safest "
-                     "alternative."))
+                     "alternative.")))
                 r = client.reply(job_id, msg)
                 if not r.get("delivered"):
                     raise RuntimeError(str(r)[:160])

@@ -51,7 +51,11 @@ import sys
 import time
 
 WS = "/data1/neoag/agents/neoag_agent_ws"
-APPROVALS = os.path.join(WS, ".neoag-approvals")
+# NEOAG_GATE_APPROVALS relocates the grant/scope files for the gate's
+# own verification battery; production runs without it and keeps using
+# the workspace directory.
+APPROVALS = os.environ.get("NEOAG_GATE_APPROVALS",
+                           os.path.join(WS, ".neoag-approvals"))
 GRANT_TTL_SECONDS = 600
 
 ALLOWED_ROOTS = (WS + "/", "/tmp/", "/var/tmp/",
@@ -219,6 +223,12 @@ def dataset_intent(cmd: str):
                          if DATASET_SOURCE_RE.search(cmd)
                          else "dataset-format file/destination")
 READ_TOOLS = {"Read", "Glob", "Grep", "LS", "list_dir", "NotebookRead"}
+# M11 P0-2: MUT_TOOLS was referenced by the workspace-bound check but
+# NEVER DEFINED - every non-Bash, non-read tool event raised
+# NameError inside this hook, and the host fail-opened, so Write/Edit
+# could write ANYWHERE without a confirmation card. Defining it closes
+# the hole; the confirm path below is what was always intended.
+MUT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 TOOL_PATH_KEYS = ("file_path", "notebook_path", "path", "file")
 # path-like shell tokens: absolute (/... or ~/...), or relative tokens
 # that contain a slash (captured WHOLE, so 'jobs/old.txt' never yields a
@@ -288,6 +298,46 @@ def grant_valid(h: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def scope_match(needles):
+    """M11 P0-2 'always allow within this scope' enforcement: a live,
+    dated grant from scope-grants.json covers EVERY outside path the
+    command touches. Only ever consulted for plain outside-workspace
+    WRITES - deletes, force verbs, secrets, self-protection, frozen
+    trees and formal launches are classified earlier and can never
+    reach a scope grant. Returns the grant id on a full cover."""
+    try:
+        with open(os.path.join(APPROVALS, "scope-grants.json")) as fh:
+            grants = json.load(fh)
+    except Exception:
+        return None
+    now = time.time()
+    for g in grants if isinstance(grants, list) else []:
+        try:
+            if float(g.get("expires", 0)) <= now:
+                continue
+        except (TypeError, ValueError):
+            continue
+        roots = [str(r) for r in (g.get("roots") or [])]
+        if roots and all(
+                any(n == r or n.startswith(r.rstrip("/") + "/")
+                    for r in roots) for n in needles):
+            return str(g.get("id", "?"))
+    return None
+
+
+def scope_audit(gid, needles):
+    """Every scoped auto-allow is journaled - the grant is auditable
+    after the fact, which is part of what makes it acceptable."""
+    try:
+        with open(os.path.join(APPROVALS, "scope-audit.jsonl"),
+                  "a") as fh:
+            fh.write(json.dumps({
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "grant": gid, "paths": list(needles)[:8]}) + "\n")
+    except OSError:
+        pass
 
 
 def emit(decision: str, reason: str, system_msg: str = ""):
@@ -434,6 +484,10 @@ def decide(ev: dict):
                     "force/clean/hard-reset, disk image, or service "
                     "control).", {"tool": "Bash", "command": cmd})
         if mut and any(not in_allowed(p) for p in wt):
+            outside = [p for p in wt if not in_allowed(p)]
+            gid = scope_match(outside)
+            if gid:
+                return ("scoped", gid, outside)
             return ("confirm",
                     "Bash command writes, overwrites or moves files "
                     "into a location outside the authorized job "
@@ -443,6 +497,9 @@ def decide(ev: dict):
     if tool in MUT_TOOLS:
         bad = [p for p in paths if not in_allowed(p)]
         if bad:
+            gid = scope_match(bad)
+            if gid:
+                return ("scoped", gid, bad)
             return ("confirm",
                     f"Tool {tool} writes outside the authorized job "
                     f"workspace ({bad[0]}).",
@@ -478,6 +535,14 @@ def main():
             except OSError:
                 pass
         emit("deny", d[1], d[2])
+        return
+    if d[0] == "scoped":
+        scope_audit(d[1], d[2])
+        emit("allow", "outside-workspace write covered by a dated "
+                      "scoped grant",
+             system_msg=f"NeoAG gate: scoped grant {d[1][:12]} allows "
+                        f"this write ({len(d[2])} target(s) under the "
+                        "granted roots). Revocable in the interface.")
         return
     detail, payload = d[1], d[2]            # ("confirm", detail, payload)
     h = op_hash(payload)

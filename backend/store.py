@@ -16,6 +16,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,7 +41,13 @@ CREATE TABLE IF NOT EXISTS messages(
 );
 CREATE TABLE IF NOT EXISTS approvals(
   id TEXT PRIMARY KEY, created_at TEXT, decided_at TEXT, job_id TEXT,
-  action TEXT, risk TEXT, detail TEXT, state TEXT, decided_by TEXT
+  action TEXT, risk TEXT, detail TEXT, state TEXT, decided_by TEXT,
+  op TEXT DEFAULT '', conv_id TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS scope_grants(
+  id TEXT PRIMARY KEY, created_at TEXT, expires REAL, roots_json TEXT,
+  approval_id TEXT DEFAULT '', op TEXT DEFAULT '', note TEXT DEFAULT '',
+  revoked INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS audit(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, actor TEXT, action TEXT,
@@ -189,6 +196,13 @@ class Store:
                 # a wall of tool rows.
                 "ALTER TABLE messages ADD COLUMN visibility "
                 "TEXT DEFAULT 'chat'",
+                # M11 P0-2: gate-op approvals carry their operation
+                # hash and conversation, so duplicate suppression and
+                # invalidation are durable queries instead of
+                # in-memory state that dies with the server process.
+                "ALTER TABLE approvals ADD COLUMN op TEXT DEFAULT ''",
+                "ALTER TABLE approvals ADD COLUMN conv_id "
+                "TEXT DEFAULT ''",
                 "ALTER TABLE conversations ADD COLUMN turn_state "
                 "TEXT DEFAULT ''",
                 "ALTER TABLE conversations ADD COLUMN turn_ts "
@@ -594,16 +608,118 @@ class Store:
 
     # ---------- approvals ----------
     def approval_create(self, appr_id: str, job_id: str, action: str, risk: str,
-                        detail: str) -> dict:
+                        detail: str, op: str = "",
+                        conv_id: str = "") -> dict:
         with self.lock:
             self.db.execute(
-                "INSERT INTO approvals(id,created_at,job_id,action,risk,detail,state)"
-                " VALUES(?,?,?,?,?,?, 'pending')",
-                (appr_id, now(), job_id, action, risk, detail))
+                "INSERT INTO approvals(id,created_at,job_id,action,risk,"
+                "detail,state,op,conv_id) VALUES(?,?,?,?,?,?, 'pending',"
+                "?,?)",
+                (appr_id, now(), job_id, action, risk, detail, op, conv_id))
             self.db.commit()
         return {"id": appr_id, "created_at": now(), "decided_at": None,
                 "job_id": job_id, "action": action, "risk": risk, "detail": detail,
-                "state": "pending", "decided_by": None}
+                "state": "pending", "decided_by": None,
+                "op": op, "conv_id": conv_id}
+
+    def approval_pending_op(self, action: str, op: str) -> dict | None:
+        """M11 P0-2 duplicate suppression: the SAME operation hash that
+        already has a live card never becomes a second card - even
+        across server restarts (the old in-memory dedup set died with
+        the process and re-presentation followed)."""
+        if not op:
+            return None
+        with self.lock:
+            row = self.db.execute(
+                "SELECT * FROM approvals WHERE action=? AND op=? "
+                "AND state='pending' ORDER BY created_at LIMIT 1",
+                (action, op)).fetchone()
+        return dict(row) if row else None
+
+    def approval_invalidate_conv(self, conv_id: str) -> int:
+        """The turn this card belonged to reached a terminal state
+        (completed / failed / cancelled / restart-interrupted): the
+        pending gate card can no longer unlock anything, so it stops
+        pretending to be actionable. Auditable state change, row kept."""
+        n = 0
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT id FROM approvals WHERE action='gate_op' "
+                "AND conv_id=? AND state='pending'", (conv_id,)).fetchall()
+            for r in rows:
+                self.db.execute(
+                    "UPDATE approvals SET state='stale', decided_at=? "
+                    "WHERE id=?", (now(), r["id"]))
+                n += 1
+            self.db.commit()
+        return n
+
+    def approval_expire_stale(self, ttl_seconds: float = 1800) -> int:
+        """A pending gate card older than its grant can ever live
+        (grants expire in 10 min; cards are given a 30-min grace for
+        reading) is expired on sight - cards must not accumulate as
+        permanently-answerable questions about operations that can no
+        longer run."""
+        cutoff = time.time() - ttl_seconds
+        n = 0
+        with self.lock:
+            for r in self.db.execute(
+                    "SELECT id, created_at FROM approvals WHERE "
+                    "action='gate_op' AND state='pending'").fetchall():
+                try:
+                    ts = datetime.fromisoformat(r["created_at"]).timestamp()
+                except (TypeError, ValueError):
+                    continue
+                if ts < cutoff:
+                    self.db.execute(
+                        "UPDATE approvals SET state='expired', "
+                        "decided_at=? WHERE id=?", (now(), r["id"]))
+                    n += 1
+            self.db.commit()
+        return n
+
+    # ---------- scoped grants (M11 P0-2) ----------
+    def scope_grant_add(self, gid: str, expires: float, roots: list[str],
+                        approval_id: str, op: str, note: str) -> dict:
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO scope_grants(id,created_at,expires,"
+                "roots_json,approval_id,op,note) VALUES(?,?,?,?,?,?,?)",
+                (gid, now(), expires,
+                 json.dumps(roots, ensure_ascii=False),
+                 approval_id, op, note))
+            self.db.commit()
+        return {"id": gid, "created_at": now(), "expires": expires,
+                "roots": roots, "approval_id": approval_id, "op": op,
+                "note": note, "revoked": 0}
+
+    def scope_grant_list(self) -> list[dict]:
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT * FROM scope_grants ORDER BY created_at DESC"
+            ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["roots"] = json.loads(d.pop("roots_json") or "[]")
+            out.append(d)
+        return out
+
+    def scope_grant_revoke(self, gid: str) -> dict | None:
+        with self.lock:
+            row = self.db.execute(
+                "SELECT * FROM scope_grants WHERE id=?", (gid,)).fetchone()
+            if not row or row["revoked"]:
+                return None
+            row = self.db.execute(
+                "SELECT * FROM scope_grants WHERE id=?", (gid,)).fetchone()
+            self.db.commit()
+        return dict(row) if row else None
+
+    def scope_grants_active(self) -> list[dict]:
+        import time as _t
+        return [g for g in self.scope_grant_list()
+                if not g["revoked"] and g["expires"] > _t.time()]
 
     def approval_get(self, appr_id: str) -> dict | None:
         with self.lock:

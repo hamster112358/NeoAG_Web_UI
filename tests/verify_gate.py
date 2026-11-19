@@ -39,6 +39,9 @@ def main():
     g = load_gate()
     ws = g.WS
     fails = []
+    # hermetic: never consult live workspace grants/scope files
+    import tempfile as _tf
+    g.APPROVALS = _tf.mkdtemp(prefix="m11gatescope")
 
     def check(name, cmd, want):
         """want: None | 'confirm' | 'deny'"""
@@ -128,6 +131,89 @@ def main():
     if not ok:
         fails.append(("op-hash identity", cmd, "raw-command hash",
                       json.dumps(payload)[:120]))
+
+    # ---- M11 P0-2: the MUT_TOOLS hole (NameError -> fail-open) ----
+    def check_ev(name, event, want):
+        d = g.decide(event)
+        got = None if d is None else d[0]
+        ok = got == want
+        print(("PASS " if ok else "FAIL ") + name)
+        if not ok:
+            fails.append((name, "event", want, str(d)[:200]))
+
+    check_ev("MUT: Write outside workspace confirms",
+             {"tool_name": "Write", "tool_input":
+              {"file_path": "/data1/neoag/other_place/x.txt"}},
+             "confirm")
+    check_ev("MUT: Edit outside workspace confirms",
+             {"tool_name": "Edit", "tool_input":
+              {"file_path": "/data1/neoag/other_place/x.txt"}},
+             "confirm")
+    check_ev("MUT: Write inside workspace allows",
+             {"tool_name": "Write", "tool_input":
+              {"file_path": f"{ws}/jobs/ok.txt"}}, None)
+    check_ev("MUT: unrelated tool (WebFetch) allows",
+             {"tool_name": "WebFetch", "tool_input": {"url": "x"}},
+             None)
+
+    # ---- M11 P0-2: scoped "always allow within this scope" grants ----
+    import time as _t
+    deep = "/data1/neoag/agents/neoag_agent_runs/case1/out"
+
+    def grants(entries):
+        with open(os.path.join(g.APPROVALS, "scope-grants.json"),
+                  "w") as fh:
+            json.dump(entries, fh)
+
+    check("scope: no grants file -> still confirm",
+          f"cp /tmp/f.txt {deep}/x.txt", "confirm")
+    grants([{"id": "g1", "roots": [deep],
+             "expires": _t.time() + 3600}])
+    check("scope: covered write auto-allows",
+          f"cp /tmp/f.txt {deep}/x.txt", "scoped")
+    check("scope: exact-root mkdir covered",
+          f"mkdir -p {deep}", "scoped")
+    check("scope: write outside granted root still confirm",
+          "cp /tmp/f.txt /data1/neoag/other_place/x.txt", "confirm")
+    check("scope: PARTIAL cover still confirm",
+          f"cp /tmp/f.txt {deep}/x.txt; cp /tmp/g.txt /etc/x", "confirm")
+    check("scope: DELETE under granted root still confirm",
+          f"rm -f {deep}/x.txt", "confirm")
+    check("scope: force verb under granted root still confirm",
+          f"chmod -R 777 {deep}", "confirm")
+    check("scope: prefix-lookalike dir NOT covered",
+          f"cp /tmp/f.txt {deep}evil/x.txt", "confirm")
+    grants([{"id": "g2", "roots": [deep], "expires": _t.time() - 1}])
+    check("scope: EXPIRED grant -> confirm",
+          f"cp /tmp/f.txt {deep}/x.txt", "confirm")
+    grants([{"id": "g3", "roots": [], "expires": _t.time() + 3600}])
+    check("scope: empty roots never match",
+          f"cp /tmp/f.txt {deep}/x.txt", "confirm")
+    grants([{"id": "g4", "roots": [deep], "expires": _t.time() + 3600}])
+    d = g.decide({"tool_name": "Write",
+                  "tool_input": {"file_path": deep + "/y.txt"}})
+    ok = d is not None and d[0] == "scoped"
+    print(("PASS " if ok else "FAIL ") + "scope: Write tool covered")
+    if not ok:
+        fails.append(("scope: Write tool covered", "Write", "scoped",
+                      str(d)[:120]))
+    ok = os.path.isfile(os.path.join(g.APPROVALS, "scope-audit.jsonl"))
+    # main() (not decide()) writes the audit line - exercise the real
+    # entrypoint once end to end so the journalling is proven:
+    import subprocess
+    evf = {"tool_name": "Bash",
+           "tool_input": {"command": f"cp /tmp/f.txt {deep}/z.txt"}}
+    r = subprocess.run([sys.executable, GATE], input=json.dumps(evf),
+                       capture_output=True, text=True,
+                       env={**os.environ, "NEOAG_GATE_APPROVALS":
+                            g.APPROVALS})
+    ok2 = ("allow" in r.stdout) and os.path.isfile(
+        os.path.join(g.APPROVALS, "scope-audit.jsonl"))
+    print(("PASS " if ok2 else "FAIL ") +
+          "scope: main() allows + journals the auto-allow")
+    if not ok2:
+        fails.append(("scope audit", "subprocess gate",
+                      "allow + audit line", r.stdout[:160]))
 
     print(f"\n{len(fails)} failure(s)")
     for name, cmd, want, got in fails:

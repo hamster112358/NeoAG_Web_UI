@@ -572,6 +572,7 @@ class Handler(BaseHTTPRequestHandler):
                 "messages": store.msg_list(400, cid) if cid else [],
                 "jobs": unified_tasks(store, 50),
                 "approvals": store.approval_list(),
+                "scope_grants": store.scope_grants_active(),
                 "decisions": store.decision_list(),
                 "research": research_public_rows(store),
                 "manifests": store.manifest_list(),
@@ -673,6 +674,11 @@ class Handler(BaseHTTPRequestHandler):
             jid = (q.get("job_id") or [None])[0]
             ds = store.decision_list(jid)
             return self._json(200, {"decisions": ds})
+        if path == "/api/scopegrants":
+            # M11 P0-2: the live 'always allow within this scope'
+            # grants - visible, dated, revocable (revoke re-materialises
+            # the file gate.py enforces).
+            return self._json(200, {"grants": store.scope_grants_active()})
         if path == "/api/codebuddy/status":
             mode = store.setting("agent_mode", "mock")
             info = {"mode": mode, "connected": False, "transport": "jobs",
@@ -1483,17 +1489,29 @@ class Handler(BaseHTTPRequestHandler):
                 legacy = body.get("approve")
                 if decision in ("", "true", "false"):
                     decision = "approve" if legacy else "reject"
-                if decision not in ("approve", "reject", "limit_scope",
-                                    "literature_only"):
+                if decision not in ("approve", "approve_scope", "reject",
+                                    "limit_scope", "literature_only"):
                     return self._json(400, {
-                        "error": "decision must be approve, reject, "
-                                 "limit_scope or literature_only"})
+                        "error": "decision must be approve, approve_scope, "
+                                 "reject, limit_scope or literature_only"})
                 if decision == "limit_scope" and not str(
                         body.get("scope") or "").strip():
                     return self._json(400, {
                         "error": "limit_scope requires a 'scope' note "
                                  "saying what the user will allow"})
-                approve = decision == "approve"
+                if decision == "approve_scope":
+                    cur = store.approval_get(aid)
+                    if not cur or cur["state"] != "pending":
+                        return self._json(409, {
+                            "error": "approval not pending"})
+                    if cur["action"] != "gate_op":
+                        # formal-run / job cards are NEVER scope-
+                        # approvable: each run stays an independent
+                        # human decision (M11 P0-2 risk rule)
+                        return self._json(400, {
+                            "error": "scoped approval applies only to "
+                                     "gate confirmations"})
+                approve = decision in ("approve", "approve_scope")
                 scope_note = str(body.get("scope") or "").strip()
                 appr = store.approval_decide(aid, approve, "user")
                 if not appr:
@@ -1512,6 +1530,22 @@ class Handler(BaseHTTPRequestHandler):
                                              scope_note)
                 publish({"type": "approval", "id": aid})
                 return self._json(200, {**appr, "decision": decision})
+            if path.startswith("/api/scopegrants/"):
+                # POST /api/scopegrants/<id>/revoke (M11 P0-2):
+                # revocation is immediate - the file gate.py reads is
+                # re-materialised without the revoked root set.
+                parts = path.strip("/").split("/")
+                if len(parts) == 4 and parts[3] == "revoke":
+                    g = store.scope_grant_revoke(parts[2])
+                    if not g:
+                        return self._json(404, {"error": "no live grant "
+                                                         "with that id"})
+                    agent.rewrite_scope_grants()
+                    store.audit("user", "scope.revoked", parts[2],
+                                {"roots": g["roots"]})
+                    publish({"type": "approval", "id": parts[2]})
+                    return self._json(200, {"ok": True, "id": parts[2]})
+                return self._json(404, {"error": "unknown route"})
             if path == "/api/admin/archive":
                 # reversible cleanup of developer/demo records (see store)
                 res = store.archive_and_purge()
