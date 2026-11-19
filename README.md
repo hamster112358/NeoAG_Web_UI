@@ -658,6 +658,60 @@ language setting persisting zh/en through the API. Browser tooling
 was verified by static checks plus served-markup inspection, not an
 automated browser run.
 
+### Milestone 10 verification (all numbers from actual runs, 2026-11-19)
+
+New dedicated suite `tests/verify_m10_acceptance.py` (isolated server
+on its own port/DB/skills/task dirs): ALL PASS - nav order and
+branding without demo badges or a Load-example entry point, zero
+remaining `window.alert/confirm/prompt` call sites (comment-stripped
+regex), en/zh dictionaries carry the identical key set, readiness
+returns one structured verdict over the whole workflow and refuses
+unknown manifests (400, never invented), a native submit without the
+explicit Start authorization still blocks on its genuine approval
+card, a confirmed manifest is single-use (409, never a second queue
+entry) with the honest retry re-confirming a fresh manifest, the
+explicit Start click carries its authorization through to the backend
+as an approval created AND decided by the named human authorization
+(the genuine gate stays intact for agent submissions), controlled
+mode stops at a real `native.plan_review` decision (execute/abort)
+with nothing executed while blocked and abort cancelling without any
+gateway submission, invalid `execution_mode` values refused (400),
+the mock engine and classic approval flow unchanged, failure
+humanization unit-proven per real code family, gate cards carrying
+derived target/consequence fields, artifact downloads 404-or-bytes
+(never 500 on traversal), and every results outcome class wired. The
+structured failure view plus the proactive chat notice are proven
+end-to-end by an honest drift-after-submit native run (private input
+directory moved after the submit-time revalidation; the planner blocks
+pre-execution; zero gateway contact). One acceptance run initially
+failed two of its own assertions and both were fixed as test bugs, not
+product patches: a decision-loop race (the loop re-read "blocked"
+before the worker's 0.25 s resolution poll advanced) and an assertion
+that assumed a literal `/example` URL where the surviving API route is
+the conversation action `act == "example"`. The suite also caught a
+REAL product bug: the authorized auto-start path created the job
+"queued" but never launched the worker, so an authorized run would
+have sat queued until the next restart - fixed (submit_native now
+launches like the approval path) and re-observed running.
+
+`verify_battery.py` 143/143; `verify_m7_acceptance.py` 35/35 ALL PASS;
+`verify_scientific.py` 76/76; `verify_discovery.py` 34/34 (live run,
+52 min honest pacing, biotools unreachable that window - recorded by
+the suite's own coverage-honesty checks, no module demoted without a
+genuine hard failure); `verify_turn_recovery.py` ALL PASS;
+`verify_real_agent.py` 35/35; `verify_long_message.py` 28 passed / 1
+documented skip (the milestone-specification round-trip only runs if
+the operator re-supplies that exact text - the suite never
+reconstructs it). Live :8712 restarted after landing (watchdog respawn,
+bootstrap verified, no active jobs at restart time). Visual/layout
+claims remain static-verified only (no browser automation on this
+host); visual acceptance stays with the operator. The login boundary
+deliberately stays HTTP Basic Auth: the secure-session prerequisite
+(cookie confidentiality + enforceable expiry behind the
+operator-managed tunnels) is not verifiable from this server, and the
+blocker is recorded in `backend/server.py` at the authentication
+section.
+
 ## Architecture
 
 ```
@@ -679,6 +733,10 @@ backend/
   native.py        read-only adapter around the real NeoAG packages:
                    probe / run_plan / preflight / controlled run
                    (never installs, never patches, version-pinned)
+  readiness.py     ONE structured pre-submission verdict over the
+                   whole workflow (runtime, inventories, inputs,
+                   planner); submit-time cheap revalidation blocks
+                   predictable failures with every blocker named
   versions.py      read-only installed-version probes + version
                    verification chains for the deployed tools layout
   evidence.py      context-gating + coverage accounting for the live
