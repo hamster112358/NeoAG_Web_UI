@@ -339,6 +339,77 @@ class DemoAgent:
                           # automatic session-restore
                           "text": "", "recovered": False})
 
+    def reattach_turns(self) -> list[str]:
+        """M11 P0-3: gateway jobs outlive this process. A turn that was
+        streaming when the Web server stopped is not automatically
+        lost: if the gateway still knows the job, re-attach a relay -
+        events already recorded are not replayed (the seen-cursor is
+        re-seeded from the transcript), and a final reply the job
+        produced while this server was down is delivered on the first
+        poll. Only genuinely gone jobs are left for the startup sweep
+        to stamp interrupted."""
+        reattached = []
+        for conv in self.store.conv_list():
+            if conv.get("turn_state") != "streaming":
+                continue
+            cid, job_id = conv["id"], conv.get("job_id") or ""
+            if not job_id:
+                continue
+            st = self._cstate(cid)
+            if st["busy"]:
+                continue
+            try:
+                client = self._ensure_client()
+                detail = client.job(job_id)
+            except Exception:
+                continue    # unreachable gateway: the sweep is honest
+            if detail.get("unknown"):
+                continue
+            state = str(detail.get("state") or "")
+            if state in ("done", "failed", "stopped"):
+                # deliver-once rule: if the final reply is already in
+                # the conversation, nothing remains to relay
+                newest = ""
+                try:
+                    for u in client.transcript(job_id):
+                        if str(u.get("sessionUpdate") or "") == \
+                                "agent_message_chunk":
+                            txt = (u.get("content") or {}).get("text") or ""
+                            if txt.strip():
+                                newest = txt
+                except Exception:
+                    newest = ""
+                rows = self.store.msg_list(50, conv_id=cid)
+                if newest and any(
+                        m["role"] == "agent"
+                        and m["text"].strip() == newest.strip()
+                        for m in rows):
+                    self.store.conv_set_turn(cid, "completed", "")
+                    continue
+                # else: the reply landed while we were down - the
+                # re-attached _turn relays it as substantive output
+            st["job"] = job_id
+            st["busy"] = True
+            st["stop"] = False
+            st["text"] = ""
+            st["recovered"] = False
+            st["kick"] = None
+            try:
+                for u in client.transcript(job_id):
+                    kind = str(u.get("sessionUpdate") or "")
+                    if kind in ("tool_call", "tool_call_update"):
+                        st["seen"].add(
+                            f"{kind}|{u.get('toolCallId')}"
+                            f"|{u.get('status')}")
+            except Exception:
+                pass
+            self.store.audit("agent", "relay.reattached", cid,
+                             {"job": job_id, "gw_state": state})
+            threading.Thread(target=self._turn, args=(cid,),
+                             daemon=True).start()
+            reattached.append(cid)
+        return reattached
+
     def stop_turn(self, conv_id: str) -> dict:
         """User-initiated interrupt of the CURRENT agent turn: set the
         cooperative flag (the relay stamps an honest terminal state) and
@@ -530,7 +601,18 @@ class DemoAgent:
                          daemon=True).start()
         return msgs
 
-    TURN_MAX_SECONDS = 900   # module-level for testability
+    # M11 P0-3: live turns are NOT bounded by a wall-clock budget.
+    # The gateway job outlives any single relay loop; ending a turn at
+    # 900s while the job kept running is the exact regression this
+    # milestone was filed for (POLYSOLVER research turns legitimately
+    # run longer than the old cap). A turn now ends only on honest
+    # events: terminal job state, user cancel, lost connection, or a
+    # relay crash. Explicit max_seconds remains a TEST seam - nothing
+    # production passes it. STALL_NOTICE_SECONDS: one honest notice
+    # (not a terminal state) when a live job produces nothing for
+    # half an hour.
+    TURN_MAX_SECONDS = 900       # test seam only
+    STALL_NOTICE_SECONDS = 1800  # notice threshold; test-overridable
 
     def _finish_turn(self, st: dict, turn_state: str) -> None:
         """End the turn honestly: the CONVERSATION row (the live
@@ -572,10 +654,13 @@ class DemoAgent:
                 {"badges": ["real agent", "integration note"]}, conv_id)
             st["busy"] = False
             return
-        max_seconds = max_seconds or self.TURN_MAX_SECONDS
+        # max_seconds is None for every production turn: the relay
+        # runs until the job itself reaches an outcome (M11 P0-3)
         t0 = time.time()
         errors = 0
         dead_ticks = 0
+        last_move = t0
+        stall_noted = False
 
         def _recover(reason: str) -> bool:
             """M7 §6: the reply never came back because the session died
@@ -611,7 +696,8 @@ class DemoAgent:
                     if kind in ("tool_call", "tool_call_update"):
                         st["seen"].add(
                             f"{kind}|{u.get('toolCallId')}|{u.get('status')}")
-            while time.time() - t0 < max_seconds:
+            last_state = None
+            while max_seconds is None or time.time() - t0 < max_seconds:
                 time.sleep(2.5)
                 try:
                     detail = client.job(job_id)
@@ -638,6 +724,9 @@ class DemoAgent:
                     return
                 state = detail.get("state")
                 self.store.conv_touch(conv_id, job_state=str(state))
+                if state != last_state:
+                    last_state = state
+                    last_move = time.time()
                 if st.get("stop"):
                     # user pressed Stop: honest terminal, no fabricated tail
                     self.store.audit("agent", "relay.user_interrupt",
@@ -673,6 +762,24 @@ class DemoAgent:
                             f"worker gone while job still recorded "
                             f"'{state}'"):
                         return
+                    if dead_ticks >= 8:
+                        # worker stays gone and recovery already had
+                        # its shot (or never applied): end honestly.
+                        # This replaces the old wall-clock cap for
+                        # the zombie case - live jobs still wait on
+                        # real events only (M11 P0-3).
+                        self.store.msg_add(
+                            "agent",
+                            "(The gateway worker for this job is gone "
+                            "and automatic recovery does not apply to "
+                            "this turn - it is ended without a "
+                            "fabricated outcome. The recorded events "
+                            "above remain the full truth.)",
+                            {"badges": ["real agent", "worker gone"],
+                             "job_id": job_id}, conv_id)
+                        self._finish_turn(st, "worker gone - no reply")
+                        publish({"type": "chat", "conv_id": conv_id})
+                        return
                 else:
                     dead_ticks = 0
                 for u in items:
@@ -682,6 +789,7 @@ class DemoAgent:
                         if key in st["seen"]:
                             continue
                         st["seen"].add(key)
+                        last_move = time.time()
                         title = str(u.get("title") or "tool")
                         status = str(u.get("status") or "")
                         meta = {"badges": ["tool output", "real agent"],
@@ -723,6 +831,22 @@ class DemoAgent:
                         txt = (u.get("content") or {}).get("text") or ""
                         if mid and txt.strip():
                             st["replies"][mid] = txt
+                if (not stall_noted and
+                        time.time() - last_move > self.STALL_NOTICE_SECONDS):
+                    # M11 P0-3: an honest WAITING notice is not a fake
+                    # outcome - the job is alive on the gateway, we just
+                    # hear nothing. Say exactly that, once, keep waiting.
+                    stall_noted = True
+                    self.store.msg_add(
+                        "agent",
+                        "(The agent job is still running on the server, "
+                        "but it has produced no new activity for "
+                        f"{int(time.time() - last_move) // 60} minutes. "
+                        "This interface keeps waiting rather than guess "
+                        "an outcome; you can stop the turn at any time.)",
+                        {"badges": ["real agent", "stall notice"],
+                         "job_id": job_id}, conv_id)
+                    publish({"type": "chat", "conv_id": conv_id})
                 if state in ("done", "failed", "stopped"):
                     # newest assistant message wins (transcript order);
                     # a message already relayed is never re-sent

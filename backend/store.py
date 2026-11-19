@@ -531,16 +531,22 @@ class Store:
                 (json.dumps(meta, ensure_ascii=False), msg_id))
             self.db.commit()
 
-    def msg_sweep_stale_streaming(self) -> int:
+    def msg_sweep_stale_streaming(self, skip_conv_ids=()) -> int:
         """Startup honesty sweep: any persisted turn still labelled
         'streaming' belongs to a relay that died with the previous
         server process - mark it terminal, do not resurrect it. Covers
         both the audit kickoff rows and the conversation-level turn
-        (M11 P0-1: the live indicator reads the conversation row)."""
+        (M11 P0-1: the live indicator reads the conversation row).
+        M11 P0-3: conversations whose relay was RE-ATTACHED to a still
+        live gateway job are skipped - those turns genuinely continue."""
+        skip = set(skip_conv_ids or ())
         n = 0
         with self.lock:
             for r in self.db.execute(
-                    "SELECT id, meta_json FROM messages").fetchall():
+                    "SELECT id, meta_json, conv_id FROM messages"
+            ).fetchall():
+                if r["conv_id"] in skip:
+                    continue
                 meta = json.loads(r["meta_json"] or "{}")
                 if meta.get("turn_state") == "streaming":
                     meta["turn_state"] = "interrupted by server restart"
@@ -554,6 +560,8 @@ class Store:
             for r in self.db.execute(
                     "SELECT id FROM conversations "
                     "WHERE turn_state='streaming'").fetchall():
+                if r["id"] in skip:
+                    continue
                 self.db.execute(
                     "UPDATE conversations SET turn_state=?, turn_ts=?, "
                     "activity='' WHERE id=?",

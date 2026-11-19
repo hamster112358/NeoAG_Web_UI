@@ -83,6 +83,7 @@ const I18N = {
     "act.waitappr": "Waiting for your approval",
     "act.reconnect": "Reconnecting - the last recorded state is shown below",
     "act.doing": "Working on", "act.think": "Thinking",
+    "act.silent": "no new events for {m} min - the job is still running",
     "act.lastturn": "Last turn",
     "act.tools1": "Agent activity - 1 tool call",
     "act.toolsN": "Agent activity - {n} tool calls",
@@ -398,6 +399,7 @@ const I18N = {
     "act.waitappr": "等待你的批准",
     "act.reconnect": "连接中断，正在重连——以下显示最后记录的状态",
     "act.doing": "正在处理", "act.think": "思考中",
+    "act.silent": "{m} 分钟内无新事件——任务仍在运行",
     "act.lastturn": "上一轮：",
     "act.tools1": "智能体活动——1 次工具调用",
     "act.toolsN": "智能体活动——{n} 次工具调用",
@@ -1445,6 +1447,18 @@ function updateActivity(gatePending) {
     label = t("act.waitappr");
   } else if (turn) {
     label = t("act.lastturn") + turn.state;
+  }
+  // M11 P0-3: a live job that says nothing for a while is shown as
+  // SILENT-BUT-RUNNING, never as finished and never as an error. The
+  // gateway heartbeat is the conversation's own updated_at.
+  if (working) {
+    const conv = state.convObj || {};
+    const silent = conv.updated_at
+      ? Date.now() - new Date(conv.updated_at).getTime() : 0;
+    if (silent > 45000) {
+      label += " · " + t("act.silent",
+                         { m: Math.max(1, Math.floor(silent / 60000)) });
+    }
   }
   // one exchange at a time (M10 §12): sending is disabled while the
   // agent is still answering; the draft stays in the box for the next turn

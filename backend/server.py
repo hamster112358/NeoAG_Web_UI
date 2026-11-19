@@ -1776,9 +1776,6 @@ def main() -> None:
     recovered = store.recover_interrupted()
     if recovered:
         print(f"recovered {len(recovered)} interrupted job(s) -> failed (see UI)")
-    swept = store.msg_sweep_stale_streaming()
-    if swept:
-        print(f"marked {swept} abandoned 'streaming' message(s) as interrupted")
     n = store.msg_purge_legacy_notices()
     if n:
         print(f"purged {n} pre-redesign mock banner(s) from chat history")
@@ -1795,6 +1792,19 @@ def main() -> None:
     if ensure_task_gateway(store):
         print("task-query gateway ready (read-only token + helper deployed "
               "into the agent workspace)")
+    # M11 P0-3 ordering: FIRST try to re-attach streaming turns to
+    # jobs the (separate, still-running) gateway is holding, THEN
+    # sweep whatever could not be re-attached to an honest
+    # interrupted state. The gateway outlives this process; a turn
+    # mid-flight across a Web restart is recoverable, not lost.
+    reattached = agent.reattach_turns()
+    if reattached:
+        print(f"re-attached {len(reattached)} streaming turn(s) to live "
+              "gateway jobs (results will still arrive)")
+    swept = store.msg_sweep_stale_streaming(skip_conv_ids=reattached)
+    if swept:
+        print(f"marked {swept} abandoned 'streaming' message(s) as "
+              "interrupted")
     store.audit("server", "server.start", "-", {"host": HOST, "port": PORT})
     jobs.resume_queued()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
