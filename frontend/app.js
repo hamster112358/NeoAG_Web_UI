@@ -120,6 +120,19 @@ const I18N = {
     "inv.ambiguous": "{n} items need your decision",
     "inv.blocked": "{n} blocking problem(s)",
     "inv.ok": "This directory is ready for analysis",
+    "inv.advisories": "Left out of the selected workflow (not blocking):",
+    "kind.missing_patient_input": "Missing patient input",
+    "kind.missing_server_reference": "Missing server reference",
+    "kind.ambiguous": "Needs your choice",
+    "kind.unsupported_format": "Unusable file",
+    "kind.missing_tool": "Missing tool / runtime",
+    "kind.unselected_stage_dependency": "Not needed by the selected workflow",
+    "kind.invalid_config": "Invalid configuration",
+    "kind.not_authorized": "Outside authorized roots",
+    "kind.planner_verdict": "Planner verdict",
+    "kind.environment": "Environment",
+    "basis.content": "by content",
+    "basis.filename": "by filename (heuristic)",
     "inv.needPick": "Choose the intended file for each highlighted item",
     "inv.tree": "Folder contents",
     "inv.notInput": "not an input",
@@ -438,6 +451,19 @@ const I18N = {
     "inv.ambiguous": "{n} 项需要你决定",
     "inv.blocked": "{n} 个阻断问题",
     "inv.ok": "该目录已满足分析条件",
+    "inv.advisories": "不在所选流程内（不构成阻断）：",
+    "kind.missing_patient_input": "缺少患者样本数据",
+    "kind.missing_server_reference": "缺少服务器参考数据",
+    "kind.ambiguous": "需要你确认",
+    "kind.unsupported_format": "文件不可用（空或格式问题）",
+    "kind.missing_tool": "缺少工具/运行时",
+    "kind.unselected_stage_dependency": "所选流程不需要",
+    "kind.invalid_config": "配置无效",
+    "kind.not_authorized": "不在授权目录内",
+    "kind.planner_verdict": "规划器判定",
+    "kind.environment": "环境",
+    "basis.content": "依据内容识别",
+    "basis.filename": "依据文件名（启发式）",
     "inv.needPick": "请为每个高亮项选择要使用的文件",
     "inv.tree": "文件夹内容",
     "inv.notInput": "非输入文件",
@@ -1974,27 +2000,62 @@ function alertHtml(kind, title, body, fix) {
     ${fix ? `<div class="fix">${esc(fix)}</div>` : ""}</div></div>`;
 }
 
+function kindLabel(k) {
+  const key = "kind." + k;
+  return t(key) !== key ? t(key) : (k || "");
+}
+
 function renderInvCard() {
   const d = prep.disc, s = d.summary || {};
   const amb = d.ambiguous || [], missing = d.missing || [];
   const confirmed = !!prep.manifest;
   const picks = VS.get("picks", {});
   const unresolved = amb.filter((a) => (a.candidates || []).length && !picks[a.field]);
+  /* M11 P0-7: the confirm gate and the red list come from the
+     workflow-typed assessment (kinds: patient data / server reference
+     / choice pending / unusable file / tool gap / branch not
+     selected), never from the raw "missing" pile - a reference asset
+     that only the OFF-by-default DNA SV branch would need must not
+     block the workflow the user is actually running. The raw native
+     answer stays verbatim in the technical view. */
+  const wf = d.workflow || {};
+  const blocks = wf.blockers || [];
+  const hardBlocks = blocks.filter((b) => b.kind !== "ambiguous");
+  const blocked = hardBlocks.length + unresolved.length;
+  const blockLine = (b) =>
+    `<b>${esc(kindLabel(b.kind))}</b> — ${esc(b.field ? b.field + ": " : "")}${esc(b.reason || "")}`;
   const alerts = [];
-  if (missing.length) alerts.push(alertHtml("blocking", t("blk.title"),
-    (missing || []).map((m) => esc(m.field ? `${m.field}: ${m.reason || ""}` : (m.reason || m))).join("<br>"),
-    LANG === "zh" ? "补齐上述数据后重新扫描即可。"
-      : "Add the missing data to the directory and scan again."));
-  if (amb.length) alerts.push(alertHtml("warn", t("warn.title"),
+  if (hardBlocks.length) alerts.push(alertHtml("blocking", t("blk.title"),
+    hardBlocks.map(blockLine).join("<br>"),
+    LANG === "zh" ? "补齐/更换上述数据后重新扫描即可；「缺少服务器参考数据」类问题由服务器管理员解决。"
+      : "Add or fix the listed data and scan again; items marked "
+        + "'Missing server reference' are fixed by the server "
+        + "administrator, not by re-uploading."));
+  if (unresolved.length) alerts.push(alertHtml("warn", t("warn.title"),
     esc(t("inv.needPick")), ""));
+  if ((wf.advisories || []).length) alerts.push(alertHtml("info",
+    t("inv.advisories"),
+    wf.advisories.map(blockLine).join("<br>"), ""));
   if ((d.warnings || []).length) alerts.push(alertHtml("warn", t("warn.title"),
     d.warnings.map(esc).join("<br>"), ""));
   if (d.native_hla_note) alerts.push(alertHtml("info", t("info.title"),
     esc(d.native_hla_note), ""));
 
+  // M11 P0-7: every role states HOW it was established - a content
+  // match (VCF header, table headers, allele pattern, BAM header
+  // samples) or the native classifier's filename heuristic. A
+  // name-based judgement is shown as such, never dressed as proven.
+  const basisChip = (i) => {
+    const key = i.basis === "content" ? "basis.content"
+      : i.basis === "filename token" ? "basis.filename" : "";
+    if (!key) return "";
+    return `<span class="rr-basis${i.basis === "content" ? "" : " hint"}"` +
+      ` title="${esc(i.basis_detail || "")}">${esc(t(key))}</span>`;
+  };
   const roleRow = (i) => `<div class="role-row">
     <span class="rr-name">${esc(roleLabelFor(i.flag))}</span>
     <span class="rr-path">${esc(String(i.path).split("/").slice(-2).join("/"))}</span>
+    ${basisChip(i)}
     <span class="rr-size">${fmtBytes(i.size_bytes)}</span></div>`;
   const pickHtml = amb.map((a) => (a.candidates || []).length ? `
     <div class="pickbox" data-pick="${esc(a.field)}">
@@ -2015,7 +2076,7 @@ function renderInvCard() {
       <span><b>${s.n_recognized || 0}</b> ${esc(t("inv.recognized", { n: "" }).replace(/^\d*\s*/, ""))}</span>
       <span><b>${(d.unmatched || []).length}+</b> ${esc(t("inv.excluded", { n: "" }).replace(/^\d*\s*/, ""))}</span>
       ${amb.length ? `<span class="pill warn">${esc(t("inv.ambiguous", { n: amb.length }))}</span>` : ""}
-      ${missing.length ? `<span class="pill danger">${esc(t("inv.blocked", { n: missing.length }))}</span>` : `<span class="pill ok">${esc(t("inv.ok"))}</span>`}
+      ${blocked ? `<span class="pill danger">${esc(t("inv.blocked", { n: blocked }))}</span>` : `<span class="pill ok">${esc(t("inv.ok"))}</span>`}
     </div>
     ${alerts.join("")}
     ${pickHtml}
@@ -2023,6 +2084,8 @@ function renderInvCard() {
       <h3>${esc(t("inv.recognized", { n: s.n_recognized || 0 }))}</h3>
       <div class="role-grid">${(d.inputs || []).map(roleRow).join("") || `<div class="empty">${esc(t("inv.none"))}</div>`}</div>
     </div>
+    ${state.techView && missing.length ? `<details class="adv"><summary>native raw missing (pre-workflow view)</summary>
+      <pre class="tool-out">${esc(missing.map((m) => `${m.field}: ${m.reason || ""}`).join("\n"))}</pre></details>` : ""}
     <div class="inv-sec">
       <h3>${esc(t("inv.tree"))}</h3>
       <div class="tree" id="inv-tree"></div>
@@ -2032,8 +2095,8 @@ function renderInvCard() {
     <div class="conf-row"><span id="case-name-txt" class="hint">${esc(prep.caseName || "-")}</span>
       ${confirmed ? "" : `<button class="btn ghost sm" id="case-name-edit">${esc(t("prep.caseEdit"))}</button>`}</div>
     ${confirmed ? "" : `<div class="btnrow">
-      <button id="prep-confirm" class="btn primary" ${missing.length ? "disabled" : ""}>${esc(t("prep.confirm"))}</button>
-      ${missing.length ? `<span class="hint">${esc(t("plan.blocked"))}</span>` : ""}
+      <button id="prep-confirm" class="btn primary" ${blocked ? "disabled" : ""}>${esc(t("prep.confirm"))}</button>
+      ${blocked ? `<span class="hint">${esc(t("plan.blocked"))}</span>` : ""}
     </div>`}
   </div>`;
   mountTree();
@@ -2417,6 +2480,8 @@ function renderReadiness() {
     return `<div class="rdy-row ${mark}"><span class="rdy-mark">${
       c.ok === true ? "&#10003;" : c.ok === false ? "&#10006;" : "&#8505;"
     }</span><span class="rdy-name">${esc(lbl)}</span>` +
+    `${c.kind ? `<span class="rk" title="${esc(c.kind)}">${
+      esc(kindLabel(c.kind))}</span>` : ""}` +
     `<span class="rdy-detail">${esc(String(c.detail || ""))}</span></div>`;
   }).join("");
   const head = r.status === "READY"

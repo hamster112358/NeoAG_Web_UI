@@ -443,6 +443,14 @@ select:focus, textarea:focus, input[type="text"]:focus, input[type="number"]:foc
   word-break: break-all; }
 .role-row .rr-size { margin-left: auto; font-size: 12px; color: var(--text-3);
   font-family: var(--mono); flex: none; }
+/* M11 P0-7: role-basis chip (content vs filename heuristic) and the
+   readiness blocker-kind chip - small, muted, hover shows the detail */
+.role-row .rr-basis { font-size: 11px; color: var(--text-3); flex: none;
+  border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px;
+  background: var(--surface); cursor: help; }
+.rdy-row .rk { font-size: 11px; color: var(--text-2); flex: none;
+  border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px;
+  background: var(--surface); cursor: help; }
 .pickbox { border: 1px solid var(--warn-border); background: var(--warn-soft);
   border-radius: var(--r-md); padding: 11px 13px; margin: 8px 0; }
 .pickbox .pq { font-weight: 700; color: #93530d; margin-bottom: 7px; font-size: 14px; }

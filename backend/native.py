@@ -597,7 +597,7 @@ AUTHORIZED_INPUT_ROOTS = [
         "NEOAG_INPUT_ROOTS", "/data1/neoag").split(os.pathsep) if r]
 
 _SCAN_SCRIPT = r"""
-import json, sys
+import gzip, json, re, struct, sys
 from pathlib import Path
 from neoag.open_neo import routing
 q = json.loads(sys.argv[1])
@@ -622,6 +622,105 @@ for f in sorted(p for p in root.rglob("*") if p.is_file()):
         unmatched.append(str(f.relative_to(root)))
 inventory = routing.build_inventory(detected)
 routes, missing, ambiguous2, warnings2 = routing.route_inputs(detected)
+
+def _bam_header(path):
+    # M11 P0-7 provenance: the file's OWN header, read from the BGZF
+    # container with stdlib only (BAM is multi-member gzip). Returns
+    # the @RG sample names + reference-sequence count, or the honest
+    # failure reason - never a guess.
+    try:
+        with gzip.open(path, "rb") as fh:
+            if fh.read(4) != b"BAM\x01":
+                return None, "first bytes are not the BAM magic"
+            (l_text,) = struct.unpack("<i", fh.read(4))
+            if l_text <= 0 or l_text > 16_000_000:
+                return None, "unparsable header length"
+            text = fh.read(l_text).decode("utf-8", "replace")
+        sm = sorted(set(re.findall(r"\tSM:([^\t\n]+)", text)))
+        return {"sm_samples": sm[:8],
+                "n_ref_seqs": len(re.findall(r"@SQ\t", text))}, None
+    except Exception as e:
+        return None, f"header unreadable ({type(e).__name__})"
+
+def _vcf_prefix(path):
+    try:
+        opener = gzip.open if str(path).endswith(".gz") else open
+        with opener(path, "rt", encoding="utf-8",
+                    errors="replace") as fh:
+            return "".join(ln for _, ln in zip(range(250), fh))
+    except Exception:
+        return None
+
+# M11 P0-7: how each role was ESTABLISHED, stated per file - content
+# (VCF header content, table header groups, allele pattern, BAM header
+# samples) or the native classifier's filename heuristic. The UI shows
+# this so a name-based judgement is never presented as a proven one.
+role_basis = {}
+for key, value in (detected or {}).items():
+    for path in (value if isinstance(value, list) else [value]):
+        p = Path(str(path))
+        low = p.name.lower()
+        if low.endswith((".vcf", ".vcf.gz")):
+            pre = _vcf_prefix(p)
+            if pre is None:
+                role_basis[str(path)] = {
+                    "how": "content",
+                    "detail": "VCF header could not be read - role "
+                              "rests on the file extension only"}
+            elif "SVTYPE=" in pre or "##ALT=<ID=BND" in pre:
+                role_basis[str(path)] = {
+                    "how": "content",
+                    "detail": "structural-variant records declared in "
+                              "the VCF header (SVTYPE/ALT BND)"}
+            else:
+                role_basis[str(path)] = {
+                    "how": "content",
+                    "detail": "readable VCF without SV records -> "
+                              "somatic variant calls"}
+        elif low.endswith(".bam"):
+            hdr, err = _bam_header(p)
+            toks = [w for w in ("rna", "wts", "transcript", "normal",
+                                "blood", "germline", "tumor", "tumour",
+                                "somatic") if w in low]
+            if hdr and hdr["sm_samples"]:
+                agree = [s for s in hdr["sm_samples"]
+                         if any(t in s.lower() for t in
+                                ("tum", "nor", "blood", "germline"))]
+                role_basis[str(path)] = {
+                    "how": "content" if agree else "filename token",
+                    "detail": "BAM header declares sample(s) "
+                              + ", ".join(hdr["sm_samples"])
+                              + (f"; role currently rests on filename "
+                                 f"token(s) {toks} - confirm this is the "
+                                 f"intended read" if not agree
+                                 else " - header sample names carry the "
+                                      "tumor/normal evidence")}
+            else:
+                role_basis[str(path)] = {
+                    "how": "filename token",
+                    "detail": "BAM header yields no sample declaration"
+                              + (f" ({err})" if err else "")
+                              + f"; native classifier used filename "
+                                f"token(s) {toks} for the role"}
+        elif low.endswith((".fastq", ".fastq.gz", ".fq", ".fq.gz")):
+            toks = [w for w in ("rna", "wts", "normal", "blood",
+                                "germline", "tumor", "tumour", "somatic")
+                    if w in low]
+            role_basis[str(path)] = {
+                "how": "filename token",
+                "detail": "read content cannot distinguish DNA from "
+                          "RNA in the sampled lines; native classifier "
+                          f"used filename token(s) {toks} for the role"}
+        elif low.endswith((".tsv", ".csv", ".txt")):
+            det = next((r for r in inventory
+                        if r.get("path") == str(path)), {})
+            role_basis[str(path)] = {
+                "how": "content",
+                "detail": "table role matched on its HEADER: "
+                          + str(det.get("header") or "")[:120]}
+        else:
+            role_basis[str(path)] = {"how": "content",
+                                     "detail": "native detector match"}
 print(json.dumps({
     "dir": str(root),
     "detected": detected,
@@ -633,6 +732,7 @@ print(json.dumps({
     "missing": missing,
     "n_files": n_files,
     "unmatched": unmatched,
+    "role_basis": role_basis,
 }))
 """
 
@@ -767,15 +867,19 @@ def discover_inputs(data_dir: str) -> dict:
         return {"ok": False, "data_dir": data_dir,
                 "error": raw.get("error", "discovery failed")}
     inv = {r["input_key"]: r for r in raw.get("inventory") or []}
+    rb = raw.get("role_basis") or {}
     inputs = []
     for flag, value in sorted((raw.get("detected") or {}).items()):
         label, cat = _ROLE_LABEL.get(flag, (flag, "processed_evidence"))
         row = inv.get(flag) or {}
         for path in (value if isinstance(value, list) else [value]):
+            basis = rb.get(str(path)) or {}
             inputs.append({"flag": flag, "role": label, "category": cat,
                            "path": path,
                            "status": row.get("status", ""),
                            "size_bytes": row.get("size_bytes", 0),
+                           "basis": basis.get("how", ""),
+                           "basis_detail": basis.get("detail", ""),
                            "bam_index": ("present" if row.get("bam_index")
                                          else ("missing"
                                                if path.endswith(".bam")
@@ -833,7 +937,7 @@ def discover_inputs(data_dir: str) -> dict:
     routes = raw.get("routes") or []
     ready = bool(routes) and not raw.get("missing") and not ambiguous
     stem = os.path.basename(raw["data_dir"].rstrip("/"))
-    return {
+    res = {
         "ok": True, "data_dir": raw["data_dir"], "scanned_at": _now(),
         "engine": raw["engine"],
         "summary": {
@@ -857,6 +961,15 @@ def discover_inputs(data_dir: str) -> dict:
                  "HLA itself from DNA inputs when the toolchain is "
                  "installed, and its plan reports what it needs"),
     }
+    # M11 P0-7: the SAME facts, re-evaluated as a typed blocker list
+    # under the workflow the interface will actually run (at discovery
+    # time that means the interface defaults - DNA-SV branch OFF, see
+    # neoag_params; the native planner verdict stays authoritative at
+    # readiness time and receives the user's real toggles).
+    # 'ready' above is kept as the RAW native view for audit/history.
+    from .readiness import workflow_assessment
+    res["workflow"] = workflow_assessment(res)
+    return res
 
 
 def write_native_manifest(data_dir: str, sample_id: str,
@@ -871,7 +984,15 @@ def write_native_manifest(data_dir: str, sample_id: str,
     if not raw.get("ok"):
         raise ValueError(raw.get("error", "discovery failed"))
     detected = dict(raw.get("detected") or {})
+    sample_picks = {}
     for field, path in (picked or {}).items():
+        # M11 P0-7: tumor/normal SAMPLE-ID picks are validated against
+        # the somatic VCF's genotype columns (the provenance authority)
+        # below - they are names, not paths, so the directory check for
+        # file picks must not (and does not) apply to them.
+        if field in ("tumor_sample_id", "normal_sample_id"):
+            sample_picks[field] = str(path or "").strip()
+            continue
         if field in _ROLE_LABEL and isinstance(path, str) and path:
             if not os.path.realpath(path).startswith(
                     raw["data_dir"].rstrip(os.sep) + os.sep):
@@ -892,6 +1013,28 @@ def write_native_manifest(data_dir: str, sample_id: str,
                   or s.lower().endswith(("_t", "-t"))), "")
     normal = next((s for s in vcf_samples if s != tumor), "") \
         if tumor and len(vcf_samples) == 2 else ""
+    if sample_picks.get("tumor_sample_id"):
+        t = sample_picks["tumor_sample_id"]
+        if vcf_samples and t not in vcf_samples:
+            raise ValueError(
+                "picked tumor sample is not one of the somatic VCF's "
+                "genotype columns (" + ", ".join(vcf_samples)
+                + ") - the VCF is the sample authority")
+        tumor = t
+        normal = next((s for s in vcf_samples if s != tumor), "") \
+            if len(vcf_samples) == 2 else ""
+    if sample_picks.get("normal_sample_id"):
+        n = sample_picks["normal_sample_id"]
+        if vcf_samples and n not in vcf_samples:
+            raise ValueError(
+                "picked normal sample is not one of the somatic VCF's "
+                "genotype columns (" + ", ".join(vcf_samples) + ")")
+        if tumor and n == tumor:
+            raise ValueError("the same sample cannot be both tumor and "
+                             "normal - pick two distinct VCF samples")
+        normal = n
+        if not tumor and len(vcf_samples) == 2:
+            tumor = next((s for s in vcf_samples if s != normal), "")
     data = {"schema_version": "open-neo-sample-v1",
             "case_id": sid, "sample_id": sid,
             "genome_build": "GRCh38",
