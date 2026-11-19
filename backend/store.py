@@ -711,10 +711,16 @@ class Store:
                 "SELECT * FROM scope_grants WHERE id=?", (gid,)).fetchone()
             if not row or row["revoked"]:
                 return None
+            self.db.execute(
+                "UPDATE scope_grants SET revoked=1 WHERE id=?", (gid,))
+            self.db.commit()
             row = self.db.execute(
                 "SELECT * FROM scope_grants WHERE id=?", (gid,)).fetchone()
-            self.db.commit()
-        return dict(row) if row else None
+            if not row:
+                return None
+            d = dict(row)
+            d["roots"] = json.loads(d.pop("roots_json") or "[]")
+        return d
 
     def scope_grants_active(self) -> list[dict]:
         import time as _t

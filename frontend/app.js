@@ -66,6 +66,20 @@ const I18N = {
     "gate.q": "Confirm destructive operation",
     "gate.sub": "The execution gate blocked this before it ran. Approving unlocks exactly this one operation; nothing else. It is also recorded in the audit trail.",
     "gate.approve": "Approve once", "gate.deny": "Deny",
+    "gate.scopeBtn": "Always allow this scope",
+    "gate.scopeTitle": "Approves this operation now, and auto-allows further writes under the recorded target directories for 4 hours. Server-enforced, audited, revocable at any time.",
+    "gate.queued": "Queued - an earlier approval is waiting first",
+    "gate.staleGone": "This confirmation is no longer valid (the task ended or it expired)",
+    "gate.effect": "Effect", "gate.reversibility": "Reversibility",
+    "gate.ec.write": "write", "gate.ec.overwrite": "overwrite",
+    "gate.ec.delete": "delete", "gate.ec.network": "network",
+    "gate.ec.network-read": "network read",
+    "gate.ec.write-or-execute": "write or execute",
+    "gate.ec.undetermined": "not determinable from the command text",
+    "attn.scopesH": "Always-allow scopes (revocable)",
+    "attn.scopeUntil": "until", "attn.revoke": "Revoke",
+    "toast.revokeOk": "Scope revoked - the execution gate no longer auto-allows it",
+    "toast.revokeFail": "revoke failed: {e}",
     "act.waitappr": "Waiting for your approval",
     "act.reconnect": "Reconnecting - the last recorded state is shown below",
     "act.doing": "Working on", "act.think": "Thinking",
@@ -367,6 +381,20 @@ const I18N = {
     "gate.q": "确认危险操作",
     "gate.sub": "执行门禁已在其运行前拦截。批准只会放开这一项操作，且会记录在审计日志中。",
     "gate.approve": "批准一次", "gate.deny": "拒绝",
+    "gate.scopeBtn": "始终允许此范围",
+    "gate.scopeTitle": "先批准本次操作；之后 4 小时内向上述目标目录的写入将自动放行。由服务端强制执行、留有审计、可随时撤销。",
+    "gate.queued": "排队中——请先处理更早的确认",
+    "gate.staleGone": "该确认已失效（任务已结束或已过期）",
+    "gate.effect": "影响类型", "gate.reversibility": "可逆性",
+    "gate.ec.write": "写入", "gate.ec.overwrite": "覆盖",
+    "gate.ec.delete": "删除", "gate.ec.network": "网络",
+    "gate.ec.network-read": "网络读取",
+    "gate.ec.write-or-execute": "写入或执行",
+    "gate.ec.undetermined": "无法从命令文本确定",
+    "attn.scopesH": "始终允许范围（可撤销）",
+    "attn.scopeUntil": "有效期至", "attn.revoke": "撤销",
+    "toast.revokeOk": "已撤销该范围——执行网关不再自动放行",
+    "toast.revokeFail": "撤销失败：{e}",
     "act.waitappr": "等待你的批准",
     "act.reconnect": "连接中断，正在重连——以下显示最后记录的状态",
     "act.doing": "正在处理", "act.think": "思考中",
@@ -1233,27 +1261,49 @@ function mergeToolMsgs(msgs) {
 function gateFieldsHtml(info, a) {
   const f = [];
   if (info.job_id) f.push([t("dr.id"), info.job_id]);
+  if ((info.effect_classes || []).length)
+    f.push([t("gate.effect"), info.effect_classes.map((e) =>
+      t("gate.ec." + e) !== "gate.ec." + e ? t("gate.ec." + e) : e)
+      .join(" + ")]);
   if ((info.target_paths || []).length)
     f.push([t("gate.target"), info.target_paths.join(", ")]);
   if (info.overwrite_risk) f.push([t("warn.title"), info.overwrite_risk]);
   if (info.consequence) f.push([t("gate.consequence"), info.consequence]);
+  if (info.reversibility)
+    f.push([t("gate.reversibility"), info.reversibility]);
   if (info.approve_effect) f.push([t("gate.approveEffect"), info.approve_effect]);
   if (info.deny_effect) f.push([t("gate.denyEffect"), info.deny_effect]);
   return f.length ? `<div class="at-fields">${f.map(
     ([k, v]) => `<b>${esc(k)}</b><span>${esc(v)}</span>`).join("")}</div>` : "";
 }
 
-function gateCardHtml(a) {
+/* M11 P0-2: one actionable approval at a time - callers render the
+   OLDEST card actionable and queue the rest as a count line. The
+   scope button only appears where a narrow scope can exist at all
+   (plain write confirmations with recorded targets; the server
+   still refuses to broaden it). */
+function gateCardHtml(a, actionable = true) {
   let info = {};
   try { info = JSON.parse(a.detail || "{}"); } catch { /* raw */ }
+  if (!actionable) {
+    return `<div class="inline-card confirm queued">
+      <div class="sub">${esc(t("gate.queued"))}</div>
+      <div class="detail">${esc(info.note || "")}</div></div>`;
+  }
+  const scopeBtn = (info.target_paths || []).length && !info.structured
+    ? `<button class="btn sm" data-appr="${esc(a.id)}"
+       data-dec="approve_scope"
+       title="${esc(t("gate.scopeTitle"))}">${esc(t("gate.scopeBtn"))}</button>`
+    : "";
   return `<div class="inline-card confirm">
     <div class="q">${esc(t("gate.q"))}</div>
     <div class="sub">${esc(t("gate.sub"))}</div>
     ${gateFieldsHtml(info, a)}
     <div class="detail">${esc(info.note || a.detail || "")}</div>
     <div class="btnrow">
-      <button class="btn primary sm" data-appr="${esc(a.id)}" data-ok="1">${esc(t("gate.approve"))}</button>
-      <button class="btn danger sm" data-appr="${esc(a.id)}">${esc(t("gate.deny"))}</button>
+      <button class="btn primary sm" data-appr="${esc(a.id)}" data-dec="approve">${esc(t("gate.approve"))}</button>
+      ${scopeBtn}
+      <button class="btn danger sm" data-appr="${esc(a.id)}" data-dec="reject">${esc(t("gate.deny"))}</button>
     </div></div>`;
 }
 
@@ -1342,8 +1392,9 @@ function renderChat() {
     if (a.state !== "pending" || a.action !== "gate_op") return false;
     try { return JSON.parse(a.detail || "{}").conv_id === state.activeCid; }
     catch { return false; }
-  });
-  for (const a of gateCards) html += gateCardHtml(a);
+  }).sort((x, y) => String(x.created_at).localeCompare(String(y.created_at)));
+  // one actionable card at a time; the rest stay visible but queued
+  gateCards.forEach((a, i) => { html += gateCardHtml(a, i === 0); });
   updateActivity(gateCards.length > 0);
   if (!(state.convMsgs || []).length && !gateCards.length) {
     html += `<div class="emptychat">
@@ -1477,6 +1528,7 @@ async function refreshJobs() {
     const b = await api("GET", "/api/bootstrap");
     state.boot.jobs = b.jobs; state.boot.approvals = b.approvals;
     state.boot.decisions = b.decisions;
+    state.boot.scope_grants = b.scope_grants || [];
     renderJobs(); renderAttention();
     // finished runs must appear in Results WITHOUT a page reload
     renderResults();
@@ -2421,14 +2473,24 @@ $("nj-submit").addEventListener("click", async () => {
    fields. "Waiting for approval" is never shown as running. */
 function attentionRowsHtml(includeGate) {
   const rows = [];
+  let gateSeen = 0;
+  const gates = (state.boot.approvals || [])
+    .filter((a) => a.state === "pending" && a.action === "gate_op")
+    .sort((x, y) => String(x.created_at).localeCompare(String(y.created_at)));
+  const gateById = new Map(gates.map((a) => [a.id, a]));
   for (const a of (state.boot.approvals || [])) {
     if (a.state !== "pending") continue;
     let info = {};
     try { info = JSON.parse(a.detail || "{}"); } catch { /* plain note */ }
     if (a.action === "gate_op") {
       // the gate card lives inline in its chat; the dialog also
-      // surfaces it so nothing waits unseen across tabs
-      if (includeGate) rows.push(`<div class="at-col">${gateCardHtml(a)}</div>`);
+      // surfaces it so nothing waits unseen across tabs - oldest
+      // first, one actionable, the rest visibly queued (P0-2)
+      if (includeGate) {
+        rows.push(`<div class="at-col">${
+          gateCardHtml(gateById.get(a.id), gateSeen === 0)}</div>`);
+        gateSeen += 1;
+      }
       continue;
     }
     if (info.kind === "benchmark_consent") {
@@ -2489,9 +2551,20 @@ function renderAttention() {
 
 $("attn-badge").addEventListener("click", () => {
   const rows = attentionRowsHtml(true);
-  if (!rows.length) return;
+  // live scoped grants (P0-2): listed, dated, each revocable - the
+  // management surface the "always allow within this scope" option
+  // is required to have
+  const gr = (state.boot.scope_grants || []).map((g) =>
+    `<div class="at-row"><span><b>${esc((g.roots || []).join(", "))}</b>`
+    + ` · ${esc(t("attn.scopeUntil"))} ${esc(fmtDT(new Date(
+      g.expires * 1000).toISOString()))}</span>`
+    + `<button class="btn sm" data-revoke="${esc(g.id)}">${esc(
+      t("attn.revoke"))}</button></div>`).join("");
+  const sec = gr ? `<div class="at-scopes"><b>${esc(
+    t("attn.scopesH"))}</b>${gr}</div>` : "";
+  if (!rows.length && !sec) return;
   uiDialog({ title: t("attn.center"),
-             bodyHtml: `<div class="at-dialog">${rows.join("")}</div>`,
+             bodyHtml: `<div class="at-dialog">${rows.join("")}${sec}</div>`,
              actions: [{ label: t("dlg.close"), value: null, cls: "ghost" }] });
 });
 
@@ -3544,8 +3617,27 @@ document.addEventListener("click", async (ev) => {
       }
       closeDialog();
       await api("POST", `/api/approvals/${appr.dataset.appr}`, body);
+    } catch (e) {
+      // a card that is no longer pending (cancelled / expired /
+      // already decided elsewhere) says so in plain words, and the
+      // next queued card takes its place
+      if (e.status === 409) toast(t("gate.staleGone"), true);
+      else toast(t("toast.apprFail", { e: e.message }), true);
+    } finally {
       await refreshJobs(); refreshConv();
-    } catch (e) { toast(t("toast.apprFail", { e: e.message }), true); }
+    }
+    return;
+  }
+  const rv = ev.target.closest("[data-revoke]");
+  if (rv) {
+    // scoped grants are revocable, and the revocation is immediate
+    // (the file the execution gate reads is rewritten server-side)
+    try {
+      closeDialog();
+      await api("POST", `/api/scopegrants/${rv.dataset.revoke}/revoke`);
+      toast(t("toast.revokeOk"));
+      await refreshJobs();
+    } catch (e) { toast(t("toast.revokeFail", { e: e.message }), true); }
     return;
   }
   const dec = ev.target.closest("[data-dec]");

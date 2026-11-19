@@ -104,6 +104,25 @@ def effect_classes(note: str, structured: dict) -> list[str]:
                else "undetermined"]
     return out
 
+
+def scope_roots_for(detail: dict) -> list[str]:
+    """Narrow roots for an 'always allow within this scope' grant,
+    DERIVED from the recorded target paths: the parent directory of
+    each written target. Refuses anything broad (< 3 path segments,
+    or more than 3 distinct roots) - a grant that would effectively
+    cover the filesystem is not a scope."""
+    roots = []
+    for p in detail.get("target_paths") or []:
+        parent = str(p).rsplit("/", 1)[0] or "/"
+        if parent not in roots:
+            roots.append(parent)
+    if not roots or len(roots) > 3:
+        return []
+    for r in roots:
+        if r.count("/") < 3:      # e.g. /tmp, /data1 - too broad
+            return []
+    return roots
+
 # Official task-query helper (B1 + Milestone 5 routing): the agent
 # queries the SAME backend records the UI shows, through the API,
 # instead of ad-hoc SQL or chat memory; it is also the ONLY sanctioned
@@ -874,24 +893,6 @@ class DemoAgent:
         except OSError:
             pass
 
-    def scope_roots_for(self, detail: dict) -> list[str]:
-        """Narrow roots for an 'always allow within this scope' grant,
-        DERIVED from the recorded target paths: the parent directory
-        of each written target. Refuses anything broad (< 3 path
-        segments, or more than 3 distinct roots) - a grant that would
-        effectively cover the filesystem is not a scope."""
-        roots = []
-        for p in detail.get("target_paths") or []:
-            parent = str(p).rsplit("/", 1)[0] or "/"
-            if parent not in roots:
-                roots.append(parent)
-        if not roots or len(roots) > 3:
-            return []
-        for r in roots:
-            if r.count("/") < 3:      # e.g. /tmp, /data1 - too broad
-                return []
-        return roots
-
     def on_gate_decision(self, appr: dict, approve: bool,
                          decision: str = "", scope_note: str = "") -> None:
         """Human resolved a confirmation card. Approve => write the
@@ -966,7 +967,7 @@ class DemoAgent:
                 except OSError:
                     pass
         if decision == "approve_scope" and op:
-            roots = self.scope_roots_for(info)
+            roots = scope_roots_for(info)
             if roots:
                 gid = new_id("scg")
                 self.store.scope_grant_add(
@@ -987,7 +988,7 @@ class DemoAgent:
                 msg = (
                     ("The user APPROVED this exact operation AND "
                      "auto-approves further writes under: "
-                     + ", ".join(self.scope_roots_for(info))
+                     + ", ".join(scope_roots_for(info))
                      + " (4 hours, revocable in the interface). Retry "
                        "the identical tool call now - then report the "
                        "outcome.")
