@@ -41,6 +41,37 @@ CONFIRM_RE = re.compile(
     r"NEOAG_CONFIRM_REQUIRED op=([0-9a-f]{24}) :: (.+?) "
     r"This operation is classified", re.S)
 
+# M10 §10.1: an approval request must say WHICH operation, against
+# WHICH target, and what its consequences are. These fields are
+# DERIVED from the recorded command (a factual parse), never invented:
+# where a claim cannot be made confidently the text says so.
+_ABS_PATH_RE = re.compile(r"(?<![\w~.-])(/[A-Za-z0-9@._+-]+(?:/[A-Za-z0-9@._+-]*)+)")
+_DESTRUCTIVE_RE = re.compile(r"(^|[\s;&|])(rm|rmdir|unlink|shred|truncate|dd|mkfs|wipefs|chown\s+-R|chmod\s+-R)(\s|$)")
+_OVERWRITE_RE = re.compile(r"(^|[^0-9>])(>{1,2}\s*/|\btee\b\s+/|\bmv\b\s+/|\bdd\b[^|]*of=/)")
+
+
+def gate_consequence(note: str) -> dict:
+    """Conservative, derived consequence fields for a gate card."""
+    targets = []
+    for p in _ABS_PATH_RE.findall(note or ""):
+        if p not in targets:
+            targets.append(p)
+    if _DESTRUCTIVE_RE.search(note or ""):
+        kind = "delete"
+        consequence = ("deletes or irreversibly overwrites its target(s) "
+                       "- there is no undo from inside this interface")
+    elif _OVERWRITE_RE.search(note or ""):
+        kind = "overwrite"
+        consequence = ("writes over existing file content at its "
+                       "target(s); prior content may be lost")
+    else:
+        kind = "write-or-run"
+        consequence = ("changes filesystem state or starts a process "
+                       "outside the always-allowed workspace baseline - "
+                       "reversibility depends on the exact command shown")
+    return {"target_paths": targets[:8], "effect_kind": kind,
+            "consequence": consequence}
+
 # Official task-query helper (B1 + Milestone 5 routing): the agent
 # queries the SAME backend records the UI shows, through the API,
 # instead of ad-hoc SQL or chat memory; it is also the ONLY sanctioned
@@ -723,6 +754,15 @@ class DemoAgent:
             "dataset_download" else "destructive"
         detail = {"op": op, "conv_id": conv_id, "note": note,
                   "job_id": st["job"]}
+        detail.update(gate_consequence(note))
+        # what each answer does - statements about this app's verified
+        # grant mechanism, identical for every card:
+        detail["approve_effect"] = (
+            "writes a single-use, hash-matched grant: the EXACT same "
+            "command unlocks once, nothing else")
+        detail["deny_effect"] = (
+            "the command never runs; the agent is told it was declined "
+            "and must not retry it")
         if structured:
             detail["structured"] = {
                 "kind": structured.get("class"),

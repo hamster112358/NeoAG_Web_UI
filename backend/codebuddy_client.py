@@ -75,6 +75,29 @@ SETTINGS = Path.home() / ".codebuddy" / "settings.json"
 BASE = "http://127.0.0.1:7890"
 HDR = {"x-codebuddy-request": "1", "Content-Type": "application/json"}
 
+# Transport ceiling for one prompt/reply sent to the gateway, counted in
+# Unicode characters. It MUST stay strictly above the user-facing chat
+# limit (server.MAX_CHAT_CHARS) plus the dispatch preamble and rolling
+# transcript, so the only limit a user can actually hit is the chat one,
+# which is validated with a clear 413 instead of a slice.
+#
+# History: dispatch/reply used `prompt[:16000]` / `text[:16000]`. On the
+# dispatch path the user's message is appended LAST, after the preamble
+# and rolling transcript, so once the combined string passed the cap the
+# slice cut the TAIL OFF THE USER'S OWN PROMPT and still reported
+# success. Exceeding the bound is now a hard, explicit error.
+MAX_PROMPT_CHARS = 200_000
+
+
+def within_limit(text: str, what: str) -> str:
+    """Return text unchanged, or raise - never return a shortened copy."""
+    if len(text) > MAX_PROMPT_CHARS:
+        raise CodeBuddyError(
+            f"{what} is {len(text)} characters, over the gateway "
+            f"transport limit of {MAX_PROMPT_CHARS}. Nothing was sent; "
+            f"shorten the message and retry.")
+    return text
+
 
 class CodeBuddyError(RuntimeError):
     pass
@@ -138,7 +161,8 @@ class CodeBuddyClient:
                  permission_mode: str | None = None,
                  tries: int = 4, backoff: int = 15) -> dict:
         """Dispatch a job instance. Returns the {id, sessionId, ...} dict."""
-        payload = {"prompt": prompt[:16000], "cwd": cwd, "name": name}
+        payload = {"prompt": within_limit(prompt, "prompt"),
+                   "cwd": cwd, "name": name}
         if permission_mode:
             payload["permissionMode"] = permission_mode
         for i in range(tries):
@@ -170,7 +194,8 @@ class CodeBuddyClient:
         """Continue the same conversation (works after settle while the
         worker is alive). Returns {delivered, notice} or {error, http}."""
         code, body = self._req("POST", f"/api/v1/jobs/{job_id}/reply",
-                               {"text": text[:16000], "bash": False})
+                               {"text": within_limit(text, "reply text"),
+                                "bash": False})
         if code == 200:
             return _loads(body).get("data", {})
         return {"error": body[:160], "http": code}

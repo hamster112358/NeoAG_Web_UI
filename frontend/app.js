@@ -21,13 +21,13 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
    deliberately NOT translated. */
 const I18N = {
   en: {
-    "brand.tag": "Neoantigen scientific workspace",
+    "brand.tag": "Agent-assisted neoantigen analysis",
     "chat.new": "New chat", "chat.stop": "Stop",
-    "chat.ph": "Describe your goal - e.g. analyze a sample, or tell the agent where your sequencing data are stored",
+    "chat.ph": "Message…",
     "chat.send": "Send",
+    "chat.busySend": "The agent is still answering - one exchange at a time.",
     "chat.emptyTitle": "Start a conversation",
     "chat.emptySub": "Ask anything about NeoAG, or describe a sample and where its data live.",
-    "chat.example": "Load example - walk through a synthetic case",
     "chat.agentWorking": "agent working", "chat.awaiting": "awaiting confirmation",
     "chat.deleteQ": "Delete this chat? It disappears from this list; the saved messages stay on the server for audit.",
     "menu.rename": "Rename", "menu.pin": "Pin to top", "menu.unpin": "Unpin",
@@ -91,8 +91,9 @@ const I18N = {
     "prep.confirmedBtn": "Confirmed",
     "prep.rescan": "Scan a different folder",
     "prep.submit": "Start analysis",
-    "prep.approval": "Your approval is always required before anything runs. After you approve, the pipeline runs in the background.",
-    "prep.submitted": "Task {id} created - approve the card above to let it run.",
+    "prep.approval": "Starting the analysis authorizes exactly this run on this host; destructive or out-of-scope operations still require their own confirmation.",
+    "prep.submitted": "Task {id} created - it proceeds in the background; watch it in Tasks.",
+    "prep.submittedCtrl": "Task {id} created - when planning finishes it will wait for your Run/Abort decision before anything executes.",
     "prep.needConfirm": "First discover the inputs and confirm them.",
     "inv.title": "Detected inputs",
     "inv.files": "{n} files", "inv.dirs": "{d} directories",
@@ -123,7 +124,7 @@ const I18N = {
     "sci.reset": "Restore defaults",
     "sci.unavail": "The parameter inventory is unavailable right now - nothing is shown rather than guessed.",
     "sci.unchecked": "Run normally (recommended)",
-    "plan.summary": "Stage plan",
+    "plan.summary": "Planning details (technical)",
     "plan.loading": "The NeoAG planner is checking the confirmed inputs - this can take a minute.",
     "plan.fail": "The plan preview failed: {e}",
     "plan.failFix": "You can retry; nothing runs during planning.",
@@ -156,7 +157,17 @@ const I18N = {
     "dr.snapNote": "Written once when the run started; never updated.",
     "dr.noDec": "No decisions recorded", "dr.defOnly": "defaults only",
     "dr.noArt": "No artifacts registered yet",
-    "res.title": "Results", "res.pick": "Completed run", "res.none": "No completed runs yet.",
+    "res.title": "Results", "res.pick": "Run", "res.none": "No runs yet.",
+    "res.showMock": "Show simulation history",
+    "res.inprogress": "This run has not finished yet ({state}) - its results will appear here when it ends.",
+    "res.cancelledNote": "This run was cancelled; nothing was produced after cancellation.",
+    "res.previewH": "Final ranking tables (as stored in the run output)",
+    "res.previewNote": "Shown verbatim from the run's own output files - nothing is re-ranked or reformatted here.",
+    "res.dl": "Download",
+    "res.discoveryRow": "Discovery review",
+    "res.discoveryNote": "This is a Discovery review, not a pipeline run - its report belongs to the Discovery workspace.",
+    "res.openDiscovery": "Open the report in Discovery",
+    "res.shortlist": "Shortlist (first rows of the final ranking)",
     "res.prov": "Output manifest, decisions and provenance",
     "res.bundle": "Download results bundle (.zip)",
     "res.download": "built from the persisted run state; raw FASTQ/BAM-class inputs are never included and exclusions are listed with reasons; re-download serves the same pinned bytes",
@@ -168,8 +179,6 @@ const I18N = {
     "disc.intro": "Searches public scientific sources and your configured NeoAG inventory to review analysis tools. It reports what it verified and marks the rest as not verified.",
     "disc.scope": "Scope", "disc.scopeT": "Targeted review",
     "disc.scopeF": "Full pipeline review",
-    "disc.engine": "Evidence source", "disc.engL": "Live sources",
-    "disc.engE": "Example data (testing)",
     "disc.run": "Start review", "disc.targets": "Targets",
     "disc.targetsT": "(one or more; from the configured repository's real stage inventory)",
     "disc.targetsF": "- full pipeline review covers every inventoried stage",
@@ -254,15 +263,69 @@ const I18N = {
     "toast.confirmFail": "Could not record the confirmed inputs: {e}",
     "toast.confirmed": "Inputs confirmed - planning starts now",
     "toast.pickFirst": "Choose the intended file for: {items}",
+    "toast.dupActive": "This sample already has an active run ({id}) - not submitted again. {d}",
+    /* M10: execution modes, analysis options, readiness, failure
+       cards, unified dialogs, central attention */
+    "mode.label": "Execution",
+    "mode.auto": "Autonomous",
+    "mode.ctrl": "Controlled",
+    "mode.help": "Autonomous: planning runs, and the planner's own pass leads straight to execution under the authorization you give below. Controlled: after planning, the plan waits for your explicit Run/Abort decision.",
+    "opt.title": "Analysis options",
+    "opt.note": "Required steps always run and cannot be switched off. Optional steps run unless you switch them off here. Steps marked not applicable come from the planner's own verdict on this data.",
+    "opt.req": "Always runs",
+    "opt.runs": "Runs",
+    "opt.off": "Skipped this run",
+    "opt.na": "Not applicable this run",
+    "rdy.title": "Readiness check",
+    "rdy.run": "Check the whole workflow now",
+    "rdy.checking": "Checking every stage of the workflow against the server - this can take a minute.",
+    "rdy.ready": "Everything required is in place; the analysis can start.",
+    "rdy.blockedNote": "Cannot start yet - all blocking items are listed:",
+    "rdy.warnNote": "Noted, not blocking:",
+    "rdy.checkedAt": "Checked",
+    "rdy.native_runtime": "Native NeoAG runtime",
+    "rdy.gateway_service": "Execution gateway service",
+    "rdy.tools_env": "Tool environment",
+    "rdy.tools_manifest": "Tool inventory",
+    "rdy.reference_manifest": "Reference inventory",
+    "rdy.reference_fasta": "Reference genome file",
+    "rdy.genome_build": "Genome build",
+    "rdy.vep": "Variant annotation (VEP)",
+    "rdy.scientific_config": "Scientific configuration",
+    "rdy.work_writable": "Working directory writable",
+    "rdy.manifest": "Confirmed inputs",
+    "rdy.inputs_present": "Input files present",
+    "rdy.inputs_authorized": "Input locations authorized",
+    "rdy.demo_fixtures": "Demo fixtures",
+    "rdy.planner": "Planner verdict",
+    "st.waitdec": "Waiting for your decision",
+    "fail.head": "This run failed",
+    "fail.startedYes": "The computation had already started.",
+    "fail.startedNo": "No computation started - nothing scientific was executed.",
+    "fail.blockersH": "Blocking issue(s)",
+    "fail.completedH": "Completed before the failure",
+    "fail.completedNone": "nothing",
+    "fail.partialN": "{n} partial output file(s) are registered on the task for inspection.",
+    "fail.partial0": "No partial outputs were produced.",
+    "fail.next": "Next step",
+    "fail.open": "Open task",
+    "gate.target": "Operation target",
+    "gate.consequence": "What approving does",
+    "gate.approveEffect": "If you approve",
+    "gate.denyEffect": "If you deny",
+    "attn.center": "Waiting for you",
+    "attn.badgeTitle": "{n} item(s) need your attention",
+    "dec.nativePlan": "The native planner cleared this run - execute now, or stop with the plan kept?",
+    "dlg.close": "Close", "dlg.cancel": "Cancel", "dlg.confirm": "Confirm",
   },
   zh: {
-    "brand.tag": "新抗原科学工作台",
+    "brand.tag": "智能体辅助新抗原分析平台",
     "chat.new": "新建对话", "chat.stop": "停止",
-    "chat.ph": "描述你的目标——例如分析一个样本，或告诉智能体测序数据存放的位置",
+    "chat.ph": "发送消息…",
     "chat.send": "发送",
+    "chat.busySend": "智能体正在回复——请等本轮回答结束后再发送下一条。",
     "chat.emptyTitle": "开始对话",
     "chat.emptySub": "可以询问任何关于 NeoAG 的问题，或描述一个样本及其数据所在的位置。",
-    "chat.example": "载入示例——演示一个合成病例的完整流程",
     "chat.agentWorking": "智能体工作中", "chat.awaiting": "等待确认",
     "chat.deleteQ": "删除这个对话？它会从列表中消失；已保存的消息仍留在服务器上以备审计。",
     "menu.rename": "重命名", "menu.pin": "置顶", "menu.unpin": "取消置顶",
@@ -326,8 +389,9 @@ const I18N = {
     "prep.confirmedBtn": "已确认",
     "prep.rescan": "扫描其他文件夹",
     "prep.submit": "开始分析",
-    "prep.approval": "任何运行开始前都必须由你批准。批准后流程将在后台执行。",
-    "prep.submitted": "任务 {id} 已创建——请在上方批准卡片中批准后才会运行。",
+    "prep.approval": "开始分析即表示你授权在本机上仅执行这一次运行；破坏性或超出范围的操作仍会单独请求确认。",
+    "prep.submitted": "任务 {id} 已创建并在后台进行——可在任务列表查看进度。",
+    "prep.submittedCtrl": "任务 {id} 已创建——规划完成后会等待你明确选择「执行」或「中止」，在此之前不会运行任何计算。",
     "prep.needConfirm": "请先识别并确认输入数据。",
     "inv.title": "识别到的输入",
     "inv.files": "{n} 个文件", "inv.dirs": "{d} 个文件夹",
@@ -358,7 +422,7 @@ const I18N = {
     "sci.reset": "恢复默认",
     "sci.unavail": "暂时取不到参数清单——宁可不显示，也不猜测选项。",
     "sci.unchecked": "正常运行（推荐）",
-    "plan.summary": "阶段计划",
+    "plan.summary": "规划详情（技术细节）",
     "plan.loading": "NeoAG 规划器正在核查已确认的输入——可能需要一分钟。",
     "plan.fail": "计划预览失败：{e}",
     "plan.failFix": "可以重试；规划期间不会运行任何计算。",
@@ -391,7 +455,17 @@ const I18N = {
     "dr.snapNote": "运行开始时写入一次，之后不再更新。",
     "dr.noDec": "未记录决策", "dr.defOnly": "仅使用默认",
     "dr.noArt": "尚未登记输出产物",
-    "res.title": "结果", "res.pick": "已完成的运行", "res.none": "暂无已完成的运行。",
+    "res.title": "结果", "res.pick": "运行", "res.none": "暂无运行记录。",
+    "res.showMock": "显示模拟/演示历史",
+    "res.inprogress": "该运行尚未结束（{state}）——结束后结果将显示在这里。",
+    "res.cancelledNote": "该运行已被取消；取消之后不会再产生任何结果。",
+    "res.previewH": "最终排序表（与运行输出文件逐字一致）",
+    "res.previewNote": "以下内容逐字来自运行自身的输出文件——此处不做重新排序或改写。",
+    "res.dl": "下载",
+    "res.discoveryRow": "研究报告",
+    "res.discoveryNote": "这是一项研究评估，不是流程运行——其报告归属研究工作区。",
+    "res.openDiscovery": "在研究页打开报告",
+    "res.shortlist": "短名单（最终排序表的前几行）",
     "res.prov": "输出清单、决策与溯源",
     "res.bundle": "下载结果包（.zip）",
     "res.download": "由持久化的运行状态生成；不会包含原始 FASTQ/BAM 输入，所有排除都附有原因；重复下载得到同一份固定字节。",
@@ -403,8 +477,6 @@ const I18N = {
     "disc.intro": "检索公开科学资源和你配置的 NeoAG 清单，以评估分析工具。只报告已核实的内容，其余一律标注为未核实。",
     "disc.scope": "范围", "disc.scopeT": "定向评估",
     "disc.scopeF": "全流程评估",
-    "disc.engine": "证据来源", "disc.engL": "公开来源",
-    "disc.engE": "示例数据（测试）",
     "disc.run": "开始评估", "disc.targets": "目标",
     "disc.targetsT": "（可多选；来自所配置仓库的真实阶段清单）",
     "disc.targetsF": "——全流程评估覆盖清单中的全部阶段",
@@ -431,7 +503,7 @@ const I18N = {
     "sk.body": "指令",
     "sk.bodyPh": "希望智能体了解或改变哪些做法？请用平实语言描述——每次新对话开始时智能体都会阅读这段内容。",
     "sk.save": "保存", "sk.cancel": "取消",
-    "sk.note": "Changes apply to new chats.",
+    "sk.note": "修改将在新对话中生效。",
     "help.title": "帮助", "help.unavail": "不可用",
     "st.incomplete": "未完成",
     "res.noCand": "没有可展示的候选行。",
@@ -489,6 +561,58 @@ const I18N = {
     "toast.confirmFail": "无法记录确认的输入：{e}",
     "toast.confirmed": "输入已确认——开始生成计划",
     "toast.pickFirst": "请先为以下项选择文件：{items}",
+    "toast.dupActive": "该样本已有进行中的运行（{id}）——未重复提交。{d}",
+    "mode.label": "执行方式",
+    "mode.auto": "自主（默认）",
+    "mode.ctrl": "受控",
+    "mode.help": "自主：完成规划后，在你下方给出的授权范围内直接进入执行。受控：规划完成后，运行计划会先等待你明确选择「执行」或「中止」。",
+    "opt.title": "分析项目",
+    "opt.note": "必需项目始终执行，不能关闭。可选项目默认开启；如需跳过请在此关闭。「不适用」来自规划器对本批数据的实际判定。",
+    "opt.req": "始终执行",
+    "opt.runs": "本次执行",
+    "opt.off": "本次已跳过",
+    "opt.na": "本次不适用",
+    "rdy.title": "就绪检查",
+    "rdy.run": "立即检查完整流程",
+    "rdy.checking": "正在与服务器核对流程的每个环节——可能需要一分钟。",
+    "rdy.ready": "所有必需条件均已具备，可以开始分析。",
+    "rdy.blockedNote": "暂时无法开始——以下列出全部阻断项：",
+    "rdy.warnNote": "提示（不阻断）：",
+    "rdy.checkedAt": "检查时间",
+    "rdy.native_runtime": "原生 NeoAG 运行时",
+    "rdy.gateway_service": "执行网关服务",
+    "rdy.tools_env": "工具环境",
+    "rdy.tools_manifest": "工具清单",
+    "rdy.reference_manifest": "参考数据清单",
+    "rdy.reference_fasta": "参考基因组文件",
+    "rdy.genome_build": "基因组版本",
+    "rdy.vep": "变异注释（VEP）",
+    "rdy.scientific_config": "科学配置",
+    "rdy.work_writable": "工作目录可写",
+    "rdy.manifest": "已确认的输入",
+    "rdy.inputs_present": "输入文件存在",
+    "rdy.inputs_authorized": "输入位置在授权范围内",
+    "rdy.demo_fixtures": "演示样例数据",
+    "rdy.planner": "规划器判定",
+    "st.waitdec": "等待你的决定",
+    "fail.head": "该运行失败",
+    "fail.startedYes": "计算已经开始。",
+    "fail.startedNo": "没有任何计算启动——未执行科学计算。",
+    "fail.blockersH": "阻断问题",
+    "fail.completedH": "失败前已完成",
+    "fail.completedNone": "无",
+    "fail.partialN": "已在任务上登记 {n} 个部分输出文件，可供核查。",
+    "fail.partial0": "没有产生任何部分输出。",
+    "fail.next": "下一步",
+    "fail.open": "打开任务",
+    "gate.target": "操作对象",
+    "gate.consequence": "批准后的效果",
+    "gate.approveEffect": "若批准",
+    "gate.denyEffect": "若拒绝",
+    "attn.center": "等待你的处理",
+    "attn.badgeTitle": "有 {n} 项需要你的处理",
+    "dec.nativePlan": "原生规划器已通过本次运行——现在执行，还是仅保留计划并停止？",
+    "dlg.close": "关闭", "dlg.cancel": "取消", "dlg.confirm": "确认",
   },
 };
 
@@ -552,7 +676,8 @@ const VS = {
 
 const state = {
   boot: null, params: null, view: "tasks", kindFilter: "",
-  jobDetail: null, resultsJob: null,
+  jobDetail: null, resultsJob: null, resultsStrategy: null,
+  resultsMock: false,
   manifest: null, agentMode: "mock",
   convs: [], activeCid: null, convMsgs: [],
   sseDown: true, // until the live stream says otherwise (§6 status)
@@ -594,6 +719,78 @@ function toast(msg, err) {
   clearTimeout(toast._h);
   toast._h = setTimeout(() => tEl.classList.add("hidden"), 4200);
 }
+
+/* Unified app dialogs (M10 §3) - these REPLACE window.alert/confirm/
+   prompt everywhere in the product. One visual language, bilingual,
+   keyboard-reachable; a result (or cancel) always resolves the promise
+   so no flow can be left half-decided. */
+let dlgKill = null;
+function uiDialog({ title, bodyHtml, actions }) {
+  return new Promise((resolve) => {
+    if (dlgKill) dlgKill();          // exactly one dialog lives at a time
+    const root = $("dialog-root");
+    $("dlg-title").textContent = title || "";
+    $("dlg-body").innerHTML = bodyHtml || "";
+    const bar = $("dlg-actions");
+    bar.innerHTML = "";
+    const cleanup = () => {
+      root.classList.add("hidden");
+      root.removeEventListener("click", onBack);
+      document.removeEventListener("keydown", onKey, true);
+      dlgKill = null;
+    };
+    const finish = (v) => { cleanup(); resolve(v); };
+    dlgKill = cleanup;
+    (actions || []).forEach((a) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "btn sm " + (a.cls || "");
+      b.textContent = a.label;
+      b.addEventListener("click", () => finish(a.value));
+      bar.appendChild(b);
+    });
+    const onKey = (ev) => {
+      if (ev.key === "Escape") { ev.stopPropagation(); finish(null); }
+    };
+    const onBack = (ev) => { if (ev.target === root) finish(null); };
+    root.addEventListener("click", onBack);
+    document.addEventListener("keydown", onKey, true);
+    root.classList.remove("hidden");
+    const first = bar.querySelector(".primary") || bar.querySelector("button");
+    if (first) first.focus();
+  });
+}
+/* cancel on backdrop/Esc reads as "no" for confirmations */
+function uiConfirm({ title, bodyHtml, okLabel, cancelLabel, danger }) {
+  return uiDialog({
+    title, bodyHtml,
+    actions: [
+      { label: okLabel || t("dlg.confirm"), value: true,
+        cls: danger ? "danger" : "primary" },
+      { label: cancelLabel || t("dlg.cancel"), value: false, cls: "ghost" },
+    ],
+  }).then((v) => v === true);
+}
+function uiPrompt({ title, bodyHtml, placeholder, value }) {
+  return uiDialog({
+    title,
+    bodyHtml: (bodyHtml || "") +
+      `<textarea id="dlg-input" rows="3" style="width:100%"
+        placeholder="${esc(placeholder || "")}">${esc(value || "")}</textarea>`,
+    actions: [
+      { label: t("dlg.confirm"), value: "ok", cls: "primary" },
+      { label: t("dlg.cancel"), value: null, cls: "ghost" },
+    ],
+  }).then((v) => {
+    if (v !== "ok") return null;
+    const s = ($("dlg-input") || {}).value || "";
+    return s.trim() || null;
+  });
+}
+/* the attention/decision cards resolve through the delegated handler;
+   opening an action closes any stale dialog so it never shows an
+   already-resolved card */
+function closeDialog() { if (dlgKill) dlgKill(); }
 
 function ago(ts) {
   if (!ts) return "";
@@ -827,7 +1024,9 @@ function showConvMenu(cid, anchor) {
         await api("POST", `/api/conversations/${cid}/flag`,
                   { archived: act === "archive" });
       } else if (act === "delete") {
-        if (!confirm(t("chat.deleteQ"))) return;
+        if (!await uiConfirm({ title: t("menu.delete"),
+                               bodyHtml: esc(t("chat.deleteQ")),
+                               danger: true })) return;
         await api("POST", `/api/conversations/${cid}/delete`, {});
       }
       if (state.activeCid === cid && ["archive", "delete"].includes(act)) {
@@ -958,6 +1157,7 @@ function toolHtml(m) {
 function msgHtml(m) {
   const meta = m.meta || {};
   if (meta.kind === "tool") return toolHtml(m);
+  if (meta.kind === "job_failure") return failMsgHtml(m);
   const badges = (meta.badges || []).map((b) =>
     `<span class="badge">${esc(b)}</span>`).join("");
   return `<div class="msg ${esc(m.role)}">
@@ -1009,17 +1209,69 @@ function mergeToolMsgs(msgs) {
   return merged;
 }
 
+/* Every confirmation card states the SAME quality fields (M10 §10):
+   task / operation / target / overwrite-risk / consequence / what
+   approving does / what denying does. Values are computed server-side
+   from the real command and arrive inside approval.detail. */
+function gateFieldsHtml(info, a) {
+  const f = [];
+  if (info.job_id) f.push([t("dr.id"), info.job_id]);
+  if ((info.target_paths || []).length)
+    f.push([t("gate.target"), info.target_paths.join(", ")]);
+  if (info.overwrite_risk) f.push([t("warn.title"), info.overwrite_risk]);
+  if (info.consequence) f.push([t("gate.consequence"), info.consequence]);
+  if (info.approve_effect) f.push([t("gate.approveEffect"), info.approve_effect]);
+  if (info.deny_effect) f.push([t("gate.denyEffect"), info.deny_effect]);
+  return f.length ? `<div class="at-fields">${f.map(
+    ([k, v]) => `<b>${esc(k)}</b><span>${esc(v)}</span>`).join("")}</div>` : "";
+}
+
 function gateCardHtml(a) {
   let info = {};
   try { info = JSON.parse(a.detail || "{}"); } catch { /* raw */ }
   return `<div class="inline-card confirm">
     <div class="q">${esc(t("gate.q"))}</div>
     <div class="sub">${esc(t("gate.sub"))}</div>
+    ${gateFieldsHtml(info, a)}
     <div class="detail">${esc(info.note || a.detail || "")}</div>
     <div class="btnrow">
       <button class="btn primary sm" data-appr="${esc(a.id)}" data-ok="1">${esc(t("gate.approve"))}</button>
       <button class="btn danger sm" data-appr="${esc(a.id)}">${esc(t("gate.deny"))}</button>
     </div></div>`;
+}
+
+/* proactive failure notice (M10 §11): name, time, whether computation
+   started, the confirmed primary reason, what completed, partial
+   results, next step - all fields the backend already confirmed. */
+function failureBodyHtml(f, completed, partial) {
+  f = f || {};
+  const rows = [];
+  rows.push(esc(f.started_computation ? t("fail.startedYes") : t("fail.startedNo")));
+  if (f.reason) rows.push(`<div>${esc(f.reason)}</div>`);
+  if ((f.blockers || []).length)
+    rows.push(`<div><b>${esc(t("fail.blockersH"))}</b>: ${f.blockers.map(esc).join("<br>")}</div>`);
+  rows.push(`<div class="hint">${esc(t("fail.completedH"))}: ${
+    (completed || []).length ? esc(completed.join(", ")) : esc(t("fail.completedNone"))}</div>`);
+  rows.push(`<div class="hint">${partial
+    ? esc(t("fail.partialN", { n: partial })) : esc(t("fail.partial0"))}</div>`);
+  if (f.next_step)
+    rows.push(`<div><b>${esc(t("fail.next"))}</b>: ${esc(f.next_step)}</div>`);
+  return `<div class="failcard">${rows.join("")}</div>`;
+}
+
+function failMsgHtml(m) {
+  const meta = m.meta || {};
+  return `<div class="msg system failmsg">
+    <div class="meta"><span>${esc(roleLabel(m.role))}</span>
+      <span class="badge danger">${esc(t("fail.head"))}</span>
+      <span class="ts">${esc(fmtTime(m.ts))}</span></div>
+    <div class="body"><b>${esc(t("fail.head"))}: ${esc(
+      taskDisplayNameById(meta.job_id || ""))}</b>
+      ${failureBodyHtml(meta.failure, meta.completed_before_failure,
+                        meta.partial_artifacts)}
+      <div class="btnrow" style="margin-top:6px">
+        <button class="btn sm" data-openjob="${esc(meta.job_id || "")}">${esc(t("fail.open"))}</button>
+      </div></div></div>`;
 }
 
 function renderChat() {
@@ -1073,13 +1325,10 @@ function renderChat() {
     html += `<div class="emptychat">
       <div class="et">${esc(t("chat.emptyTitle"))}</div>
       <div class="es">${esc(t("chat.emptySub"))}</div>
-      <button id="load-example">${esc(t("chat.example"))}</button>
     </div>`;
   }
   log.innerHTML = html;
   log.scrollTop = log.scrollHeight;
-  const le = $("load-example");
-  if (le) le.addEventListener("click", loadExample);
 }
 
 /* activity line right above the composer - what the agent is doing
@@ -1121,6 +1370,13 @@ function updateActivity(gatePending) {
   } else if (turn) {
     label = t("act.lastturn") + turn.state;
   }
+  // one exchange at a time (M10 §12): sending is disabled while the
+  // agent is still answering; the draft stays in the box for the next turn
+  const send = $("chat-send");
+  if (send) {
+    send.disabled = !!working;
+    send.title = working ? t("chat.busySend") : "";
+  }
   if (!label) {
     bar.classList.add("hidden"); stop.classList.add("hidden");
     return;
@@ -1151,23 +1407,11 @@ $("chat-stop").addEventListener("click", async () => {
   $("chat-stop").disabled = false;
 });
 
-async function loadExample() {
-  try {
-    if (!state.activeCid) {
-      const r = await api("POST", "/api/conversations", {});
-      state.activeCid = r.conversation.id;
-    }
-    await api("POST", `/api/conversations/${state.activeCid}/example`, {});
-    await refreshConv();
-    await refreshSidebar();
-    await refreshJobs();
-  } catch (e) { toast(e.message, true); }
-}
-
 $("chat-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const text = $("chat-input").value.trim();
   if (!text) return;
+  if (state.turnWorking) { toast(t("chat.busySend"), true); return; }
   $("chat-input").value = "";
   try {
     const r = await api("POST", "/api/chat",
@@ -1176,7 +1420,15 @@ $("chat-form").addEventListener("submit", async (ev) => {
     await refreshConv();
     await refreshSidebar();
     await refreshJobs();
-  } catch (e) { toast(t("toast.sendFail", { e: e.message }), true); }
+  } catch (e) {
+    // The server now REJECTS an oversized prompt (413) instead of
+    // silently cutting its tail. Put the draft back so a long message
+    // is never lost on a failed send, and surface the server's own
+    // explanation rather than a bare "HTTP 413".
+    if (!$("chat-input").value) $("chat-input").value = text;
+    const detail = (e.data && (e.data.detail || e.data.error)) || e.message;
+    toast(t("toast.sendFail", { e: detail }), true);
+  }
 });
 $("chat-input").addEventListener("keydown", (ev) => {
   if (ev.key === "Enter" && !ev.shiftKey) {
@@ -1295,7 +1547,9 @@ function scienceOverrides() {
     const el = document.querySelector(`[data-param="${CSS.escape(c.id)}"]`);
     if (!el) return;
     if (c.control === "checkbox") {
-      if (el.checked) cfg[c.id] = true;
+      // option rows are "runs" checkboxes: unchecked = skip this run,
+      // which is exactly the skip_* override the native CLI applies
+      if (!el.checked) cfg[c.id] = true;
     } else if (c.control === "number") {
       const v = parseInt(el.value, 10);
       if (!isNaN(v) && v !== Number(c.native_default)) cfg[c.id] = v;
@@ -1321,7 +1575,9 @@ function renderScience() {
   const ov = state.requestedConfig || {};
   let html = `<div class="scientific">`;
   Object.keys(secs).forEach((sid) => {
-    const items = ctrl.filter((c) => c.section === sid);
+    // optional skip-switches live in Analysis options, not here (M10 §7)
+    const items = ctrl.filter((c) => c.section === sid &&
+                                     c.control !== "checkbox");
     if (!items.length) return;
     html += `<div class="pgroup"><h3>${esc(LANG === "zh" ? secLabelZh(sid) : secs[sid])}</h3>`;
     html += items.map((c) => scCtrlHtml(c, ov)).join("") + `</div>`;
@@ -1423,7 +1679,7 @@ $("sci-reset").addEventListener("click", () => {
    planner; the Web layer only presents their answers. The review
    survives tab switches and reloads (VS "prep"). */
 const prep = { disc: null, manifest: null, plan: null, planState: "idle",
-               caseName: "" };
+               caseName: "", ready: null, readyState: "idle" };
 let discReq = 0;
 
 function prepPersist() {
@@ -1461,6 +1717,8 @@ function renderPrepFlow() {
     $("prep-actions").hidden = true;
     $("sci-block").hidden = true;
     $("plan-block").hidden = true;
+    $("options-block").hidden = true;
+    $("ready-block").hidden = true;
     $("approval-note").hidden = true;
     $("prep-entry").hidden = false;
     return;
@@ -1499,7 +1757,7 @@ $("prep-discover").addEventListener("click", async () => {
                                    "/api/native/discover", { data_dir });
     if (req !== discReq) return;           // a newer scan superseded this
     prep.disc = d; prep.manifest = null; prep.plan = null;
-    prep.planState = "idle";
+    prep.planState = "idle"; prep.ready = null; prep.readyState = "idle";
     prep.caseName = ((d.summary || {}).tumor_sample_id
       || (d.summary || {}).case_guess || "").replace(/_T$/i, "").toUpperCase();
     prepPersist();
@@ -1595,6 +1853,7 @@ function renderInvCard() {
   const rc = $("prep-rescan");
   if (rc) rc.addEventListener("click", () => {
     prep.disc = null; prep.manifest = null; prep.plan = null; prep.planState = "idle";
+    prep.ready = null; prep.readyState = "idle";
     VS.drop("picks"); prepPersist(); renderPrepFlow();
     $("prep-dir").focus();
   });
@@ -1795,9 +2054,14 @@ function renderConfirmed() {
   $("prep-flow").appendChild(card);
   $("sci-block").hidden = false;
   $("plan-block").hidden = false;
+  $("options-block").hidden = false;
+  $("ready-block").hidden = false;
   $("prep-actions").hidden = false;
   $("approval-note").hidden = false;
+  $("exec-mode").value = VS.get("execMode", "autonomous");
   updateSciState();
+  renderOptions();
+  renderReadiness();
   renderSubmitState();
 }
 
@@ -1816,6 +2080,10 @@ async function loadPlan() {
       "/api/jobs/native/preview", { manifest_id: m.id });
     prep.plan = plan; prep.planState = "done";
     renderPlan();
+    renderOptions();
+    // one coherent readiness state (M10 §9): every fresh planner verdict
+    // refreshes the full-workflow check together with it
+    loadReadiness();
   } catch (e) {
     prep.plan = null; prep.planState = "failed";
     body.innerHTML = alertHtml("blocking",
@@ -1825,6 +2093,135 @@ async function loadPlan() {
     $("plan-retry").addEventListener("click", loadPlan);
     renderSubmitState();
   }
+}
+
+/* ---------------- analysis options (M10 §7) ----------------
+   One list from REAL sources only: the planner's own step verdicts
+   (required / not-applicable) plus the verified optional switches from
+   the parameter inventory (default on = native behavior; turning one
+   off records a skip override exactly as the CLI would). */
+function renderOptions() {
+  const block = $("options-block");
+  if (!block) return;
+  if (!prep.manifest || prep.manifest.status !== "confirmed") {
+    block.hidden = true;
+    return;
+  }
+  block.hidden = false;
+  $("options-note").textContent = t("opt.note");
+  const ov = state.requestedConfig || {};
+  const rows = [];
+  (((state.params || {}).science) || [])
+    .filter((c) => c.control === "checkbox")
+    .forEach((c) => {
+      const id = esc(c.id);
+      const on = !ov[c.id];            // default: the step runs
+      const name = LANG === "zh" ? scLabelZh(c.id) : c.label;
+      const hint = LANG === "zh" ? scHintZh(c.id) : "";
+      rows.push(`<div class="opt-row${on ? "" : " off"}">
+        <label class="chk"><input type="checkbox" data-param="${id}"
+          ${on ? "checked" : ""}><span>${esc(name)}</span></label>
+        <span class="opt-tag">${esc(on ? t("opt.runs") : t("opt.off"))}</span>
+        ${hint ? `<div class="sc-hint">${esc(hint)}</div>` : ""}</div>`);
+    });
+  const plan = prep.plan;
+  ((plan && plan.steps) || []).forEach((st) => {
+    const label = [st.step_id, st.name].filter(Boolean).join(" ") +
+      (LANG === "zh" && planStepName(st)
+        ? ` ${planStepName(st)}` : "");
+    if (st.status === "SKIPPED")
+      rows.push(`<div class="opt-row na"><span>${esc(label)}</span>` +
+        `<span class="opt-tag">${esc(t("opt.na"))}</span></div>`);
+    else if (["PASS", "DRY_RUN", "PLANNED_IN_PRODUCTION_DAG"]
+      .includes(st.status))
+      rows.push(`<div class="opt-row req"><span>${esc(label)}</span>` +
+        `<span class="opt-tag">${esc(t("opt.req"))}</span></div>`);
+  });
+  $("options-body").innerHTML = rows.join("") ||
+    `<div class="hint">${esc(t("plan.loading"))}</div>`;
+  document.querySelectorAll("#options-body input[data-param]")
+    .forEach((el) => el.addEventListener("change", () => {
+      updateSciState();
+      renderOptions();
+      renderScience();     // keep the fold's "changed" count in sync
+      if (prep.manifest) {
+        clearTimeout(planDebounce);
+        planDebounce = setTimeout(loadPlan, 600);
+      }
+    }));
+}
+
+/* ---------------- readiness check (M10 §9) ----------------
+   ONE comprehensive pre-submission check of the ENTIRE workflow,
+   computed by the server (real planner included). The interface only
+   renders what the server measured - readiness is never assembled,
+   cached past a configuration change, or estimated locally. */
+let readyReq = 0;
+async function loadReadiness() {
+  const m = prep.manifest;
+  if (!m || m.status !== "confirmed") return;
+  const req = ++readyReq;
+  prep.readyState = "loading";
+  renderReadiness();
+  try {
+    const r = await apiWithTimeout(300000, "POST",
+      "/api/jobs/native/readiness",
+      { manifest_id: m.id, native_params: nativeParamsPayload() });
+    if (req !== readyReq) return;
+    prep.ready = r; prep.readyState = "done";
+  } catch (e) {
+    if (req !== readyReq) return;
+    // a failed check is a failed check: it BLOCKS rather than passing
+    // silently, and the server's own reason is shown
+    prep.ready = { status: "BLOCKED", checks: [], warnings: [],
+                   blockers: [String((e.data && e.data.error) || e.message)],
+                   plan: null, checked_at: "" };
+    prep.readyState = "done";
+  }
+  renderReadiness();
+  renderSubmitState();
+}
+$("ready-run").addEventListener("click", loadReadiness);
+
+function renderReadiness() {
+  const block = $("ready-block");
+  if (!block) return;
+  if (!prep.manifest || prep.manifest.status !== "confirmed") {
+    block.hidden = true;
+    return;
+  }
+  block.hidden = false;
+  $("ready-run").disabled = prep.readyState === "loading";
+  const body = $("ready-body");
+  if (prep.readyState === "idle") {
+    body.innerHTML = "";
+    return;
+  }
+  if (prep.readyState === "loading") {
+    body.innerHTML = `<div class="prep-progress"><span class="spin"></span>
+      <span>${esc(t("rdy.checking"))}</span></div>`;
+    return;
+  }
+  const r = prep.ready || {};
+  const rows = (r.checks || []).map((c) => {
+    const mark = c.ok === true ? "ok" : c.ok === false ? "bad" : "note";
+    const lbl = t("rdy." + c.id) !== "rdy." + c.id ? t("rdy." + c.id) : c.id;
+    return `<div class="rdy-row ${mark}"><span class="rdy-mark">${
+      c.ok === true ? "&#10003;" : c.ok === false ? "&#10006;" : "&#8505;"
+    }</span><span class="rdy-name">${esc(lbl)}</span>` +
+    `<span class="rdy-detail">${esc(String(c.detail || ""))}</span></div>`;
+  }).join("");
+  const head = r.status === "READY"
+    ? alertHtml("good", t("rdy.ready"), "")
+    : alertHtml("blocking", t("rdy.blockedNote"),
+        (r.blockers || []).map(esc).join("<br>"));
+  const warn = (r.warnings || []).length
+    ? alertHtml("info", t("rdy.warnNote"),
+        (r.warnings || []).map(esc).join("<br>")) : "";
+  body.innerHTML = head + warn +
+    (rows ? `<div class="rdy-list">${rows}</div>` : "") +
+    (r.checked_at ? `<div class="hint">${esc(t("rdy.checkedAt"))}: ${
+      esc(r.checked_at)}</div>` : "");
 }
 
 function renderPlan() {
@@ -1886,6 +2283,17 @@ function planStepName(st) {
   return "";
 }
 
+function nativeParamsPayload() {
+  const sci = scienceOverrides();
+  const fwd = {};
+  ["event_top_n", "candidate_top_n", "genome_build",
+   "rna_quant_method", "automatic_tool_policy",
+   "skip_dna_sv", "skip_bam_matcher"].forEach((k) => {
+    if (sci[k] !== undefined && sci[k] !== "") fwd[k] = sci[k];
+  });
+  return fwd;
+}
+
 function renderSubmitState() {
   const btn = $("nj-submit"), hint = $("prep-hint");
   const plan = prep.plan;
@@ -1897,49 +2305,87 @@ function renderSubmitState() {
     why = t("plan.unavail"); can = false;
   } else if (plan && (plan.blocking_issues || []).length) {
     why = t("plan.blocked"); can = false;
+  } else if (prep.readyState === "loading") {
+    why = t("rdy.checking"); can = false;
+  } else if (prep.readyState === "done" &&
+             (prep.ready || {}).status !== "READY") {
+    // one coherent state: the same readiness the panel shows also
+    // gates the button (the server re-validates this at submit)
+    why = t("rdy.blockedNote"); can = false;
   }
   btn.disabled = !can;
   hint.textContent = why;
 }
+
+$("exec-mode").addEventListener("change", () => {
+  VS.set("execMode", $("exec-mode").value);
+});
 
 $("nj-submit").addEventListener("click", async () => {
   const m = prep.manifest;
   if (!(m && m.status === "confirmed")) {
     toast(t("prep.needConfirm"), true); return;
   }
-  const body = { engine: "native", manifest_id: m.id };
-  const sci = scienceOverrides();
-  const fwd = {};
-  ["event_top_n", "candidate_top_n", "genome_build",
-   "rna_quant_method", "automatic_tool_policy",
-   "skip_dna_sv", "skip_bam_matcher"].forEach((k) => {
-    if (sci[k] !== undefined && sci[k] !== "") fwd[k] = sci[k];
-  });
+  const exMode = $("exec-mode").value === "controlled"
+    ? "controlled" : "autonomous";
+  const body = { engine: "native", manifest_id: m.id,
+                 execution_mode: exMode,
+                 // M10 §10: this click IS the explicit, scoped start
+                 // authorization for exactly this run (the backend
+                 // records it as such and keeps the approval trail)
+                 authorized: "start_analysis" };
+  const fwd = nativeParamsPayload();
   if (Object.keys(fwd).length) body.native_params = fwd;
   $("nj-submit").disabled = true;
   try {
     const res = await api("POST", "/api/jobs", body);
-    toast(t("prep.submitted", { id: res.job_id }));
+    toast(t(exMode === "controlled"
+      ? "prep.submittedCtrl" : "prep.submitted", { id: res.job_id }));
     prep.disc = null; prep.manifest = null; prep.plan = null;
     prep.planState = "idle"; state.requestedConfig = {};
+    prep.ready = null; prep.readyState = "idle";
     VS.drop("prep");
     renderPrepFlow(); renderScience();
     switchView("tasks");
     await refreshJobs();
   } catch (e) {
     $("nj-submit").disabled = false;
-    toast(String((e.data && e.data.error) || e.message), true);
+    const d = (e.data && e.data) || {};
+    if (d.error === "readiness_blocked") {
+      // the server's re-validation outranks the local view: show its
+      // real blockers and re-render the same readiness state
+      prep.ready = { status: "BLOCKED", checks: (d.checks || []),
+                     blockers: d.blockers || [], warnings: d.warnings || [],
+                     plan: null, checked_at: "" };
+      prep.readyState = "done";
+      renderReadiness(); renderSubmitState();
+      toast(String(d.detail || e.message), true);
+    } else if (d.error === "duplicate_active") {
+      toast(t("toast.dupActive", { id: d.job_id || "",
+                                   d: d.detail || "" }), true);
+    } else {
+      toast(String(d.error && d.error.length < 60 ? d.error
+                  : (d.detail || d.error || e.message)), true);
+    }
   }
 });
 
-/* attention strip: anything blocked on a human click */
-function renderAttention() {
-  const host = $("attention");
+/* attention (M10 §10): EVERY item blocked on a human decision is
+   counted and reachable from anywhere via the header badge; the
+   central dialog carries the same cards with their full quality
+   fields. "Waiting for approval" is never shown as running. */
+function attentionRowsHtml(includeGate) {
   const rows = [];
   for (const a of (state.boot.approvals || [])) {
-    if (a.state !== "pending" || a.action === "gate_op") continue;
+    if (a.state !== "pending") continue;
     let info = {};
     try { info = JSON.parse(a.detail || "{}"); } catch { /* plain note */ }
+    if (a.action === "gate_op") {
+      // the gate card lives inline in its chat; the dialog also
+      // surfaces it so nothing waits unseen across tabs
+      if (includeGate) rows.push(`<div class="at-col">${gateCardHtml(a)}</div>`);
+      continue;
+    }
     if (info.kind === "benchmark_consent") {
       // the consent card states the whole experiment and offers the
       // four answers the user is entitled to give.
@@ -1967,25 +2413,55 @@ function renderAttention() {
   }
   for (const d of (state.boot.decisions || [])) {
     if (d.status !== "pending") continue;
+    // the fixed plan-review question gets the product gloss; the raw
+    // server record stays in the tooltip (server text is not translated)
+    const q = d.key === "native.plan_review"
+      ? t("dec.nativePlan") : d.question;
     rows.push(`<div class="at-row">
-      <span><b>${esc(t("attn.decision"))}</b> - ${esc(d.question)}</span>
+      <span><b>${esc(t("attn.decision"))}</b> - ${esc(q)}</span>
       <span class="btnrow" style="margin:0">${(d.options || []).map((o) =>
         `<button class="btn sm" data-dec="${esc(d.id)}" data-choice="${esc(o.id)}"
           title="${esc(o.validation_status || "")}">${esc(o.label)}${o.policy_default ? " " + esc(t("attn.policyDefault")) : ""}</button>`).join("")}</span></div>`);
   }
+  return rows;
+}
+
+function renderAttention() {
+  const host = $("attention");
+  const all = attentionRowsHtml(true);
+  const badge = $("attn-badge");
+  if (badge) {
+    badge.classList.toggle("hidden", !all.length);
+    badge.textContent = String(all.length);
+    badge.title = t("attn.badgeTitle", { n: all.length });
+  }
+  const rows = attentionRowsHtml(false);
   if (!rows.length) { host.classList.add("hidden"); host.innerHTML = ""; return; }
   host.classList.remove("hidden");
-  host.innerHTML = `<div class="at-head">${rows.length} ${esc(t("attn.waiting"))}</div>` +
+  host.innerHTML = `<div class="at-head">${all.length} ${esc(t("attn.waiting"))}</div>` +
     rows.join("");
 }
 
+$("attn-badge").addEventListener("click", () => {
+  const rows = attentionRowsHtml(true);
+  if (!rows.length) return;
+  uiDialog({ title: t("attn.center"),
+             bodyHtml: `<div class="at-dialog">${rows.join("")}</div>`,
+             actions: [{ label: t("dlg.close"), value: null, cls: "ghost" }] });
+});
+
 /* ---------------- tasks (M9 §8/§9) ---------------- */
 const ACTIVE_STATES = ["queued", "running", "paused", "blocked"];
-function statusPill(st) {
+function statusPill(st, j) {
   const cls = { completed: "ok", running: "accent", queued: "accent",
                 blocked: "warn", paused: "warn", failed: "danger",
                 cancelled: "muted" }[st] || "muted";
-  const lbl = t("st." + st) !== "st." + st ? t("st." + st) : st;
+  let lbl = t("st." + st) !== "st." + st ? t("st." + st) : st;
+  // "waiting for approval" and "waiting for your decision" are kept
+  // apart from "running" - at a glance, never the same thing (M10 §10)
+  if (st === "blocked" && j && (state.boot?.decisions || [])
+    .some((d) => d.status === "pending" && d.job_id === j.id))
+    lbl = t("st.waitdec");
   return `<span class="pill ${cls}">${esc(lbl)}</span>`;
 }
 /* Display name: an explicit user title always wins; otherwise pieces
@@ -2010,11 +2486,14 @@ function jobRowHtml(j) {
       ? t("concl." + j.outcome) : "" : "";
   const sub = [j.id, fmtDT(j.created_at), j.stage || "", concl]
     .filter(Boolean).join(" · ");
+  // human headline on terminal rows; the raw code stays in the drawer
+  const tail = j.state === "failed" ? " - " + esc(t("fail.head"))
+    : j.error ? " - " + esc(j.error) : "";
   return `<div class="jr-main">
       <div class="jr-name">${esc(displayName(j))}</div>
-      <div class="jr-sub">${esc(sub)}${j.error ? " - " + esc(j.error) : ""}</div>
+      <div class="jr-sub">${esc(sub)}${tail}</div>
     </div>
-    <div class="jr-side">${bar}${statusPill(j.state)}</div>`;
+    <div class="jr-side">${bar}${statusPill(j.state, j)}</div>`;
 }
 
 function renderJobs() {
@@ -2091,8 +2570,11 @@ async function openJob(id, quiet) {
     <div class="dr-sub">${esc(t("dr.created"))}: ${esc(fmtDT(job.created_at))}</div>
     <div class="dr-id">${esc(t("dr.id"))}: ${esc(job.id)}</div>
     <div class="state-pair">
-      <span>${esc(t("dr.exec"))}:</span> ${statusPill(job.state)} ${conclHtml}
+      <span>${esc(t("dr.exec"))}:</span> ${statusPill(job.state, job)} ${conclHtml}
     </div>
+    ${task && task.failure ? `<section><h3>${esc(t("fail.head"))}</h3>
+      ${failureBodyHtml(task.failure, task.completed_before_failure,
+                        task.partial_artifacts)}</section>` : ""}
     <section><h3>${esc(t("dr.controls"))}</h3><div class="btnrow">
       <button class="btn sm" id="jd-pause"
         ${running && !(task && task.native) ? "" : "disabled"}
@@ -2103,12 +2585,7 @@ async function openJob(id, quiet) {
         title="${task && task.native && task.native.profile === "gateway" ? esc(t("dr.cancelNote")) : ""}">${esc(t("dr.cancel"))}</button>
     </div></section>
     ${arts.length ? `<section><h3>${esc(t("dr.artifacts"))}</h3>
-      <div class="tablewrap"><table class="data">
-        <thead><tr><th>${esc(t("dr.artifacts"))}</th><th>Status</th><th>Rows</th></tr></thead>
-        <tbody>${arts.map((a) => `<tr><td>${esc(a.name)}</td>
-          <td><span class="pill ${a.status === "available" ? "ok"
-            : a.status === "empty" ? "warn" : "danger"}">${esc(a.status)}</span></td>
-          <td>${esc(a.rows ?? "")}</td></tr>`).join("")}</tbody></table></div></section>` : ""}
+      ${artifactRows(arts, id)}</section>` : ""}
     <section><h3>${esc(t("dr.tech"))}</h3>
       <details class="adv"><summary>${esc(t("dr.reqcfg"))}</summary>
         <div class="kv">${Object.entries((job.spec &&
@@ -2192,6 +2669,9 @@ async function openJob(id, quiet) {
 
 function renderTasks() {
   renderScience();
+  renderOptions();
+  renderReadiness();
+  renderSubmitState();
 }
 
 /* ---------------- results view ---------------- */
@@ -2213,26 +2693,114 @@ function candTable(rows) {
     </table></div>`;
 }
 
+/* the single authoritative results registry (M10 §14): EVERY formal
+   run appears with its real outcome - running, waiting, failed,
+   cancelled, zero-candidates or delivered - plus the Discovery
+   reviews, whose reports stay owned by that workspace. Legacy
+   simulation history is hidden by default but never deleted. */
+function clearResultsPanes() {
+  ["res-findings", "res-warnings", "res-artifacts", "res-strategy",
+   "res-table", "res-meta", "res-manifest"].forEach(
+    (id) => { $(id).innerHTML = ""; });
+}
+
+function artifactRows(arts, jid) {
+  if (!arts.length) return "";
+  return `<div class="tablewrap"><table class="data">
+    <thead><tr><th>Artifact</th><th>Type</th><th>Status</th>
+    <th>Rows</th><th></th></tr></thead><tbody>${arts.map((a) => `
+      <tr><td>${esc(a.name)}</td><td>${esc(a.type || a.strategy || "")}</td>
+      <td><span class="pill ${a.status === "available" ? "ok"
+        : a.status === "empty" ? "warn" : "danger"}">${esc(a.status)}</span></td>
+      <td>${esc(a.rows ?? "")}</td>
+      <td>${a.status === "available"
+        ? `<a class="btn sm ghost" href="/api/results/${encodeURIComponent(
+            jid)}/artifact/${encodeURIComponent(a.id ?? a.name)}"
+            download>${esc(t("res.dl"))}</a>` : ""}</td></tr>`).join("")
+    }</tbody></table></div>`;
+}
+
 function renderResults() {
-  // research rows share the unified task list but have no run results -
-  // their report lives in the Discovery workspace
-  const done = (state.boot.jobs || []).filter((j) => j.state === "completed"
-                                              && !/^res-/.test(j.id));
-  $("res-job").innerHTML = done.map((j) =>
-    `<option value="${esc(j.id)}">${esc(displayName(j))} · ${esc(j.id)}` +
-    `${j.outcome ? " - " + esc(j.outcome.replace(/_/g, " ")) : ""}</option>`)
-    .join("");
-  if (!done.length) {
+  const jobs = (state.boot?.jobs || []).filter((j) => !/^res-/.test(j.id));
+  const research = state.boot?.research || [];
+  const isMock = (j) => !j.spec || j.spec.engine === "mock";
+  const hasMock = jobs.some(isMock);
+  $("res-mock-wrap").hidden = !hasMock;
+  $("res-mock").checked = !!state.resultsMock;
+  const runs = jobs.filter((j) => state.resultsMock || !isMock(j));
+  const opts = runs.map((j) => {
+    const st = t("st." + j.state) !== "st." + j.state ? t("st." + j.state) : j.state;
+    return `<option value="${esc(j.id)}">${esc(displayName(j))} · ${st}` +
+      `${j.outcome ? " - " + esc(j.outcome.replace(/_/g, " ")) : ""}` +
+      ` · ${esc(j.id)}</option>`;
+  }).join("") + research.map((r) =>
+    `<option value="${esc(r.id)}">${esc(researchName(r))} · ${
+      esc(t("res.discoveryRow"))}</option>`).join("");
+  $("res-job").innerHTML = opts;
+  if (!opts) {
     $("res-outcome").innerHTML = `<div class="empty">${esc(t("res.none"))}</div>`;
-    $("res-meta").innerHTML = ""; $("res-table").innerHTML = "";
-    $("res-warnings").innerHTML = ""; $("res-artifacts").innerHTML = "";
-    $("res-strategy").innerHTML = ""; $("res-manifest").innerHTML = "";
+    clearResultsPanes();
     return;
   }
-  if (!state.resultsJob || !done.find((j) => j.id === state.resultsJob))
-    state.resultsJob = done[0].id;
+  if (!state.resultsJob ||
+      !opts.includes(`value="${state.resultsJob}"`))
+    state.resultsJob = $("res-job").options[0].value;
   $("res-job").value = state.resultsJob;
-  api("GET", `/api/results/${state.resultsJob}`).then((res) => {
+  const jid = state.resultsJob;
+  if (/^res-/.test(jid)) {
+    const r = research.find((x) => x.id === jid) || {};
+    $("res-outcome").innerHTML = `<div class="alert info">
+      <b>${esc(researchName(r))}</b> ${resPill(r.status || "completed")}
+      <div>${esc(t("res.discoveryNote"))}</div>
+      <div class="btnrow" style="margin-top:6px"><button class="btn sm"
+        id="res-open-disc">${esc(t("res.openDiscovery"))}</button></div></div>`;
+    $("res-open-disc").addEventListener("click", () => {
+      const tab = document.querySelector('.wtab[data-view="discovery"]');
+      if (tab) tab.click();
+      showReport(jid);
+    });
+    clearResultsPanes();
+    return;
+  }
+  const job = jobs.find((j) => j.id === jid);
+  clearResultsPanes();
+  if (job && ["queued", "running", "paused", "blocked"].includes(job.state)) {
+    const st = t("st." + job.state) !== "st." + job.state ? t("st." + job.state) : job.state;
+    $("res-outcome").innerHTML = alertHtml("info", displayName(job),
+      esc(t("res.inprogress", { state: st })));
+    return;
+  }
+  if (job && job.state === "cancelled") {
+    $("res-outcome").innerHTML =
+      `<div class="outcome muted"><b>${esc(t("st.cancelled"))}</b></div>` +
+      alertHtml("info", displayName(job), esc(t("res.cancelledNote")));
+    return;
+  }
+  if (job && job.state === "failed") {
+    $("res-outcome").innerHTML = `<div class="prep-progress">
+      <span class="spin"></span></div>`;
+    api("GET", `/api/results/${jid}`).then((res) => {
+      const arts = res.artifacts || [];
+      $("res-outcome").innerHTML =
+        `<div class="outcome danger"><b>${esc(
+          (res.outcome || "generation_failed").replace(/_/g, " "))}</b>
+         <div class="hint">${esc(res.note || "")}</div></div>` +
+        `<div class="failcard-inline"><b>${esc(t("fail.head"))}</b>` +
+        failureBodyHtml(res.failure, res.completed_before_failure,
+                        arts.length) +
+        `<details class="adv"><summary>technical</summary><code>${esc(
+          res.failure_detail || "")}</code></details></div>`;
+      $("res-artifacts").innerHTML =
+        `<h3 class="sec">${esc(t("res.artH", { n: arts.length }))}</h3>` +
+        (artifactRows(arts, jid) ||
+         `<div class="hint">${esc(t("fail.partial0"))}</div>`);
+    }).catch((e) => {
+      $("res-outcome").innerHTML = alertHtml("warn", t("fail.head"),
+        esc(t("res.unavail", { e: e.message })));
+    });
+    return;
+  }
+  api("GET", `/api/results/${jid}`).then((res) => {
     const outcome = res.outcome || "no_artifacts";
     $("res-outcome").innerHTML = `
       <div class="outcome ${esc(OUTCOME_CLS[outcome] || "muted")}">
@@ -2271,16 +2839,29 @@ function renderResults() {
         ` artefacts (see the results bundle)</div></div>`);
     }
     const arts = res.artifacts || (res.manifest || {}).artifacts || [];
+    // findings first: the shortlist before any tables or provenance
+    const byS0 = res.candidates_by_strategy || {};
+    const cands0 = byS0[state.resultsStrategy] ||
+      byS0[Object.keys(byS0)[0]] || res.candidates || [];
+    let findings = "";
+    if (cands0.length) {
+      findings = `<h3 class="sec">${esc(t("res.shortlist"))}</h3>` +
+        cands0.slice(0, 3).map((r) => `<div class="find-row">
+          <b>${esc(r.peptide)}</b> · ${esc(r.gene)} · HLA ${esc(r.hla)} ·
+          ${esc(r.branch)} · ${esc(r.mock_combined_score ?? r.combined_score ?? "")}</div>`).join("");
+    } else if ((res.preview_tables || []).length) {
+      const pt = res.preview_tables[0];
+      findings = `<h3 class="sec">${esc(t("res.shortlist"))}</h3>` +
+        (pt.rows || []).slice(0, 3).map((row) =>
+          `<div class="find-row">${(row.slice(0, 4) || []).map(esc).join(" · ")}</div>`).join("") +
+        `<div class="hint">${esc(t("res.previewNote"))}</div>`;
+    } else if (outcome === "zero_candidates") {
+      findings = alertHtml("info", t("res.empty0"), "");
+    }
+    $("res-findings").innerHTML = findings;
     $("res-artifacts").innerHTML = `<h3 class="sec">${esc(t("res.artH", { n: arts.length }))}</h3>` +
-      (arts.length ? `<div class="tablewrap"><table class="data">
-        <thead><tr><th>Artifact</th><th>Strategy</th><th>Status</th>
-        <th>Rows</th><th>Checksum</th></tr></thead><tbody>${arts.map((a) => `
-          <tr><td>${esc(a.name)}</td><td>${esc(a.strategy || "")}</td>
-          <td><span class="pill ${a.status === "available" ? "ok"
-            : a.status === "empty" ? "warn" : "danger"}">${esc(a.status)}</span></td>
-          <td>${esc(a.rows ?? "")}</td>
-          <td><code>${esc(a.checksum || "")}</code></td></tr>`).join("")}</tbody></table></div>`
-      : `<div class="alert warn">${esc(t("res.noArtReg"))}</div>`);
+      (artifactRows(arts, jid) ||
+       `<div class="alert warn">${esc(t("res.noArtReg"))}</div>`);
     // every strategy the run produced gets its own table, not one
     const byS = res.candidates_by_strategy || {};
     const strategies = Object.keys(byS).length ? Object.keys(byS)
@@ -2301,6 +2882,18 @@ function renderResults() {
       });
       $("res-table").innerHTML = candTable(
         byS[state.resultsStrategy] || res.candidates || []);
+    } else if ((res.preview_tables || []).length) {
+      // native runs: the pipeline's OWN ranked tables, verbatim
+      $("res-strategy").innerHTML = "";
+      $("res-table").innerHTML =
+        `<h3 class="sec">${esc(t("res.previewH"))}</h3>
+         <div class="hint">${esc(t("res.previewNote"))}</div>` +
+        res.preview_tables.map((pt) => `
+          <div class="tablewrap"><table class="data">
+          <thead><tr>${(pt.header || []).map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead>
+          <tbody>${(pt.rows || []).map((r) =>
+            `<tr>${r.map((c) => `<td>${esc(c)}</td>`).join("")}</tr>`).join("")}</tbody>
+          </table><div class="hint">${esc(pt.name)} (${esc(pt.kind || "")})</div></div>`).join("");
     } else {
       $("res-strategy").innerHTML = "";
       $("res-table").innerHTML = arts.length
@@ -2336,12 +2929,15 @@ $("res-job").addEventListener("change", () => {
   state.resultsStrategy = null;
   renderResults();
 });
+$("res-mock").addEventListener("change", () => {
+  state.resultsMock = $("res-mock").checked;
+  renderResults();
+});
 
 /* ---------------- discovery (real retrieval + example fixture) -------- */
 function discoveryTargets() {
   const d = (state.boot || {}).discovery || {};
-  return ($("res-engine").value || "live") === "example"
-    ? (d.example_targets || []) : (d.live_targets || []);
+  return d.live_targets || [];
 }
 
 function renderDiscoveryControls() {
@@ -2679,7 +3275,7 @@ async function showReport(id) {
 
 $("res-run").addEventListener("click", async () => {
   const scope = $("res-scope").value;
-  const engine = $("res-engine").value;
+  const engine = "live";
   const targets = [...document.querySelectorAll("[data-dtarget]:checked")]
     .map((c) => c.dataset.dtarget);
   const custom = $("res-custom").value.trim()
@@ -2702,10 +3298,6 @@ $("res-run").addEventListener("click", async () => {
   }
 });
 $("res-scope").addEventListener("change", renderDiscoveryControls);
-$("res-engine").addEventListener("change", () => {
-  state.discSel = {};
-  renderDiscoveryControls();
-});
 
 async function refreshDiscovery() {
   try {
@@ -2813,8 +3405,10 @@ async function refreshSkills() {
 function openSkillEditor(slug) {
   const host = $("skill-editor");
   const fill = (s) => {
-    host.innerHTML = `<div class="card">
-      <div class="card-head"><h2>${esc(t(s ? "sk.editTitle" : "sk.newTitle"))}</h2></div>
+    // inline editing inside the Skills card itself (M10 §15) - no
+    // separate page, no modal detour
+    host.innerHTML = `<div class="inline-edit">
+      <div class="card-head"><h3>${esc(t(s ? "sk.editTitle" : "sk.newTitle"))}</h3></div>
       <label class="lbl">${esc(t("sk.name"))}</label>
       <input id="sk-name" value="${esc(s ? s.title : "")}"
         placeholder="${esc(t("sk.namePh"))}">
@@ -2827,6 +3421,8 @@ function openSkillEditor(slug) {
         <span class="hint">${esc(t("sk.note"))}</span>
       </div>
       <div id="sk-err" class="hint"></div></div>`;
+    host.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    $("sk-name").focus();
     $("sk-cancel").addEventListener("click", () => { host.innerHTML = ""; });
     $("sk-save").addEventListener("click", async () => {
       const body = { name: $("sk-name").value.trim(),
@@ -2896,10 +3492,12 @@ document.addEventListener("click", async (ev) => {
         ? { decision: dec }
         : { approve: appr.dataset.ok === "1" };
       if (dec === "limit_scope") {
-        const s = window.prompt(t("attn.scopePrompt"));
+        const s = await uiPrompt({ title: t("attn.limit"),
+                                   bodyHtml: esc(t("attn.scopePrompt")) });
         if (!s) return;           // user backed out - card stays pending
         body.scope = s;
       }
+      closeDialog();
       await api("POST", `/api/approvals/${appr.dataset.appr}`, body);
       await refreshJobs(); refreshConv();
     } catch (e) { toast(t("toast.apprFail", { e: e.message }), true); }
@@ -2908,11 +3506,15 @@ document.addEventListener("click", async (ev) => {
   const dec = ev.target.closest("[data-dec]");
   if (dec) {
     try {
+      closeDialog();
       await api("POST", `/api/decisions/${dec.dataset.dec}/resolve`,
         { choice: dec.dataset.choice, note: t("attn.resolvedNote") });
       await refreshJobs();
     } catch (e) { toast(t("toast.decFail", { e: e.message }), true); }
+    return;
   }
+  const oj = ev.target.closest("[data-openjob]");
+  if (oj) { switchView("tasks"); openJob(oj.dataset.openjob); }
 });
 
 boot();

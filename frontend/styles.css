@@ -655,3 +655,94 @@ details.skill-adv pre.skill-raw { margin-top: 8px; white-space: pre-wrap; }
   .card { padding: 16px 16px; }
   .sctrl { grid-template-columns: 1fr; }
 }
+
+/* ================= M10: dialogs, attention, options, readiness,
+   findings, failure cards ================= */
+#dialog-root {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(30, 45, 62, .38);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding: 9vh 16px 16px;
+}
+.dlg-box {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r-lg); box-shadow: 0 10px 38px rgba(25, 45, 70, .22);
+  max-width: 640px; width: 100%; max-height: 78vh; overflow: auto;
+  padding: 18px 20px;
+}
+.dlg-box h3 { margin: 0 0 10px; font-size: 17px; }
+.dlg-box #dlg-body { font-size: 14px; color: var(--text-2); }
+.dlg-box #dlg-body textarea { margin-top: 8px; font-family: var(--sans); }
+.dlg-box .btnrow { margin-top: 14px; }
+.dlg-box .at-dialog .at-row { border: 1px solid var(--border);
+  border-radius: var(--r-md); padding: 10px 12px; margin-bottom: 10px; }
+.dlg-box .inline-card { margin-bottom: 10px; }
+
+.attn-badge {
+  min-width: 26px; height: 26px; border-radius: 13px;
+  border: 1px solid var(--danger-border); background: var(--danger-soft);
+  color: var(--danger); font-weight: 700; font-size: 13px;
+  cursor: pointer; padding: 0 8px;
+}
+.attn-badge:hover { background: #fbe0e0; }
+
+/* analysis options (M10 §7) */
+#options-body { display: flex; flex-direction: column; gap: 6px; }
+.opt-row {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  border: 1px solid var(--border); border-radius: var(--r-md);
+  padding: 8px 12px; background: var(--surface-2); font-size: 14px;
+}
+.opt-row .sc-hint { flex-basis: 100%; margin-top: -2px; }
+.opt-row.off { background: var(--warn-soft); border-color: var(--warn-border); }
+.opt-row.na { color: var(--text-3); }
+.opt-row.req { background: var(--surface); }
+.opt-tag {
+  margin-left: auto; font-size: 12px; color: var(--text-2);
+  border: 1px solid var(--border); border-radius: 999px;
+  padding: 1px 9px; background: var(--surface); white-space: nowrap;
+}
+.opt-row.req .opt-tag { color: var(--teal); border-color: #bfe6e2; background: var(--teal-soft); }
+.opt-row.na .opt-tag { color: var(--text-3); }
+
+/* readiness (M10 §9) */
+.rdy-list { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.rdy-row {
+  display: flex; gap: 9px; align-items: baseline;
+  font-size: 13.5px; padding: 5px 9px;
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+.rdy-row.ok .rdy-mark { color: var(--ok); }
+.rdy-row.bad .rdy-mark { color: var(--danger); }
+.rdy-row.note .rdy-mark { color: var(--text-3); }
+.rdy-row.bad { background: var(--danger-soft); border-color: var(--danger-border); }
+.rdy-name { font-weight: 600; white-space: nowrap; }
+.rdy-detail { color: var(--text-2); overflow-wrap: anywhere; }
+
+/* failure cards (M10 §11) */
+.failcard, .failcard-inline {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 13.5px; color: var(--text-2);
+  border-left: 3px solid var(--danger); padding: 6px 12px;
+  background: var(--danger-soft); border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  margin-top: 8px;
+}
+.failmsg .body { max-width: 100%; }
+.badge.danger { background: var(--danger-soft); color: var(--danger);
+  border: 1px solid var(--danger-border); }
+
+/* findings-first results (M10 §14) */
+#res-findings .find-row {
+  font-size: 13.5px; color: var(--text-2);
+  padding: 4px 10px; border-left: 3px solid var(--accent-border);
+  background: var(--accent-soft); border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  margin: 4px 0;
+}
+
+/* inline skill editing (M10 §15) */
+.inline-edit {
+  border: 1px solid var(--accent-border); background: var(--accent-soft);
+  border-radius: var(--r-md); padding: 14px 16px; margin-top: 12px;
+}
+.inline-edit textarea { font-family: var(--sans); }

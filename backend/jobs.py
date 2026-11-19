@@ -260,7 +260,9 @@ class JobManager:
     def submit_native(self, sample_id: str, profile: str = "demo",
                       native_params: dict | None = None, stub: bool = False,
                       requested_by: str = "user",
-                      conv_id: str = "") -> dict:
+                      conv_id: str = "",
+                      execution_mode: str = "autonomous",
+                      authorized_start: dict | None = None) -> dict:
         """Formal NEOAG job on the NATIVE execution system (Milestone 5,
         PART 1). Two profiles, both real NeoAG code paths:
           demo    - `neoag.cli run-demo`: the deployed repo's own safe
@@ -273,41 +275,99 @@ class JobManager:
                     execute returns GATEWAY_REQUIRED). Requires real
                     inputs and a working toolchain; failures are
                     reported honestly, never rerouted to the mock engine.
-        Same approval boundary as mock execute-class work: a human
-        approves BEFORE anything runs (POL-005)."""
+
+        Approval boundary (M10 §10, POL-005 preserved):
+          - agent / taskquery submissions: blocked on an approval card,
+            exactly as before - nothing the agent queues runs without a
+            separate human click;
+          - the human's OWN "Start Analysis" click in the preparation
+            flow arrives as `authorized_start` (the backend re-verified
+            readiness on the same request): the authorization is
+            RECORDED as an approval decided by the user at that moment,
+            naming its exact scope, and the job queues directly - the
+            same human consent, no redundant second card.
+        Execution mode (M10 §8, real behaviour, not a label):
+          autonomous - planning runs, and if the native planner clears
+                       the run, execution follows without further
+                       prompts (the start click was the consent);
+          controlled - after the planner clears the run, a REAL pause:
+                       a plan-review decision blocks the job until the
+                       human chooses Run / Abort (see _run_native).
+        """
         if profile not in ("demo", "gateway"):
             raise ValueError("profile must be demo|gateway")
         if profile == "gateway" and not (native_params or {}).get("sample_id"):
             raise ValueError("gateway profile requires native_params.sample_id")
+        if execution_mode not in ("autonomous", "controlled"):
+            raise ValueError("execution_mode must be autonomous|controlled")
         params = dict(native_params or {})
         params.setdefault("sample_id", sample_id)
         spec = {"engine": "native", "native_profile": profile,
                 "native_params": params, "stub": bool(stub),
-                "execution_mode": "autonomous",
+                "execution_mode": execution_mode,
                 "requested_config": dict(params)}
         job_id = new_id("job")
+        data_dir = str(params.get("input_dir") or "")
         if profile == "demo":
             summary = ("start NATIVE demo execution for sample "
                        f"{sample_id} - real NeoAG pipeline code, bundled "
                        "demo fixtures, predictors stubbed")
             risk = "MEDIUM (native runner, synthetic fixture inputs only)"
-            note = ("Approving runs `neoag.cli run-demo` from the deployed "
+            note = ("Runs `neoag.cli run-demo` from the deployed "
                     "NeoAG source. No patient data, no licensed binaries, "
                     "no network. Outputs are real files under the run's "
-                    "scratch directory.")
+                    "scratch directory. Stopping this run terminates our "
+                    "supervised runner process.")
         else:
             summary = ("start NATIVE execution via the NeoAG gateway for "
                        f"case {params.get('case_id') or sample_id} "
-                       "(planning first, then execute after this approval)")
+                       f"(planning first, then execute)"
+                       + (f" | data: {data_dir}" if data_dir else ""))
             risk = "HIGH (execute-class on the native gateway)"
-            note = ("Approving plans through the native planner and submits "
-                    "the execution to NeoAG's controlled-execution gateway "
-                    "with approved=true. Cancel is NOT supported by the "
-                    "native gateway (verified limitation): cancelling here "
-                    "marks the Web job cancelled but the gateway job runs "
-                    "to completion.")
+            note = (
+                "Plans through the native planner, then submits execution "
+                "to NeoAG's controlled-execution gateway with approved=true. "
+                f"Target: scratch outputs under {native_mod.WORK}/jobs/"
+                f"{job_id}"
+                + (f"; inputs read from {data_dir}" if data_dir else "")
+                + ". Consequence: real pipeline stages compute on this "
+                "host and WRITE new files under that run directory "
+                "(existing directories are never overwritten wholesale). "
+                "Reversibility: outputs are additive and deletable. "
+                "Cancel limitation (verified): the native gateway has no "
+                "cancel route - cancelling the Web job after submission "
+                "marks it cancelled but the gateway job runs to completion. "
+                "If declined: nothing is planned or executed; the job is "
+                "recorded cancelled.")
         appr = self.store.approval_create(new_id("appr"), job_id, summary,
                                           risk, note)
+        auto = (authorized_start or {}).get("authorized") and \
+            requested_by == "user"
+        if auto:
+            scope = str((authorized_start or {}).get("scope") or "")[:400]
+            self.store.approval_decide(appr["id"], True,
+                                       "user (explicit Start Analysis "
+                                       "authorization)")
+            self.store.job_create(job_id, "neoag-native-run", sample_id,
+                                  spec, "queued", appr["id"],
+                                  conv_id=conv_id)
+            self.store.event_add(
+                job_id, "state",
+                "queued: authorized at submission by the user's own Start "
+                f"Analysis click ({execution_mode} mode; scope: "
+                f"{scope or 'this confirmed manifest'})")
+            self.store.audit("user", "job.native.start.authorized", job_id,
+                             {"sample": sample_id, "profile": profile,
+                              "execution_mode": execution_mode,
+                              "scope": scope, "approval": appr["id"]})
+            # same launch step the approval path performs once a card is
+            # approved (on_approval_decided): the consent arrived WITH the
+            # submission, so the worker starts now, not at next boot.
+            self._launch(job_id)
+            self.publish({"type": "job", "id": job_id})
+            return {"job_id": job_id, "approval_id": appr["id"],
+                    "auto_started": True,
+                    "authorization": "user-explicit-start"}
         self.store.job_create(job_id, "neoag-native-run", sample_id, spec,
                               "blocked", appr["id"], conv_id=conv_id)
         self.store.event_add(job_id, "state",
@@ -1080,14 +1140,77 @@ class JobManager:
         self.store.event_add(job_id, "state", f"cancelled: {note}")
         self.publish({"type": "job", "id": job_id})
 
+    # ---- M10 §11: structured, human-readable failure reporting ----
+    @staticmethod
+    def _humanize_native_failure(code: str, message: str, detail,
+                                 profile: str, phase: str) -> dict:
+        """One confirmed reason + the real next step, derived from the
+        actual failure record (never a guess). Phases: preflight /
+        planning / submission / execution."""
+        code = str(code or "")
+        started = phase == "execution"
+        blockers = []
+        if isinstance(detail, dict):
+            blockers = [str(x) for x in (detail.get("blocking_issues")
+                                         or [])]
+        if code == "NATIVE_UNAVAILABLE":
+            reason = ("the native NeoAG runtime is not importable on "
+                      "this host - the run was refused BEFORE any "
+                      "planning or computation")
+            nxt = ("ask the operator to restore the NeoAG deployment "
+                   "(python + source root); the exact coordinates are in "
+                   "the task's technical details")
+        elif code.startswith("PLAN_"):
+            reason = ("the native planner did not clear this run, so "
+                      "NOTHING was executed - this is a preflight "
+                      "verdict, not a failed computation")
+            nxt = ("resolve the first blocking issue listed below and "
+                   "start again" if blockers else
+                   "open the run plan in the task's technical details - "
+                   "the planner states what it needs")
+        elif code == "GATEWAY_APPROVAL_REQUIRED":
+            reason = ("the native gateway demanded its own approval for "
+                      "this payload and refused the submission")
+            nxt = "check the gateway payload policy, then start again"
+        elif code == "GATEWAY_SUBMISSION_FAILED":
+            reason = "the native gateway refused this execution submission"
+            nxt = ("see the gateway detail below; the deployment log is "
+                   f"{native_mod.WORK}/gateway.log")
+        elif code == "GATEWAY_MONITOR_TIMEOUT":
+            reason = ("the gateway job was still non-terminal after the "
+                      "monitoring window - its true state is UNKNOWN "
+                      "here, this interface does not guess it")
+            nxt = "check the native gateway job status / operator log"
+        elif code.startswith("DEMO_"):
+            reason = f"the native demo run stopped: {message}"
+            nxt = ("the demo path needs the deployed repo's bundled "
+                   "fixtures; the log tail in technical details shows "
+                   "the exact error")
+        else:
+            reason = message or f"native execution reported {code}"
+            nxt = "open the task's technical details for the recorded detail"
+        return {"code": code, "phase": phase,
+                "started_computation": started,
+                "reason": reason, "blockers": blockers[:10],
+                "next_step": nxt}
+
     def _fail_native(self, job_id: str, outdir: str, profile: str,
-                     code: str, message: str, detail) -> None:
+                     code: str, message: str, detail,
+                     phase: str = "planning") -> None:
         # register whatever the attempt really produced (forensics), then
         # fail honestly - a failed native run is NEVER downgraded into a
         # mock success.
         arts, _un = native_mod.collect_artifacts(outdir)
-        self._register_native_artifacts(job_id, arts, profile)
+        registered = self._register_native_artifacts(job_id, arts, profile)
         err = f"NATIVE FAILURE {code}: {message}"[:500]
+        report = self._humanize_native_failure(code, message, detail,
+                                               profile, phase)
+        completed = []
+        if phase in ("submission", "execution"):
+            completed.append("input discovery + manifest confirmation")
+            completed.append("native planning (planner PASS)")
+        elif phase == "planning":
+            completed.append("input discovery + manifest confirmation")
         self.store.job_set(job_id, state="failed", finished_at=now(),
                            outcome="generation_failed", error=err,
                            result_json=json.dumps({
@@ -1096,9 +1219,50 @@ class JobManager:
                                "native_profile": profile, "ok": False,
                                "failure_code": code,
                                "failure_detail": str(detail or "")[:1500],
+                               "failure": report,
+                               "completed_before_failure": completed,
+                               "partial_artifacts": len(registered or []),
                                "outdir": outdir}, ensure_ascii=False))
         self.store.event_add(job_id, "state", f"failed: {err}")
         self.publish({"type": "job", "id": job_id})
+        self._notify_failure(job_id, report, completed,
+                             len(registered or []))
+
+    def _notify_failure(self, job_id: str, report: dict,
+                        completed: list, partial: int) -> None:
+        """M10 §11: the owning conversation is TOLD proactively - name,
+        time, whether computation started, the confirmed primary reason,
+        what completed, partial results, next step. Raw codes stay in
+        the technical detail, not the headline."""
+        job = self.store.job_get(job_id)
+        if not job:
+            return
+        lines = [
+            ("started" if report.get("started_computation") else
+             "stopped") ,
+            report.get("reason", ""),
+        ]
+        if report.get("blockers"):
+            lines.append("Blocking issue(s): "
+                         + " | ".join(report["blockers"][:4]))
+        lines.append("Completed before the failure: "
+                     + (", ".join(completed) if completed
+                        else "nothing - no computation started"))
+        lines.append(f"Partial results: {partial} file(s) registered "
+                     "on the task for forensics" if partial else
+                     "Partial results: none")
+        lines.append("Next step: " + report.get("next_step", ""))
+        text = (f"Task {job_id} failed at {now()}. "
+                + " ".join(str(x) for x in lines if x))[:1200]
+        meta = {"kind": "job_failure", "job_id": job_id,
+                "badges": ["task failure"],
+                "failure": report,
+                "completed_before_failure": completed,
+                "partial_artifacts": partial}
+        for cid in {job.get("conv_id") or "", ""}:
+            if cid:
+                self.store.msg_add("system", text, meta, cid)
+                self.publish({"type": "chat", "conv_id": cid})
 
     def _register_native_artifacts(self, job_id: str, arts: list,
                                    profile: str) -> list:
@@ -1198,12 +1362,26 @@ class JobManager:
                                  f"{outcome}; {len(registered)} real "
                                  f"artifact(s) registered under {outdir}")
         else:
+            report = self._humanize_native_failure(
+                (failure or {}).get("code") or "NATIVE_FAILED",
+                "native execution reported failure", failure, profile,
+                "execution")
+            completed = (["native demo runner launched (real pipeline "
+                          "code on bundled fixtures)"]
+                         if profile == "demo" else
+                         ["input discovery + manifest confirmation",
+                          "native planning (planner PASS)"])
+            if gw:
+                completed.append("gateway submission")
             result = {"engine": "native",
                       "engine_version": NATIVE_ENGINE_VERSION,
                       "native_profile": profile, "ok": False,
                       "gateway_job_id": gw,
                       "failure_code": (failure or {}).get("code"),
                       "failure_detail": (failure or {}).get("detail"),
+                      "failure": report,
+                      "completed_before_failure": completed,
+                      "partial_artifacts": len(registered),
                       "artifact_count": len(registered),
                       "warnings": warnings, "outdir": outdir,
                       "inputs": params}
@@ -1217,11 +1395,16 @@ class JobManager:
                                  "failed: native execution reported failure "
                                  f"({(failure or {}).get('code')}) - partial "
                                  "outputs, if any, registered for forensics")
+            self.publish({"type": "job", "id": job_id})
+            self._notify_failure(job_id, report, completed,
+                                 len(registered))
+            return
         self.publish({"type": "job", "id": job_id})
 
     def _run_native(self, job: dict, spec: dict) -> None:
         job_id = job["id"]
         profile = spec.get("native_profile", "demo")
+        exec_mode = spec.get("execution_mode") or "autonomous"
         params = dict(spec.get("native_params") or {})
         params.setdefault("case_id", job["sample_id"])
         sample_id = job["sample_id"]
@@ -1235,7 +1418,7 @@ class JobManager:
             "engine": "native", "engine_version": NATIVE_ENGINE_VERSION,
             "native_profile": profile, "native_params": params,
             "requested_config": spec.get("requested_config") or {},
-            "execution_mode_at_start": "autonomous",
+            "execution_mode_at_start": exec_mode,
             "policy_version": POLICY_VERSION,
             "toolchain": cap.get("toolchain"),
             "gateway_url": cap.get("gateway", {}).get("url"),
@@ -1254,7 +1437,7 @@ class JobManager:
                 job_id, outdir, profile, "NATIVE_UNAVAILABLE",
                 "native NeoAG source/python is not importable on this host; "
                 "the Web UI refuses to silently fall back to mock (Milestone "
-                "5 1.6)", cap)
+                "5 1.6)", cap, phase="preflight")
         if profile == "demo":
             self.store.event_add(job_id, "log",
                 "native 'demo' profile: runs the real NeoAG pipeline "
@@ -1305,12 +1488,45 @@ class JobManager:
         if self._flag(job_id, "cancel"):
             return self._cancel_native(job_id,
                 "cancelled after planning, before any execution")
+        # M10 §8: 'controlled' is REAL here - the planner has passed, and
+        # execution now waits for an explicit Run/Abort on a plan-review
+        # decision. 'autonomous' (the default, matching what the Start
+        # Analysis authorization already consented to) proceeds.
+        if exec_mode == "controlled":
+            d_id = self._make_decision(job_id, {"name": "plan review"}, {
+                "decision_type": "execution gate",
+                "question": ("The native planner cleared this run. Execute "
+                             "now, or stop with the plan kept?"),
+                "options": [
+                    {"id": "execute", "label": "Run the planned execution",
+                     "policy_default": True,
+                     "effect": {"action": "submit to gateway"}},
+                    {"id": "abort", "label": "Abort - keep the plan only",
+                     "effect": {"action": "cancel web job"}}],
+                "rationale_default": "human choice - no default is applied",
+                "key": "native.plan_review", "category": "execution",
+                "trigger": "after native planning",
+                "source": "NeoAG Web M10 §8", "mandatory": True,
+                "effect_class": "execution"})
+            self.store.job_set(job_id, state="blocked", stage="plan review")
+            self.store.event_add(job_id, "state",
+                                 "blocked: waiting for plan-review decision "
+                                 f"{d_id} - NOTHING executed yet")
+            self.publish({"type": "job", "id": job_id})
+            self.publish({"type": "approval", "id": d_id})
+            choice = self._await_decision(job_id, d_id)
+            if choice != "execute":
+                return self._cancel_native(
+                    job_id, "aborted at plan review - the plan is kept on "
+                    "the task, nothing was executed")
+            self.store.job_set(job_id, state="running", stage="native")
+            self.publish({"type": "job", "id": job_id})
         ex = native_mod.submit_execute(params, outdir,
                                        stub=bool(spec.get("stub")))
         if not ex.get("ok"):
             return self._fail_native(job_id, outdir, profile,
                 str(ex.get("status")), "native gateway submission failed",
-                ex.get("detail"))
+                ex.get("detail"), phase="submission")
         gw = ex["gw_job_id"]
         self.store.job_set(job_id, gw_job_id=gw)
         self.store.event_add(job_id, "log",
@@ -1344,7 +1560,7 @@ class JobManager:
             return self._fail_native(job_id, outdir, profile,
                 "GATEWAY_MONITOR_TIMEOUT",
                 f"gateway job {gw} was still not terminal after 4h of "
-                "monitoring", None)
+                "monitoring", None, phase="execution")
         ok = final.get("status") == "PASS"
         return self._finalize_native(
             job_id, outdir, profile, params, ok,

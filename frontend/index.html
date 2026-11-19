@@ -25,10 +25,12 @@
     </svg>
     <div class="brand-text">
       <span class="name">NeoAG</span>
-      <span class="tag" data-i18n="brand.tag">Neoantigen scientific workspace</span>
+      <span class="tag" data-i18n="brand.tag">Agent-assisted neoantigen analysis</span>
     </div>
   </div>
   <div class="top-right">
+    <button id="attn-badge" class="attn-badge hidden" type="button"
+      aria-label="attention"></button>
     <select id="lang-select" class="lang-select" title="Language / 语言" aria-label="Language">
       <option value="zh">中文</option>
       <option value="en">English</option>
@@ -58,7 +60,7 @@
     <form id="chat-form" autocomplete="off">
       <textarea id="chat-input" rows="2"
         data-i18n-ph="chat.ph"
-        placeholder="Describe your goal - e.g. analyze a sample, or tell the agent where your sequencing data are stored"></textarea>
+        placeholder="Message…"></textarea>
       <button id="chat-send" class="btn primary" type="submit" data-i18n="chat.send">Send</button>
     </form>
   </section>
@@ -68,8 +70,8 @@
   <section id="work-pane" aria-label="Workspace">
     <nav id="work-nav">
       <button class="wtab active" data-view="tasks" data-i18n="tab.tasks">Tasks</button>
-      <button class="wtab" data-view="results" data-i18n="tab.results">Results</button>
       <button class="wtab" data-view="discovery" data-i18n="tab.discovery">Discovery</button>
+      <button class="wtab" data-view="results" data-i18n="tab.results">Results</button>
       <button class="wtab" data-view="skills" data-i18n="tab.skills">Skills</button>
       <button class="wtab" data-view="help" data-i18n="tab.help">Help</button>
     </nav>
@@ -108,16 +110,39 @@
             </div>
           </details>
 
+          <div id="options-block" hidden>
+            <div class="card-head">
+              <h3 data-i18n="opt.title">Analysis options</h3>
+              <span class="hint" id="options-note"></span>
+            </div>
+            <div id="options-body"></div>
+          </div>
+
           <details class="adv" id="plan-block" hidden>
-            <summary data-i18n="plan.summary">Stage plan</summary>
+            <summary data-i18n="plan.summary">Planning details (technical)</summary>
             <div id="plan-body"></div>
           </details>
 
+          <div id="ready-block" hidden>
+            <div class="ready-head">
+              <h3 data-i18n="rdy.title">Readiness check</h3>
+              <button id="ready-run" class="btn ghost sm" data-i18n="rdy.run">Check the whole workflow now</button>
+            </div>
+            <div id="ready-body"></div>
+          </div>
+
           <div class="btnrow" id="prep-actions" hidden>
+            <label class="lbl inline" id="exec-mode-wrap">
+              <span data-i18n="mode.label">Execution</span>
+              <select id="exec-mode" data-i18n-title="mode.help" title="Autonomous: planning runs, and the planner's own pass leads straight to execution under the authorization you give below. Controlled: after planning, the plan waits for your explicit Run/Abort decision.">
+                <option value="autonomous" data-i18n="mode.auto">Autonomous</option>
+                <option value="controlled" data-i18n="mode.ctrl">Controlled</option>
+              </select>
+            </label>
             <button id="nj-submit" class="btn primary" disabled data-i18n="prep.submit">Start analysis</button>
             <span class="hint" id="prep-hint"></span>
           </div>
-          <p class="hint" id="approval-note" data-i18n="prep.approval">Your approval is always required before anything runs.</p>
+          <p class="hint" id="approval-note" data-i18n="prep.approval">Starting the analysis authorizes exactly this run on this host; destructive or out-of-scope operations still require their own confirmation.</p>
         </div>
 
         <div class="card">
@@ -144,15 +169,18 @@
         <div class="card">
           <div class="card-head">
             <h2 data-i18n="res.title">Results</h2>
-            <label class="lbl inline"><span data-i18n="res.pick">Completed run</span>
+            <label class="lbl inline"><span data-i18n="res.pick">Run</span>
               <select id="res-job"></select></label>
+            <label class="lbl inline" id="res-mock-wrap" hidden>
+              <input type="checkbox" id="res-mock"> <span data-i18n="res.showMock">Show simulation history</span></label>
           </div>
           <div id="res-outcome"></div>
-          <div id="res-meta"></div>
+          <div id="res-findings"></div>
           <div id="res-warnings"></div>
           <div id="res-artifacts"></div>
           <div id="res-strategy"></div>
           <div id="res-table"></div>
+          <div id="res-meta"></div>
           <details class="adv" id="res-manifest-wrap">
             <summary data-i18n="res.prov">Output manifest, decisions and provenance</summary>
             <div id="res-manifest"></div>
@@ -171,11 +199,6 @@
               <select id="res-scope">
                 <option value="targeted" data-i18n="disc.scopeT">Targeted review</option>
                 <option value="full" data-i18n="disc.scopeF">Full pipeline review</option>
-              </select></label>
-            <label class="lbl"><span data-i18n="disc.engine">Evidence source</span>
-              <select id="res-engine">
-                <option value="live" data-i18n="disc.engL">Live sources</option>
-                <option value="example" data-i18n="disc.engE">Example data (testing)</option>
               </select></label>
             <button id="res-run" class="btn primary" data-i18n="disc.run">Start review</button>
           </div>
@@ -201,8 +224,8 @@
             <button id="skill-new" class="btn ghost" data-i18n="skill.new">New skill</button>
           </div>
           <div id="skill-list"></div>
+          <div id="skill-editor"></div>
         </div>
-        <div id="skill-editor"></div>
       </section>
 
       <section id="view-help" class="wview">
@@ -218,6 +241,14 @@
     </div>
   </section>
 </main>
+<div id="dialog-root" class="hidden" role="dialog" aria-modal="true"
+     aria-labelledby="dlg-title">
+  <div class="dlg-box">
+    <h3 id="dlg-title"></h3>
+    <div id="dlg-body"></div>
+    <div class="btnrow" id="dlg-actions"></div>
+  </div>
+</div>
 <div id="toast" class="toast hidden" role="status"></div>
 <script src="/static/app.js"></script>
 </body>

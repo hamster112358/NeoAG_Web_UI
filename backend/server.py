@@ -21,6 +21,7 @@ from urllib.parse import urlparse, parse_qs
 
 from . import skills as skills_mod
 from . import native as native_mod
+from . import readiness as readiness_mod
 from . import exports as exports_mod
 from . import versions as versions_mod
 from .agent import DemoAgent, ensure_task_gateway
@@ -45,6 +46,20 @@ HOST = "127.0.0.1"
 # NEOAG_DEMO_PORT + NEOAG_DEMO_DB let verification batteries run isolated
 # servers against fresh databases without touching the live demo state.
 PORT = int(os.environ.get("NEOAG_DEMO_PORT", "8712"))
+
+# Hard, EXPLICIT limit for one chat message, counted in Unicode
+# characters (never bytes) so Chinese/Japanese prompts get exactly the
+# same allowance as ASCII ones. Oversized messages are REJECTED with a
+# 413 and the real numbers - they are never silently shortened.
+#
+# History: this path used to do `str(body["text"])[:4000]`, which
+# destroyed a long specification prompt mid-word with no error, no
+# audit entry and no way for the user to notice (2026-11-19 defect).
+# The limit is set far above any realistic instruction prompt; the
+# matching transport bound is codebuddy_client.MAX_PROMPT_CHARS, which
+# must stay higher than this plus the dispatch preamble + rolling
+# transcript so the limit a user hits is always THIS one.
+MAX_CHAT_CHARS = 100_000
 
 store = Store(DATA)
 EVENT_QUEUES: list[queue.Queue] = []
@@ -110,6 +125,42 @@ def task_name_parts(kind: str, spec: dict, sample_id: str,
         # a job row whose only identity is its scope/target text
         subj, ntype = str(target or "")[:48], (scope or "task")
     return {"name_subject": subj, "name_type": ntype}
+
+
+def _native_preview_tables(arts, max_tables=2, max_rows=25):
+    """Verbatim header + first rows of the real ranked/scoring tables a
+    native run produced (served exactly as the file states them - the
+    web layer adds no scientific interpretation)."""
+    import csv as _csv
+    cand = [a for a in arts
+            if a.get("status") == "available"
+            and (str(a.get("type")) in ("ranking", "scoring", "table")
+                 or str(a.get("name", "")).startswith(("ranking/",
+                                                       "scoring/")))
+            and str(a.get("name", "")).endswith((".tsv", ".csv", ".txt"))]
+    cand.sort(key=lambda a: (0 if str(a["name"]).startswith("ranking/")
+                             else 1, str(a["name"])))
+    out = []
+    for a in cand[:max_tables]:
+        p = str(a.get("path") or "")
+        if not p or not os.path.isfile(p):
+            continue
+        try:
+            with open(p, newline="", encoding="utf-8",
+                      errors="replace") as f:
+                head = f.read(65536)
+            delim = "\t" if p.endswith(".tsv") else ","
+            rdr = list(_csv.reader(head.splitlines(), delimiter=delim))
+            if not rdr:
+                continue
+            out.append({"artifact_id": a.get("id"), "name": a["name"],
+                        "kind": a.get("type"),
+                        "header": rdr[0][:16],
+                        "rows": [r[:16] for r in rdr[1:1 + max_rows]],
+                        "truncated": True})
+        except OSError:
+            continue
+    return out
 
 
 def job_public(job: dict) -> dict:
@@ -214,6 +265,13 @@ def task_detail(store, job: dict) -> dict:
         t["outcome_note"] = res.get("outcome_note", "")
         t["delivery_claim"] = res.get("delivery_claim", "")
         t["warnings"] = res.get("warnings", [])
+        # M10 §11: the structured failure record (humanized reason,
+        # phase, next step) travels with the task detail everywhere.
+        if res.get("failure"):
+            t["failure"] = res["failure"]
+            t["completed_before_failure"] = res.get(
+                "completed_before_failure", [])
+            t["partial_artifacts"] = res.get("partial_artifacts", 0)
         t["effective_config"] = (res.get("manifest") or {}).get(
             "effective_config", {})
         t["requested_config"] = (res.get("manifest") or {}).get(
@@ -280,6 +338,18 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     # ---------- authentication ----------
+    # M10 PART 3 decision, recorded honestly: the login stays HTTP Basic
+    # Auth. Replacing it with app-level sessions (cookie + server-side
+    # session store) was NOT adopted because the secure-session
+    # prerequisites could not be verified on this deployment: the app is
+    # reached through operator-managed tunnels where TLS termination and
+    # cookie confidentiality are outside this server's control, so a
+    # session cookie would travel over a channel this code cannot prove
+    # is confidential, and logout/expiry semantics would be unenforceable
+    # behind those tunnels. Basic Auth is per-request, has no bearer
+    # artifact to leak or expire, and its boundary is the tunnel policy
+    # the operator already controls. Revisit when the deployment serves
+    # the app over an end-to-end HTTPS origin this server owns.
     def _unauthorized(self) -> None:
         body = json.dumps({"error": "authentication required"}).encode("utf-8")
         self.send_response(401)
@@ -793,9 +863,55 @@ class Handler(BaseHTTPRequestHandler):
                       "bytes", "sha256", "source_hash", "version",
                       "created_at")}
                     for e in store.export_list("job", jid)]})
+            if len(parts) > 4 and parts[3] == "artifact":
+                # M10 §14: serve ONE registered artifact's real bytes.
+                # The path is whatever the artifact row recorded (never
+                # client input) and must live under our scratch root.
+                arts = store.artifact_list(jid)
+                want = parts[4]
+                row = next((a for a in arts if str(a["id"]) == want
+                            or a["name"] == want), None)
+                if not row or not row.get("path"):
+                    return self._json(404, {"error": "no such artifact"})
+                p = os.path.realpath(str(row["path"]))
+                root = os.path.realpath(native_mod.WORK)
+                if not p.startswith(root + os.sep) or not os.path.isfile(p):
+                    return self._json(403, {"error": "artifact path is "
+                                                     "outside the served "
+                                                     "root or missing"})
+                try:
+                    with open(p, "rb") as f:
+                        data = f.read()
+                except OSError as e:
+                    return self._json(500, {"error": str(e)[:200]})
+                ctype = ("text/html" if p.endswith(".html") else
+                         "text/tab-separated-values" if p.endswith(".tsv")
+                         else "text/plain")
+                return self._file(data, os.path.basename(p), ctype)
             job = store.job_get(jid)
             if not job:
                 return self._json(404, {"error": "no such job"})
+            if job["state"] == "failed":
+                # M10 §14: a failed formal run is still a RESULTS subject
+                # - its structured failure record + whatever partial
+                # artifacts were registered for forensics. No candidates
+                # are invented for it.
+                res = json.loads(job["result_json"] or "{}")
+                return self._json(200, {
+                    "job_id": jid, "state": "failed",
+                    "outcome": job.get("outcome") or "generation_failed",
+                    "failure": res.get("failure") or
+                    {"code": res.get("failure_code"),
+                     "reason": job.get("error")},
+                    "failure_detail": res.get("failure_detail"),
+                    "completed_before_failure":
+                        res.get("completed_before_failure") or [],
+                    "artifacts": store.artifact_list(jid),
+                    "outdir": res.get("outdir"),
+                    "engine": res.get("engine"),
+                    "note": "partial outputs (if any) are registered for "
+                            "forensics; nothing here is a delivered "
+                            "result"})
             if job["state"] != "completed":
                 return self._json(409, {"error": f"job is {job['state']}"})
             res = json.loads(job["result_json"] or "{}")
@@ -813,6 +929,12 @@ class Handler(BaseHTTPRequestHandler):
             res["artifacts"] = arts
             if res.get("manifest") is not None:
                 res["manifest"]["artifacts"] = arts
+            if (res.get("engine") == "native" and not res.get("candidates")):
+                # M10 §14.3: for a NATIVE run the shortlist IS the real
+                # ranked table the pipeline produced. We serve its
+                # header + first rows VERBATIM (no web-layer
+                # reinterpretation of scientific columns).
+                res["preview_tables"] = _native_preview_tables(arts)
             if gone:
                 res["missing_artifacts"] = gone
             if res.get("outcome") != live_outcome:
@@ -850,7 +972,25 @@ class Handler(BaseHTTPRequestHandler):
             body["requested_by_kind"] = "task_query_token"
         try:
             if path == "/api/chat":
-                text = str(body.get("text", ""))[:4000]
+                raw = str(body.get("text", ""))
+                if len(raw) > MAX_CHAT_CHARS:
+                    # Loud rejection, never a silent slice: the previous
+                    # behaviour lost the tail of the user's own prompt
+                    # while still reporting a successful send. Nothing is
+                    # persisted and nothing is dispatched on this path.
+                    rcid = str(body.get("conv_id", "") or "")
+                    store.audit("user", "chat.rejected_too_long", rcid,
+                                {"limit": MAX_CHAT_CHARS,
+                                 "actual": len(raw)})
+                    return self._json(413, {
+                        "error": "message_too_long",
+                        "limit": MAX_CHAT_CHARS,
+                        "actual": len(raw),
+                        "detail": f"Message is {len(raw)} characters, "
+                                  f"over the {MAX_CHAT_CHARS}-character "
+                                  f"limit. Nothing was saved or sent to "
+                                  f"the agent."})
+                text = raw
                 cid = str(body.get("conv_id", "") or "")
                 conv = store.conv_get(cid) if cid else None
                 if not conv or conv.get("deleted"):
@@ -1023,13 +1163,86 @@ class Handler(BaseHTTPRequestHandler):
                         return self._json(400, {
                             "error": "unvalidated scientific configuration: "
                                      + "; ".join(bad)})
+                    # M10 §12 (UI path): a confirmed manifest is
+                    # SINGLE-USE while its job is still active - a second
+                    # Start click (or a second browser tab) gets the live
+                    # task's id back, never a duplicate queue entry.
+                    if mid:
+                        _man = store.manifest_get(mid) or {}
+                        _lj = str(_man.get("job_id") or "")
+                        if _lj:
+                            _j2 = store.job_get(_lj)
+                            if _j2 and _j2["state"] in ("queued", "running",
+                                                        "paused", "blocked"):
+                                return self._json(409, {
+                                    "error": "duplicate_active",
+                                    "job_id": _lj,
+                                    "detail": ("this confirmed input set "
+                                               "already has an active run: "
+                                               f"{_lj} ({_j2['state']})")})
+                    # M10 §12: a task-query (agent) submission may not
+                    # stack duplicates of a run that is ALREADY active -
+                    # the honest answer is the id of the live task, never
+                    # a second queue entry for the same work.
+                    if scoped:
+                        for j in store.job_list(200):
+                            if (j["state"] in ("queued", "running",
+                                               "paused", "blocked")
+                                    and j["kind"] == "neoag-native-run"
+                                    and (j["sample_id"] == sid
+                                         or (mid and str(
+                                             json.loads(j["spec_json"] or
+                                                        "{}").get(
+                                                "manifest_id") or "")
+                                             == mid))):
+                                return self._json(409, {
+                                    "error": "duplicate_active",
+                                    "job_id": j["id"],
+                                    "detail": ("an active native run for "
+                                               "this sample already exists: "
+                                               f"{j['id']} ({j['state']}) - "
+                                               "query it via taskquery "
+                                               "instead of re-submitting")})
+                    # M10 §9: server-side revalidation at submit - the
+                    # cheap live checks (runtime, manifests of record,
+                    # input files still present, authorized roots,
+                    # writable scratch). A predictable failure is blocked
+                    # HERE with ALL of its reasons, not queued to fail.
+                    recheck = readiness_mod.assess(
+                        store, profile=profile, params=nparams,
+                        manifest_id=mid, run_planner=False)
+                    if recheck["status"] == "BLOCKED":
+                        return self._json(409, {
+                            "error": "readiness_blocked",
+                            "blockers": recheck["blockers"],
+                            "warnings": recheck["warnings"],
+                            "detail": "; ".join(recheck["blockers"])})
+                    ex_mode = str(body.get("execution_mode")
+                                  or "autonomous")
+                    if ex_mode not in ("autonomous", "controlled"):
+                        return self._json(400, {
+                            "error": "execution_mode must be "
+                                     "autonomous or controlled"})
+                    # M10 §10: the human's explicit Start Analysis click
+                    # (Basic-auth session, never the agent token) carries
+                    # its authorization THROUGH to the backend record.
+                    authorized_start = None
+                    if (str(body.get("authorized") or "")
+                            == "start_analysis" and not scoped):
+                        authorized_start = {
+                            "authorized": True,
+                            "scope": (f"confirmed manifest {mid} "
+                                      f"({sid})" if mid else
+                                      f"native params for {sid}")}
                     try:
                         res = jobs.submit_native(
                             sid, profile=profile, native_params=nparams,
                             stub=bool(body.get("stub")),
                             requested_by=str(body.get("requested_by",
                                                       "user")),
-                            conv_id=str(body.get("conv_id", "") or ""))
+                            conv_id=str(body.get("conv_id", "") or ""),
+                            execution_mode=ex_mode,
+                            authorized_start=authorized_start)
                     except ValueError as e:
                         return self._json(400, {"error": str(e)})
                     if mid:
@@ -1141,6 +1354,44 @@ class Handler(BaseHTTPRequestHandler):
                              "picked": len(picked)})
                 publish({"type": "manifest", "id": mid})
                 return self._json(201, m)
+            if path == "/api/jobs/native/readiness":
+                # M10 §9: ONE comprehensive pre-submission check of the
+                # ENTIRE selected workflow. Runs the real native planner
+                # over the resolved configuration (read-only) and merges
+                # its verdict with the deployment-side checks; ALL
+                # blockers come back together. Nothing is faked: every
+                # check reports the state it actually measured.
+                nparams = body.get("native_params") or {}
+                if not isinstance(nparams, dict):
+                    return self._json(400, {"error": "native_params must be "
+                                                     "an object"})
+                mid = str(body.get("manifest_id") or "")
+                if mid:
+                    man = store.manifest_get(mid)
+                    if not man:
+                        return self._json(400, {"error": "no such manifest"})
+                    nparams = {**nparams,
+                               **native_mod.params_from_manifest(man)}
+                profile = str(body.get("native_profile", "") or "")
+                if body.get("synthetic_demo"):
+                    profile = "demo"
+                if not profile:
+                    profile = "gateway" if nparams else "demo"
+                sid = str(nparams.get("sample_id")
+                          or nparams.get("case_id") or "")
+                if not sid and profile == "gateway":
+                    return self._json(400, {"error": "nothing to assess: "
+                                                     "no sample/inputs"})
+                nparams.setdefault("sample_id", sid or "DEMO-NEOAG")
+                nparams.setdefault("case_id", sid or "DEMO-NEOAG")
+                out = readiness_mod.assess(store, profile=profile,
+                                           params=nparams,
+                                           manifest_id=mid)
+                store.audit("user", "native.readiness", "",
+                            {"status": out["status"],
+                             "blockers": len(out["blockers"]),
+                             "sample": sid})
+                return self._json(200, out)
             if path == "/api/jobs/native/preview":
                 # Real native planning/preflight WITHOUT executing: the
                 # planner decides routes; we only display them. Read-only
