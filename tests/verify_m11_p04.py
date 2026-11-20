@@ -16,6 +16,7 @@ Run: python3 tests/verify_m11_p04.py
 import atexit
 import base64
 import json
+import re
 import os
 import pathlib
 import shutil
@@ -264,10 +265,12 @@ try:
         _amod.TOOL_OUTPUT_STORE_MAX = old_max
 
     # ============ 5. honest gateway-detail inside a message ===========
+    _raw5 = "boom " * 200
+
     class _FailGW:
         def job(self, j):
             return {"state": "failed", "alive": False,
-                    "detail": "boom " * 200}
+                    "detail": _raw5}
 
         def transcript(self, j):
             return []
@@ -280,11 +283,18 @@ try:
                 "stop": False, "conv": cid7})
     ag._client = _FailGW()
     ag._turn(cid7)
+    # P1-12 moved the terminal line into phrasing.turn_ended_text; its
+    # honesty tail is stable across states. The trimmed-from count is
+    # measured on the WHITESPACE-COLLAPSED string the display works
+    # with, so derive it from the same input instead of hardcoding.
+    _norm5 = " ".join(_raw5.split())
     tx7 = [m["text"] for m in store.msg_list(200, conv_id=cid7)
-           if "Agent turn ended" in m["text"]]
+           if "No assistant reply text was recorded" in m["text"]]
+    _trim5 = re.search(r"\[text trimmed from (\d+) chars\]",
+                       tx7[0]) if tx7 else None
     check("5a a gateway detail shortened for display SAYS so "
-          "(trimmed-from marker + original size)",
-          bool(tx7) and "trimmed from 1000 chars" in tx7[0],
+          "(trimmed-from marker + the size it collapsed to)",
+          bool(_trim5) and int(_trim5.group(1)) == len(_norm5),
           tx7[0][:120] if tx7 else "no terminal message")
 finally:
     _amod.time = time

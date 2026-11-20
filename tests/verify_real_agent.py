@@ -19,9 +19,13 @@ Checks (each turn talks to a genuine CodeBuddy gateway job):
  R7  REGRESSION (stall bug): a job stopped mid-turn must drive the
      streaming kickoff message to an honest terminal state - never
      leave a turn permanently 'streaming'
- R8  REGRESSION (stall bug): server restart mid-turn marks the
-     orphaned streaming message 'interrupted by server restart', and
-     the next message still completes the conversation
+ R8  REGRESSION (stall bug): after a mid-turn server restart the
+     orphaned streaming turn must RESOLVE - M11 P0-3: a job the
+     gateway still reports alive is re-attached and completes with
+     its real reply; a genuinely dead job gets the 'interrupted by
+     server restart' stamp. What is never allowed is a turn that
+     stays 'streaming' forever. Either resolution keeps the
+     conversation usable for the next message.
 
 Run:  python3 tests/verify_real_agent.py     (takes several minutes)
 """
@@ -378,8 +382,9 @@ def main():
 
         # ---------- R8 REGRESSION: restart mid-turn -----------------
         # The relay thread dying with the server used to leave the
-        # kickoff 'streaming' forever. The startup sweep must stamp it,
-        # and the conversation must stay usable.
+        # kickoff 'streaming' forever. Startup must now resolve the
+        # turn (re-attach a live job, stamp a dead one), and the
+        # conversation must stay usable.
         r8 = cl.req("POST", "/api/chat", {
             "conv_id": cid,
             "text": "Use Bash right now, no questions: run exactly "
@@ -392,9 +397,17 @@ def main():
         stop_server(srv)          # relay dies mid-turn - exactly the bug
         srv = start_server()
         check("R8 server back up after mid-turn kill", cl.wait_up())
-        ts = wait_kick_state(cl, cid, timeout=30)
-        check("R8 orphaned streaming msg -> interrupted (never stalls)",
-              ts == "interrupted by server restart", f"ts={ts}")
+        # P0-3 made 'interrupted within seconds' only ONE of two honest
+        # outcomes - here the gateway job (sleep 35) is still alive, so
+        # the startup reconciliation re-attaches the relay and the turn
+        # completes with its real reply. The regression this guards is
+        # the STALL: leaving turn_state 'streaming' forever.
+        ts = wait_kick_state(cl, cid, timeout=180)
+        check("R8 orphaned streaming msg resolves - never stalls "
+              "(P0-3: live job -> re-attached and completed; dead job "
+              "-> interrupted stamp)",
+              ts not in ("streaming", "TIMEOUT_STILL_STREAMING"),
+              f"ts={ts}")
         since = last_id(cl, cid)
         cl.req("POST", "/api/chat",
                {"conv_id": cid, "text": "Reply with exactly: BACK-ON"})
