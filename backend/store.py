@@ -115,6 +115,18 @@ CREATE TABLE IF NOT EXISTS exports(
   filename TEXT, path TEXT, bytes INTEGER, sha256 TEXT, source_hash TEXT,
   version INTEGER, created_at TEXT, meta_json TEXT
 );
+-- M11 P1-10: file intake. An attachment is a WORKSPACE FILE whose PATH
+-- the agent may read - uploads are stored copies under the data dir,
+-- server picks reference the authorized original IN PLACE (never
+-- copied, never moved). The row is the stable handle: name, kind,
+-- exact size + sha256, conversation association and the honest source
+-- line. Nothing here is ever a patient sequencing input: BAM/FASTQ
+-- and friends belong to the formal ingestion path and are refused.
+CREATE TABLE IF NOT EXISTS attachments(
+  id TEXT PRIMARY KEY, conv_id TEXT DEFAULT '', created_at TEXT,
+  name TEXT, mime TEXT, kind TEXT, size INTEGER, sha256 TEXT,
+  path TEXT, source TEXT, origin TEXT DEFAULT ''
+);
 
 """
 
@@ -161,6 +173,13 @@ class Store:
         self.export_dir = data_dir / (
             "exports" if _stem == "state" else f"exports-{_stem}")
         self.export_dir.mkdir(parents=True, exist_ok=True)
+        # M11 P1-10: uploaded attachments are isolated per database
+        # exactly like exports, so parallel batteries never touch the
+        # live deployment's intake files.
+        self.attach_dir = data_dir / (
+            "attachments" if _stem == "state"
+            else f"attachments-{_stem}")
+        self.attach_dir.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.db_path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         with self.lock:
@@ -863,6 +882,55 @@ class Store:
                 "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
                 (key, json.dumps(value, ensure_ascii=False)))
             self.db.commit()
+
+    # ---------- attachments (M11 P1-10 file intake) ----------
+    def att_add(self, att: dict) -> None:
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO attachments(id,conv_id,created_at,name,mime,"
+                "kind,size,sha256,path,source,origin) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (att["id"], att.get("conv_id", ""), att["created_at"],
+                 att["name"], att.get("mime", ""), att["kind"],
+                 att["size"], att["sha256"], att["path"],
+                 att["source"], att.get("origin", "")))
+            self.db.commit()
+
+    def att_get(self, aid: str) -> dict | None:
+        with self.lock:
+            row = self.db.execute(
+                "SELECT * FROM attachments WHERE id=?", (aid,)).fetchone()
+        return dict(row) if row else None
+
+    def att_list(self, conv_id: str | None = None) -> list[dict]:
+        q = "SELECT * FROM attachments"
+        args: list = []
+        if conv_id:
+            q += " WHERE conv_id=?"
+            args.append(conv_id)
+        q += " ORDER BY created_at DESC, rowid DESC"
+        with self.lock:
+            rows = self.db.execute(q, args).fetchall()
+        return [dict(r) for r in rows]
+
+    def att_link_conv(self, aid: str, conv_id: str) -> None:
+        with self.lock:
+            self.db.execute("UPDATE attachments SET conv_id=? WHERE id=?",
+                            (conv_id, aid))
+            self.db.commit()
+
+    def att_delete(self, aid: str) -> dict | None:
+        """Remove the ROW (and let the caller decide about the file:
+        an upload's stored copy goes with it; a server pick's ORIGINAL
+        never does - originals are never touched)."""
+        with self.lock:
+            row = self.db.execute(
+                "SELECT * FROM attachments WHERE id=?", (aid,)).fetchone()
+            if not row:
+                return None
+            self.db.execute("DELETE FROM attachments WHERE id=?", (aid,))
+            self.db.commit()
+        return dict(row)
 
     # ---------- decisions (persistent decision history) ----------
     def decision_add(self, d: dict) -> None:

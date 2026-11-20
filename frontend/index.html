@@ -59,6 +59,21 @@
       <span id="act-elapsed" class="act-elapsed"></span>
       <button id="chat-stop" class="btn danger sm hidden" type="button" data-i18n="chat.stop">Stop</button>
     </div>
+    <!-- M11 P1-10 file intake. Uploads are documents/reports/tables/
+         images with a size cap; the picker reads existing files under
+         the authorized roots. Either way the AGENT receives the PATH
+         - file bytes never leave this machine through chat, and every
+         reference is audited. -->
+    <div id="att-row" class="att-row">
+      <button id="att-btn" class="btn sm ghost" type="button"
+        data-i18n="att.add">Attach file</button>
+      <button id="att-pick-btn" class="btn sm ghost" type="button"
+        data-i18n="att.pick">Pick on server</button>
+      <input id="att-file" type="file" hidden multiple>
+    </div>
+    <div id="att-chips" class="att-chips" hidden></div>
+    <div id="att-upload" class="att-upload" hidden></div>
+    <div id="att-picker" class="att-picker" hidden></div>
     <form id="chat-form" autocomplete="off">
       <textarea id="chat-input" rows="2"
         data-i18n-ph="chat.ph"

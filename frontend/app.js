@@ -208,6 +208,26 @@ const I18N = {
     "tm.purgeMismatch": "Type the exact task id to confirm",
     "tm.bulkDone": "{ok} task(s) updated",
     "tm.bulkPart": "{ok} updated, {ref} refused (last reason: {why})",
+    /* M11 P1-10: file intake */
+    "att.add": "Attach file", "att.pick": "Pick on server",
+    "att.uploading": "Uploading {n}...", "att.cancel": "Cancel",
+    "att.cancelled": "Upload cancelled - nothing was stored",
+    "att.tooBig": "{n} is {s} bytes, over the {cap}-byte cap; "
+      + "nothing was uploaded",
+    "att.badType": "Unsupported file type for {n} - documents, "
+      + "reports, tables and images only; sequencing files belong to "
+      + "the formal ingestion path",
+    "att.chipTitle": "{kind} - {size} bytes - the agent receives the "
+      + "PATH, never the bytes",
+    "att.remove": "Remove", "att.pickedNote": "referenced in place",
+    "att.egressNote": "Attachments travel as paths - the file bytes "
+      + "never leave this machine; every reference is audited.",
+    "att.up": ".. up", "att.roots": "Authorized input roots",
+    "att.seqNote": "sequencing input - formal ingestion only",
+    "att.unsup": "unsupported type",
+    "att.badSend": "an upload is still in flight - cancel it or wait",
+    "toast.attFail": "upload failed: {e}",
+    "toast.pickFail": "could not reference that file: {e}",
     "dr.close": "Close", "dr.rename": "Rename", "dr.renameSave": "Save",
     "dr.renameCancel": "Cancel", "dr.renamed": "Title updated",
     "dr.id": "Task ID", "dr.created": "Created", "dr.finished": "Finished",
@@ -572,6 +592,23 @@ const I18N = {
     "tm.purgeMismatch": "请输入准确的任务 id 以确认",
     "tm.bulkDone": "已更新 {ok} 个任务",
     "tm.bulkPart": "{ok} 项已更新，{ref} 项被拒绝（原因：{why}）",
+    /* M11 P1-10：文件接入 */
+    "att.add": "添加文件", "att.pick": "选择服务器文件",
+    "att.uploading": "正在上传 {n}...", "att.cancel": "取消",
+    "att.cancelled": "已取消上传 - 未存储任何内容",
+    "att.tooBig": "{n} 有 {s} 字节，超过 {cap} 字节上限；未上传",
+    "att.badType": "{n} 类型不支持 - 仅限文档、报告、表格与图片；"
+      + "测序文件请走正式录入流程",
+    "att.chipTitle": "{kind} - {size} 字节 - 代理只收到路径，绝不包含文件字节",
+    "att.remove": "移除", "att.pickedNote": "原位引用",
+    "att.egressNote": "附件以路径传递 - 文件字节绝不会离开本机；"
+      + "每次引用均有审计记录。",
+    "att.up": ".. 上级", "att.roots": "已授权输入根目录",
+    "att.seqNote": "测序输入 - 请走正式录入流程",
+    "att.unsup": "类型不支持",
+    "att.badSend": "仍有文件在上传 - 请取消或等待完成",
+    "toast.attFail": "上传失败：{e}",
+    "toast.pickFail": "无法引用该文件：{e}",
     "dr.close": "关闭", "dr.rename": "重命名", "dr.renameSave": "保存",
     "dr.renameCancel": "取消", "dr.renamed": "标题已更新",
     "dr.id": "任务 ID", "dr.created": "创建于", "dr.finished": "完成于",
@@ -826,6 +863,8 @@ const state = {
   // flag actions; trashCount is refreshed on the same beats as jobs.
   taskSearch: "", taskSort: "new", trashMode: false,
   trashJobs: [], trashCount: null, bulkSel: new Set(),
+  // M11 P1-10: files waiting beside the composer + in-flight uploads
+  pendAtts: [], uploads: new Map(), pickDir: null,
 };
 try { state.techView = localStorage.getItem("nj_tech") === "1"; }
 catch { /* private mode */ }
@@ -1657,13 +1696,20 @@ $("chat-stop").addEventListener("click", async () => {
 $("chat-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const text = $("chat-input").value.trim();
-  if (!text) return;
+  if (!text && !state.pendAtts.length) return;
   if (state.turnWorking) { toast(t("chat.busySend"), true); return; }
+  // P1-10: never send "some of" the pending set - either the uploads
+  // all finished or the send waits.
+  if (state.uploads.size) { toast(t("att.badSend"), true); return; }
+  const atts = state.pendAtts.slice();
   $("chat-input").value = "";
   try {
     const r = await api("POST", "/api/chat",
-                        { text, conv_id: state.activeCid || "" });
+                        { text, conv_id: state.activeCid || "",
+                          attachment_ids: atts.map((a) => a.id) });
     state.activeCid = r.conv_id;
+    state.pendAtts = [];
+    renderAttChips();
     draftSave(state.activeCid);   // sent: its parked draft is no more
     await refreshConv();
     await refreshSidebar();
@@ -1681,6 +1727,184 @@ $("chat-form").addEventListener("submit", async (ev) => {
 });
 $("chat-input").addEventListener("input",
                                  () => draftSave(state.activeCid));
+
+/* ---------------- file intake (M11 P1-10) -----------------------------
+ * Two doors, one model: an attachment is a workspace file whose PATH
+ * the agent may read. Uploads are stored copies; server picks stay
+ * in place. File bytes never enter the chat payload, and the removal
+ * rules are honest (a pick's ORIGINAL is never deleted here). */
+function fmtBytes(n) {
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB";
+  if (n >= 1024) return (n / 1024).toFixed(1) + " KB";
+  return n + " B";
+}
+function attExt(name) {
+  const i = name.lastIndexOf(".");
+  return i < 0 ? "" : name.slice(i).toLowerCase();
+}
+const ATT_EXT_OK = new Set([".txt", ".md", ".pdf", ".docx", ".html",
+  ".htm", ".csv", ".tsv", ".json", ".yaml", ".yml", ".xlsx", ".png",
+  ".jpg", ".jpeg", ".webp"]);
+const ATT_EXT_SEQ = new Set([".bam", ".cram", ".fastq", ".fq", ".sam",
+  ".vcf", ".bcf"]);
+function attPreflight(f, cap) {
+  const ext = attExt(f.name);
+  if (ATT_EXT_SEQ.has(ext)) {
+    return t("att.badType", { n: f.name });
+  }
+  if (!ATT_EXT_OK.has(ext)) return t("att.badType", { n: f.name });
+  if (f.size > cap) return t("att.tooBig",
+    { n: f.name, s: f.size, cap });
+  if (!f.size) return t("att.badType", { n: f.name });
+  return null;
+}
+function renderAttChips() {
+  const box = $("att-chips");
+  box.hidden = !state.pendAtts.length;
+  box.innerHTML = state.pendAtts.map((a) =>
+    `<span class="att-chip" title="${esc(t("att.chipTitle",
+      { kind: a.kind, size: a.size }))}">`
+    + `${esc(a.name)} <i>${esc(fmtBytes(a.size))}</i>`
+    + `${a.source === "server_pick"
+        ? ` <em>${esc(t("att.pickedNote"))}</em>` : ""}`
+    + ` <button class="att-x" type="button" data-ax="${esc(a.id)}"`
+    + ` title="${esc(t("att.remove"))}">×</button></span>`).join("")
+    + `<div class="hint">${esc(t("att.egressNote"))}</div>`;
+  box.querySelectorAll("[data-ax]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const id = b.dataset.ax;
+      try { await api("POST", `/api/attachments/${encodeURIComponent(id)}/delete`, {}); }
+      catch { /* already gone: local state still clears */ }
+      state.pendAtts = state.pendAtts.filter((a) => a.id !== id);
+      renderAttChips();
+    }));
+}
+function uploadAtt(f, cap) {
+  const err = attPreflight(f, cap);
+  if (err) { toast(err, true); return; }
+  const row = $("att-upload");
+  row.hidden = false;
+  row.innerHTML = `<span class="hint">${esc(t("att.uploading",
+    { n: f.name }))}</span>`;
+  const fr = new FileReader();
+  fr.onerror = () => { row.hidden = true;
+    toast(t("toast.attFail", { e: f.name }), true); };
+  fr.onload = () => {
+    const b64 = String(fr.result).split(",")[1] || "";
+    const xhr = new XMLHttpRequest();
+    state.uploads.set(f.name, xhr);
+    const done = () => {
+      state.uploads.delete(f.name);
+      if (!state.uploads.size) { row.hidden = true; row.innerHTML = ""; }
+    };
+    xhr.open("POST", "/api/attachments");
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.upload.onprogress = (e) => {
+      if (!e.lengthComputable) return;
+      row.innerHTML = `<span class="hint">${esc(t("att.uploading",
+        { n: f.name }))} ${Math.round((e.loaded / e.total) * 100)}%</span>`
+        + ` <button class="btn sm ghost" id="att-up-cancel" type="button">${esc(t("att.cancel"))}</button>`;
+      const c = $("att-up-cancel");
+      if (c) c.addEventListener("click", () => {
+        xhr.abort();
+        toast(t("att.cancelled"));
+      });
+    };
+    xhr.onload = () => {
+      done();
+      let j = {};
+      try { j = JSON.parse(xhr.responseText || "{}"); } catch { /* */ }
+      if (xhr.status === 201 && j.attachment) {
+        state.pendAtts.push(j.attachment);
+        renderAttChips();
+      } else {
+        toast(t("toast.attFail",
+          { e: (j && (j.detail || j.error)) || `HTTP ${xhr.status}` }),
+          true);
+      }
+    };
+    xhr.onerror = () => { done();
+      toast(t("toast.attFail", { e: f.name }), true); };
+    xhr.onabort = done;
+    xhr.send(JSON.stringify({ name: f.name, data_b64: b64,
+                              conv_id: state.activeCid || "" }));
+  };
+  fr.readAsDataURL(f);
+}
+$("att-btn").addEventListener("click", () => $("att-file").click());
+$("att-file").addEventListener("change", async () => {
+  const files = [...$("att-file").files];
+  $("att-file").value = "";
+  if (!files.length) return;
+  let cap = 26214400;
+  try {
+    const r = await api("GET", "/api/attachments");
+    cap = r.max_bytes || cap;
+  } catch { /* server default still applies client-side */ }
+  files.forEach((f) => uploadAtt(f, cap));
+});
+
+/* the server-side picker: one level at a time under the authorized
+   roots; sequencing files are visible but clearly refused here -
+   they belong to the formal ingestion, and the label says so */
+async function openPicker(dir) {
+  const box = $("att-picker");
+  let r;
+  try {
+    r = await api("GET", "/api/files"
+      + (dir ? "?dir=" + encodeURIComponent(dir) : ""));
+  } catch (e) {
+    box.hidden = false;
+    box.innerHTML = `<div class="alert warn">${esc(e.message)}</div>`;
+    return;
+  }
+  state.pickDir = r.dir || "";
+  const up = !r.roots && r.dir
+    ? `<button class="btn sm ghost" id="att-pk-up" type="button">${esc(t("att.up"))}</button>`
+    : "";
+  box.hidden = false;
+  box.innerHTML = `<div class="pk-head"><b>${esc(r.roots
+      ? t("att.roots") : r.dir)}</b> ${up}
+      <button class="btn sm ghost" id="att-pk-close" type="button">×</button>
+    </div><div class="pk-list">${(r.entries || []).map((en) => {
+      if (en.dir) {
+        return `<div class="pk-row" data-pkdir="${esc(en.path)}">`
+          + `<span class="pk-name">${esc(en.name)}/</span></div>`;
+      }
+      const tag = en.seq ? `<span class="hint">${esc(t("att.seqNote"))}</span>`
+        : en.allowed ? ""
+          : `<span class="hint">${esc(t("att.unsup"))}</span>`;
+      return `<div class="pk-row ${en.allowed ? "use" : "no"}"`
+        + (en.allowed ? ` data-pkfile="${esc(en.path)}"` : "")
+        + `><span class="pk-name">${esc(en.name)}</span>`
+        + ` <span class="hint">${esc(fmtBytes(en.size))}</span> ${tag}</div>`;
+    }).join("") || `<div class="empty">-</div>`}</div>`;
+  const u = $("att-pk-up");
+  if (u) u.addEventListener("click", () => {
+    const parent = state.pickDir.replace(/\/[^/]+\/?$/, "");
+    openPicker(parent || "");
+  });
+  $("att-pk-close").addEventListener("click",
+    () => { $("att-picker").hidden = true; });
+  box.querySelectorAll("[data-pkdir]").forEach((el) =>
+    el.addEventListener("click", () => openPicker(el.dataset.pkdir)));
+  box.querySelectorAll("[data-pkfile]").forEach((el) =>
+    el.addEventListener("click", async () => {
+      try {
+        const j = await api("POST", "/api/attachments/pick",
+          { path: el.dataset.pkfile, conv_id: state.activeCid || "" });
+        state.pendAtts.push(j.attachment);
+        renderAttChips();
+        $("att-picker").hidden = true;
+      } catch (e) {
+        toast(t("toast.pickFail", { e: e.message }), true);
+      }
+    }));
+}
+$("att-pick-btn").addEventListener("click", () => {
+  if (!$("att-picker").hidden) { $("att-picker").hidden = true; return; }
+  openPicker("");
+});
 $("chat-input").addEventListener("keydown", (ev) => {
   if (ev.key === "Enter" && !ev.shiftKey) {
     ev.preventDefault();

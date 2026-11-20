@@ -61,6 +61,82 @@ PORT = int(os.environ.get("NEOAG_DEMO_PORT", "8712"))
 # transcript so the limit a user hits is always THIS one.
 MAX_CHAT_CHARS = 100_000
 
+# M11 P1-10: file intake. Uploads are documents/reports/tables/images
+# only, and the size cap applies to the DECODED bytes (measured after
+# base64 decode, so the rejection counts what actually lands). The cap
+# is env-overridable because it is an operator policy knob, not a
+# science constant. Sequencing files are refused on BOTH intake paths:
+# they belong to the formal ingestion (discovery -> confirmed
+# manifest), never to a chat attachment.
+ATTACH_MAX_BYTES = int(os.environ.get("NEOAG_ATTACH_MAX_BYTES")
+                       or 25 * 1024 * 1024)
+ATTACH_KINDS = {
+    ".txt": "document", ".md": "document", ".pdf": "document",
+    ".docx": "document", ".html": "report", ".htm": "report",
+    ".csv": "table", ".tsv": "table", ".json": "table",
+    ".yaml": "table", ".yml": "table", ".xlsx": "table",
+    ".png": "image", ".jpg": "image", ".jpeg": "image",
+    ".webp": "image",
+}
+ATTACH_SEQ_EXT = {".bam", ".cram", ".fastq", ".fq", ".sam", ".vcf",
+                  ".bcf", ".2bit", ".ubam"}
+ATTACH_MIME_BY_EXT = {
+    ".txt": "text/plain", ".md": "text/markdown",
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument."
+             "wordprocessingml.document",
+    ".html": "text/html", ".htm": "text/html",
+    ".csv": "text/csv", ".tsv": "text/tab-separated-values",
+    ".json": "application/json", ".yaml": "application/x-yaml",
+    ".yml": "application/x-yaml",
+    ".xlsx": "application/vnd.openxmlformats-officedocument."
+             "spreadsheetml.sheet",
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+}
+
+
+def attach_dir() -> Path:
+    d = Path(store.attach_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def attach_public(a: dict) -> dict:
+    return {k: a[k] for k in ("id", "conv_id", "created_at", "name",
+                              "mime", "kind", "size", "sha256",
+                              "path", "source", "origin")}
+
+
+def attach_kind(name: str) -> tuple[str, str]:
+    """(kind, ext) for an allowed attachment name; raises with an
+    honest message for anything else."""
+    ext = os.path.splitext(name)[1].lower()
+    if ext in ATTACH_SEQ_EXT:
+        raise ValueError(
+            f"{ext} files are sequencing/variant inputs - they belong "
+            "to the formal ingestion path (input discovery -> "
+            "confirmed manifest), not to a chat attachment")
+    if ext not in ATTACH_KINDS:
+        raise ValueError(
+            f"unsupported attachment type {ext or '(no extension)'} - "
+            "documents, reports, tables and images only")
+    return ATTACH_KINDS[ext], ext
+
+
+def under_authorized_root(p: str) -> str:
+    """Realpath the given path must live under - or reject with an
+    honest error naming the authorized roots (same boundary the
+    input-discovery API already enforces)."""
+    rp = os.path.realpath(p)
+    for root in native_mod.AUTHORIZED_INPUT_ROOTS:
+        if rp == root or rp.startswith(root + os.sep):
+            return rp
+    raise PermissionError(
+        "path is outside the authorized input roots: "
+        + ", ".join(native_mod.AUTHORIZED_INPUT_ROOTS))
+
+
 store = Store(DATA)
 EVENT_QUEUES: list[queue.Queue] = []
 EVENT_LOCK = threading.Lock()
@@ -809,6 +885,91 @@ class Handler(BaseHTTPRequestHandler):
             rows = [job_public(j) for j in store.job_list(200,
                                                           trash=trash)]
             return self._json(200, {"jobs": rows})
+        if path == "/api/attachments":
+            cid = (q.get("conv_id") or [None])[0]
+            return self._json(200, {"attachments":
+                                    [attach_public(a) for a in
+                                     store.att_list(cid)],
+                                    "max_bytes": ATTACH_MAX_BYTES,
+                                    "kinds": sorted(set(
+                                        ATTACH_KINDS.values()))})
+        if path.startswith("/api/attachments/") and \
+                path.endswith("/download"):
+            a = store.att_get(path.split("/")[3])
+            if not a:
+                return self._json(404, {"error": "no such attachment"})
+            try:
+                with open(a["path"], "rb") as f:
+                    data = f.read()
+            except OSError as e:
+                return self._json(410, {"error": "stored file is "
+                                                 "unreadable: " +
+                                                 str(e)[:160]})
+            got = hashlib.sha256(data).hexdigest()
+            # the download must BE what was registered - a stored file
+            # that no longer matches its row is refused, not served.
+            # Server picks register no checksum (hashing a multi-GB
+            # original on pick is not the operator's ask), so only
+            # uploads are byte-pinned here.
+            if a["sha256"] and got != a["sha256"]:
+                return self._json(500, {"error": "stored bytes no "
+                                                 "longer match the "
+                                                 "registered checksum"})
+            return self._file(data, a["name"],
+                              a["mime"] or "application/octet-stream",
+                              extra={"X-Attachment-Id": a["id"]})
+        if path == "/api/files":
+            # P1-10 intake path 2: a PICKER over the authorized input
+            # roots. It lists one directory level, refuses anything
+            # outside the roots, and follows nothing across a root
+            # boundary (every entry is realpath-checked).
+            try:
+                d = (q.get("dir") or [""])[0]
+                if d:
+                    rp = under_authorized_root(d)
+                    if not os.path.isdir(rp):
+                        return self._json(404, {"error": "no such "
+                                                         "directory"})
+                else:
+                    rp = ""
+            except PermissionError as e:
+                return self._json(403, {"error": str(e)})
+            if not rp:
+                roots = [{"name": r, "path": r, "dir": True}
+                         for r in native_mod.AUTHORIZED_INPUT_ROOTS
+                         if os.path.isdir(r)]
+                return self._json(200, {"dir": "", "roots": True,
+                                        "entries": roots})
+            entries, skipped = [], 0
+            try:
+                names = sorted(os.listdir(rp))
+            except OSError as e:
+                return self._json(403, {"error": str(e)[:200]})
+            for n in names:
+                if n.startswith(".") or len(entries) >= 500:
+                    skipped += 1
+                    continue
+                fp = os.path.join(rp, n)
+                try:
+                    frp = os.path.realpath(fp)
+                    under_authorized_root(frp)
+                except PermissionError:
+                    skipped += 1
+                    continue
+                try:
+                    st_ = os.stat(frp)
+                except OSError:
+                    continue
+                ext = os.path.splitext(n)[1].lower()
+                entries.append({"name": n, "path": frp,
+                                "dir": os.path.isdir(frp),
+                                "size": st_.st_size,
+                                "seq": ext in ATTACH_SEQ_EXT,
+                                "allowed": (not os.path.isdir(frp))
+                                and ext in ATTACH_KINDS})
+            return self._json(200, {"dir": rp, "roots": False,
+                                    "entries": entries,
+                                    "skipped": skipped})
         if path == "/api/tasks/active":
             # B2: which run belongs to THIS conversation? Never guess the
             # most-recent job: no conv link -> empty list, not a fallback.
@@ -1056,6 +1217,122 @@ class Handler(BaseHTTPRequestHandler):
             body["requested_by"] = "agent"
             body["requested_by_kind"] = "task_query_token"
         try:
+            if path == "/api/attachments":
+                # P1-10 intake path 1: browser upload. The stored copy
+                # lives under the data dir, keyed by a stable id; the
+                # name is reduced to its basename (no traversal), the
+                # size cap counts DECODED bytes, and oversize/unknown
+                # types are refused loudly with the reason.
+                raw_name = str(body.get("name") or "").replace("\\", "/")
+                name = os.path.basename(raw_name).strip()
+                if not name or name.startswith("."):
+                    return self._json(400, {"error": "a real file "
+                                                     "name is required"})
+                try:
+                    kind, ext = attach_kind(name)
+                except ValueError as e:
+                    return self._json(415, {"error": str(e)})
+                b64 = str(body.get("data_b64") or "")
+                if not b64:
+                    return self._json(400, {"error": "data_b64 required"})
+                if len(b64) > (ATTACH_MAX_BYTES // 3 + 1) * 4 + 1024:
+                    return self._json(413, {
+                        "error": "file_too_big",
+                        "detail": f"the file is over the "
+                                  f"{ATTACH_MAX_BYTES}-byte cap",
+                        "limit": ATTACH_MAX_BYTES})
+                try:
+                    data = base64.b64decode(b64, validate=True)
+                except Exception:
+                    return self._json(400, {"error": "data_b64 is not "
+                                                     "valid base64"})
+                if not data:
+                    return self._json(400, {"error": "empty file"})
+                if len(data) > ATTACH_MAX_BYTES:
+                    store.audit("user", "attachment.rejected_too_big",
+                                "", {"name": name,
+                                     "actual": len(data),
+                                     "limit": ATTACH_MAX_BYTES})
+                    return self._json(413, {
+                        "error": "file_too_big",
+                        "limit": ATTACH_MAX_BYTES, "actual": len(data),
+                        "detail": f"file is {len(data)} bytes, over "
+                                  f"the {ATTACH_MAX_BYTES}-byte cap; "
+                                  "nothing was stored"})
+                cid = str(body.get("conv_id") or "")
+                if cid and not store.conv_get(cid):
+                    return self._json(404, {"error": "no such "
+                                                     "conversation"})
+                aid = new_id("att")
+                adir = attach_dir() / aid
+                adir.mkdir(parents=True)
+                fp = adir / name
+                fp.write_bytes(data)
+                att = {"id": aid, "conv_id": cid, "created_at": now(),
+                       "name": name,
+                       "mime": ATTACH_MIME_BY_EXT.get(ext, ""),
+                       "kind": kind, "size": len(data),
+                       "sha256": hashlib.sha256(data).hexdigest(),
+                       "path": str(fp), "source": "upload",
+                       "origin": ""}
+                store.att_add(att)
+                store.audit("user", "attachment.upload", aid,
+                            {"name": name, "size": len(data),
+                             "sha256": att["sha256"], "conv_id": cid})
+                return self._json(201, {"attachment":
+                                        attach_public(att)})
+            if path == "/api/attachments/pick":
+                # P1-10 intake path 2: reference an EXISTING file
+                # under an authorized root, in place - nothing is
+                # copied, the original is never moved and never
+                # deleted (even when the attachment row goes away).
+                p0 = str(body.get("path") or "")
+                try:
+                    rp = under_authorized_root(p0)
+                except PermissionError as e:
+                    return self._json(403, {"error": str(e)})
+                if not os.path.isfile(rp):
+                    return self._json(404, {"error": "not a readable "
+                                                     "file under an "
+                                                     "authorized root"})
+                nm = os.path.basename(rp)
+                try:
+                    kind, ext = attach_kind(nm)
+                except ValueError as e:
+                    return self._json(415, {"error": str(e)})
+                cid = str(body.get("conv_id") or "")
+                aid = new_id("att")
+                att = {"id": aid, "conv_id": cid, "created_at": now(),
+                       "name": nm, "mime": ATTACH_MIME_BY_EXT.get(ext, ""),
+                       "kind": kind, "size": os.path.getsize(rp),
+                       "sha256": "", "path": rp,
+                       "source": "server_pick", "origin": rp}
+                store.att_add(att)
+                store.audit("user", "attachment.pick", aid,
+                            {"path": rp, "kind": kind, "conv_id": cid})
+                return self._json(201, {"attachment":
+                                        attach_public(att)})
+            if path.startswith("/api/attachments/") and \
+                    path.endswith("/delete"):
+                aid = path.split("/")[3]
+                a = store.att_get(aid)
+                if not a:
+                    return self._json(404, {"error": "no such "
+                                                     "attachment"})
+                store.att_delete(aid)
+                note = "original untouched (server pick - never " \
+                    "deleted through this door)"
+                if a["source"] == "upload":
+                    try:
+                        os.unlink(a["path"])
+                        os.rmdir(os.path.dirname(a["path"]))
+                        note = "stored copy deleted"
+                    except OSError as e:
+                        note = f"stored copy removal failed: {str(e)[:140]}"
+                store.audit("user", "attachment.deleted", aid,
+                            {"name": a["name"], "source": a["source"],
+                             "path": a["path"], "file": note})
+                return self._json(200, {"ok": True, "file": note})
             if path == "/api/chat":
                 raw = str(body.get("text", ""))
                 if len(raw) > MAX_CHAT_CHARS:
@@ -1077,18 +1354,57 @@ class Handler(BaseHTTPRequestHandler):
                                   f"the agent."})
                 text = raw
                 cid = str(body.get("conv_id", "") or "")
+                # P1-10: validate attachments BEFORE anything is
+                # created - a bad attachment id must not leave an
+                # empty conversation behind.
+                att_ids = body.get("attachment_ids") or []
+                att_rows = []
+                if att_ids:
+                    if not isinstance(att_ids, list) or len(att_ids) > 10:
+                        return self._json(400, {
+                            "error": "attachment_ids must be a list "
+                                     "of at most 10 ids"})
+                    for x in att_ids:
+                        a = store.att_get(str(x))
+                        if not a:
+                            return self._json(400, {
+                                "error": f"no such attachment: {x}"})
+                        att_rows.append(a)
                 conv = store.conv_get(cid) if cid else None
                 if not conv or conv.get("deleted"):
                     conv = store.conv_create("")  # first message starts a chat
                     cid = conv["id"]
                 if not (conv.get("title") or "").strip():
                     store.conv_set_title(cid, agent.title_from(text))
+                # P1-10: attachments travel as PATHS. The dispatch
+                # text gains a block naming the workspace files the
+                # agent may read - the file BYTES are never embedded,
+                # encoded or forwarded anywhere, and the egress audit
+                # records exactly what left (path + identity).
+                # (att_rows was validated above, before creation.)
+                if att_rows:
+                    lines = "\n".join(
+                        f"- {a['path']} ({a['name']}, {a['kind']}, "
+                        f"{a['size']} bytes)" for a in att_rows)
+                    text = ((text + "\n\n") if text else "") + \
+                        "[attached files - read these paths; the " \
+                        "bytes are NOT inline]\n" + lines
                 # log field is an explicitly-named preview; the FULL
                 # text is persisted as the message row itself
                 store.audit("user", "chat.send", cid,
                             {"text_head": text[:120],
                              "chars": len(text)})
-                msgs = [store.msg_add("user", text, {}, cid)]
+                for a in att_rows:
+                    if not a["conv_id"]:
+                        store.att_link_conv(a["id"], cid)
+                    store.audit("user", "attachment.egress", a["id"],
+                                {"path": a["path"], "name": a["name"],
+                                 "kind": a["kind"], "conv_id": cid,
+                                 "what_left": "path only - file "
+                                              "bytes never leave"})
+                meta = ({"attachments": [a["id"] for a in att_rows]}
+                        if att_rows else {})
+                msgs = [store.msg_add("user", text, meta, cid)]
                 mode = store.setting("agent_mode", "mock")
                 if mode == "real":
                     msgs += agent.handle_real(text, cid)
