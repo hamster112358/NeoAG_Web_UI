@@ -257,6 +257,15 @@ contracts (product code verified first; no product change; 3a83ce7):
 Post-fix verification on 3a83ce7: p04 17/17, real_agent 36/36 (the
 earlier documented R1 live flake also cleared), battery 143/143.
 
-Delivery: push to the GitHub fork + SHA verification + live :8712
-restart + live-instance suites: recorded in the next row of this
-section once executed.
+Delivery (executed 2026-11-20): the mid-transfer transport resets
+documented in the README are alive on this host - the first push of
+the 26-commit fast-forward died mid-sideband, a later ls-remote even
+timed out; attempt 4 of the retry loop completed. Verified by
+independent query AFTER the success, not by push's own exit text: the
+fork's refs/heads/main reads 345cf1d437e06313cad4fadb2c9f159e84985326
+= local HEAD. Live :8712 restarted via kill $(cat server.pid) +
+watchdog respawn (pid 2869797 -> 3012731, same working tree), then
+live-instance suites on the running server: verify_live_journey ALL
+PASS (1 note: submitted job cancelled while still blocked on
+approval - native pipeline never started by the test, as designed),
+verify_live_message_integrity 9/9. M11 step 11 COMPLETE.
