@@ -663,11 +663,17 @@ details.skill-adv pre.skill-raw { margin-top: 8px; white-space: pre-wrap; }
 .conf-row { display: flex; gap: 9px; align-items: center; }
 
 /* ---------- toast / empty ---------- */
+/* M11 P2-14: the toast used to sit bottom-CENTER of the viewport,
+   exactly over the chat composer and the newest inline approval
+   card - an error toast could hide the very button the user must
+   press. It now parks bottom-right, and its z-layer (55) is pinned
+   BELOW the modal dialog (60) so a toast can never cover a dialog.
+   The context menu (120) stays above both - it is click-transient. */
 .toast {
-  position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+  position: fixed; bottom: 20px; right: 20px; left: auto; transform: none;
   background: #22303f; color: #fff; font-size: 14px; border-radius: var(--r-md);
-  padding: 11px 20px; z-index: 60; box-shadow: 0 8px 26px rgba(0,0,0,.2);
-  max-width: 70vw;
+  padding: 11px 20px; z-index: 55; box-shadow: 0 8px 26px rgba(0,0,0,.2);
+  max-width: min(70vw, 420px);
 }
 .toast.err { background: var(--danger); }
 .empty { color: var(--text-3); font-size: 14px; padding: 22px 6px; text-align: center; }
@@ -696,6 +702,28 @@ details.skill-adv pre.skill-raw { margin-top: 8px; white-space: pre-wrap; }
 .chiprow .count { color: var(--text-3); font-weight: 500; }
 .count { color: var(--text-3); font-size: 12.5px; }
 
+/* ---------- M11 P2-14: keyboard focus + zh typography ---------- */
+/* Every interactive element shows a keyboard-only ring (WCAG 2.4.7).
+   :focus-visible so pointer clicks stay visually quiet; the accent
+   ring is the single focus language across controls. */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* chat-input opts out of outlines globally; pin the ring back on. */
+#chat-input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* Skip-to-content affordance for keyboard users (hidden until focus). */
+#skip-link {
+  position: absolute; left: -9999px; top: 0; z-index: 200;
+  background: var(--surface); color: var(--accent-deep);
+  border: 1px solid var(--accent-border); border-radius: 0 0 var(--r-sm) 0;
+  padding: 8px 14px; font-size: 14px; text-decoration: none;
+}
+#skip-link:focus { left: 0; }
+
+/* Chinese reads better at a slightly airier rhythm; the sans stack
+   already ends in CJK families, so glyph choice needs no change -
+   only line-height/letter spacing tuning per resolved language. */
+html[lang="zh"] body { line-height: 1.7; }
+html[lang="zh"] .hint, html[lang="zh"] .inline-card .sub { line-height: 1.75; }
+
 /* ---------- responsive ---------- */
 @media (max-width: 1180px) {
   #shell { grid-template-columns: 200px var(--chatw, 380px) 5px minmax(0, 1fr); }
@@ -711,6 +739,17 @@ details.skill-adv pre.skill-raw { margin-top: 8px; white-space: pre-wrap; }
   #work-body { padding: 18px 16px 40px; }
   .card { padding: 16px 16px; }
   .sctrl { grid-template-columns: 1fr; }
+}
+/* phone-ish widths: the 1000px pass already stacked the shell;
+   this tier only fixes what still breaks under ~760px. */
+@media (max-width: 760px) {
+  #shell { grid-template-rows: auto 45vh minmax(0, 1fr); }
+  #dialog-root { padding: 5vh 10px 10px; }
+  .dlg-box { padding: 14px 14px; max-height: 86vh; }
+  .alert { flex-direction: column; }
+  /* toast spans the width instead of floating a 70vw card askew */
+  .toast { left: 12px; right: 12px; bottom: 12px; max-width: none;
+           text-align: center; }
 }
 
 /* ================= M10: dialogs, attention, options, readiness,
