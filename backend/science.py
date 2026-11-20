@@ -21,6 +21,7 @@ Only 'direct alternative' rows may enter a replacement comparison.
 from __future__ import annotations
 
 import re
+from collections import Counter
 
 from . import ontology
 
@@ -945,12 +946,121 @@ def extract_tool_mentions(records, profile) -> list[dict]:
 # A4: task-driven literature query plan (question-first, not keyword-first)
 # ---------------------------------------------------------------------------
 
-def literature_queries(profile, target_label: str) -> list[dict]:
+_NON_ASCII = re.compile(r"[^\x00-\x7f]")
+
+
+def _ascii_terms(text: str) -> str:
+    """ASCII-only view of a label: the literature sources index
+    English, so a mixed-language label must never be embedded
+    verbatim (regression res-20261119-153059-9e95ab: five verbatim
+    Chinese queries, five zeros, a report concluding from its own
+    untranslated echo)."""
+    return re.sub(r"\s+", " ", _NON_ASCII.sub(" ", text or "")).strip()
+
+
+def intent_queries(intent: dict) -> list[dict]:
+    """M11 P1-11: the query plan derived from an interpreted question.
+    Per-tool separation (each named tool gets its OWN benchmark query,
+    never one blended string), English modality terms for the review/
+    method/benchmark angles, comparison vocabulary when the question
+    asked for it. Returns [] when the interpretation produced no
+    English signal - the caller records a skip, it never falls back
+    to the untranslated label."""
+    if not intent or not intent.get("has_english_signal"):
+        return []
+    tools = [t["raw"] for t in intent.get("tools") or []][:3]
+    doms = list(intent.get("domain_terms") or [])[:3]
+    cmp_words = ('benchmark OR "head-to-head" OR '
+                 '"comparative performance" OR evaluation')
+    if "comparison" in intent.get("facets", []) or \
+            "replacement" in intent.get("facets", []):
+        cmp_words += ' OR comparison OR "better"'
+    out = []
+    for t in tools:
+        out.append({"source": "europepmc",
+                    "query": f'"{t}" AND ({cmp_words})',
+                    "purpose": f"benchmarks / comparisons naming "
+                               f"{t} (per-tool separation)"})
+    joined = " OR ".join(f'"{d}"' for d in doms)
+    if joined:
+        out.append({"source": "europepmc",
+                    "query": f"({joined}) AND (review OR taxonomy OR "
+                             f"\"state of the art\") AND tools",
+                    "purpose": "reviews naming the methodological "
+                               "families and their tools"})
+        out.append({"source": "pubmed",
+                    "query": f"{joined} (tool OR software OR algorithm)",
+                    "purpose": "original method papers naming "
+                               "candidate tools"})
+        out.append({"source": "openalex",
+                    "query": f"{joined} validated benchmark dataset",
+                    "purpose": "evaluation studies with named "
+                               "validation datasets"})
+    if not out and tools:
+        out.append({"source": "europepmc",
+                    "query": " OR ".join(f'"{t}"' for t in tools),
+                    "purpose": "literature naming the requested tools "
+                               "(no modality vocabulary was derived)"})
+    return out
+
+
+def broaden_after_zero(intent: dict) -> list[dict]:
+    """M11 P1-11 bounded recovery: when the primary plan retrieved
+    nothing, ONE deliberate broadening step is allowed (names/terms
+    alone, all qualifiers dropped) before the run must abstain
+    honestly. Bounded by construction: at most two queries."""
+    if not intent or not intent.get("has_english_signal"):
+        return []
+    tools = [f'"{t["raw"]}"' for t in intent.get("tools") or []][:3]
+    core = " OR ".join(tools) if tools else " OR ".join(
+        f'"{d}"' for d in list(intent.get("domain_terms") or [])[:2])
+    if not core:
+        return []
+    return [
+        {"source": "europepmc", "query": core,
+         "purpose": "bounded broadening after zero results "
+                    "(M11 P1-11): names alone, no qualifiers"},
+        {"source": "openalex", "query": core,
+         "purpose": "bounded broadening after zero results "
+                    "(M11 P1-11): names alone, no qualifiers"},
+    ]
+
+
+def intent_profile(intent: dict) -> dict:
+    """A task profile assembled from the interpretation so the
+    downstream screen/extract stages get real English vocabulary
+    instead of the empty GENERIC_PROFILE."""
+    doms = list(intent.get("domain_terms") or [])
+    names = [t["raw"].lower() for t in intent.get("tools") or []]
+    subj = ", ".join(doms[:2]) if doms else (
+        " / ".join(names[:2]) if names else "this task")
+    return _p(f"Which published method for {subj} performs better "
+              f"under conditions comparable to NeoAG's deployment?",
+              doms + [n for n in names if n], doms[:2], [], [],
+              endpoint="define the endpoint from a published benchmark "
+                       "of the target's own field before any ranking")
+
+
+def literature_queries(profile, target_label: str,
+                       intent: dict | None = None) -> list[dict]:
     """The retrieval starts from the scientific question and the task's
-    own vocabulary, not from a bare word like 'ranking'."""
-    label = target_label.split("(")[0].strip()
+    own vocabulary, not from a bare word like 'ranking'.
+
+    M11 P1-11: when the caller supplies an interpreted intent (free-
+    form questions/custom targets), the plan is built from resolved
+    ENGLISH terms with per-tool separation. On the legacy path the
+    label is used only in its ASCII projection - a mixed-language
+    label is never embedded verbatim, and a label with no ASCII
+    vocabulary yields no label-derived query."""
+    if intent is not None:
+        plan = intent_queries(intent)
+        if plan:
+            return plan
+    label = _ascii_terms(target_label.split("(")[0].strip())
     domain = profile["domain"][:3]
     d1 = domain[0].replace("?", "") if domain else label
+    if not d1:
+        return []
     return [
         {"source": "europepmc",
          "query": f'"{d1}" AND (benchmark OR "head-to-head" OR '
@@ -958,8 +1068,8 @@ def literature_queries(profile, target_label: str) -> list[dict]:
          "purpose": "independent benchmarks and comparative studies "
                     "for the task"},
         {"source": "europepmc",
-         "query": f"({label}) AND (review OR taxonomy OR \"state of the "
-                  f"art\") AND tools",
+         "query": f"({label or d1}) AND (review OR taxonomy OR \"state "
+                  f"of the art\") AND tools",
          "purpose": "reviews naming the methodological families and "
                     "their tools"},
         {"source": "pubmed",
@@ -978,6 +1088,43 @@ def literature_queries(profile, target_label: str) -> list[dict]:
 # may only be chosen when its evidence condition is actually met, so a
 # recommendation can never contradict the evidence block next to it.
 # ---------------------------------------------------------------------------
+
+# M11 P1-11: the licensing vocabulary ladder. Every weaker rung MUST
+# be reported AS ITSELF - the classic defect class is "no licence
+# label on the registry page" being flattened into "no licence" or,
+# worse, a commercial/licence-required dependency being listed beside
+# open-source tools as if equally adoptable. Reports state the rung,
+# never a stronger one.
+LICENSE_LADDER = [
+    "not stated where looked (an absent registry label is NOT 'no "
+    "licence')",
+    "declared on a registry page (SPDX label, unverified here)",
+    "licence text located and read (only then may it be called "
+    "confirmed)",
+    "commercial / licence-required - needs THIS deployment's own "
+    "licence verification before adoption",
+]
+LICENSE_LADDER_NOTE = (
+    "licence vocabulary ladder (weakest to strongest): "
+    + " < ".join(LICENSE_LADDER)
+    + "; a registry SPDX label is a DECLARATION, not a verification, "
+      "and 'not stated' never means 'free to use'")
+
+
+def license_rung(value: str) -> tuple[str, str]:
+    """Classify one retrieved licence string onto the ladder.
+    Returns (rung, display). 'none-declared'/NOASSERTION/blank are the
+    registry SAYING NOTHING - rung 1, never a licence claim."""
+    v = str(value or "").strip()
+    if not v or v.lower() in ("none-declared", "noassertion", "none",
+                              "unknown", "not verified"):
+        return ("not-stated", "licence not stated where looked "
+                              "(does not mean unlicensed)")
+    if v.startswith("Not verified"):
+        return ("not-stated", v)
+    return ("declared-unverified", f"{v} (declared on a registry "
+                                   "page; licence text not read here)")
+
 
 RECOMMENDATIONS = [
     "Retain current tool",
@@ -1261,7 +1408,8 @@ RELATIVE_RELEVANT = ("direct-alternative", "partial-overlap",
 def recommend_v2(*, baseline_identified: bool, gate_failures=(),
                  coverage_partial: bool = False, relevance_rows=(),
                  comparisons=(), endpoint_defined: bool = True,
-                 endpoint: str = "") -> dict:
+                 endpoint: str = "", retrieved_records: int | None = None,
+                 ) -> dict:
     """Pure function of the module's stage outputs. relevance_rows:
     [{"name","relationship","followups_open"}]; comparisons:
     compare_measurements() outputs plus "candidate". Every branch
@@ -1389,6 +1537,23 @@ def recommend_v2(*, baseline_identified: bool, gate_failures=(),
                     "define the endpoint from a published benchmark "
                     "of this task's field first",
                     _met=met, _unmet=unmet)
+    if not relevance_rows and not comparisons and retrieved_records == 0:
+        # M11 P1-11 (res-20261119-153059-9e95ab): a review that
+        # retrieved NOTHING cannot conclude "no justified change" -
+        # the empty literature feed is the interpretation failing,
+        # not the field being empty. An honest abstention, never a
+        # verdict dressed up as an outcome.
+        unmet.append("at least one literature record was retrieved "
+                     "for this module")
+        return done("Review incomplete",
+                    "no literature record was retrieved for this "
+                    "module - the research could not be completed; "
+                    "an empty literature feed is NOT evidence that "
+                    "no alternative exists",
+                    "broaden the search (re-interpret the question, "
+                    "English synonyms, per-tool names), then "
+                    "re-synthesise",
+                    _met=met, _unmet=unmet)
     met.append(f"{len(relevance_rows)} candidate(s) reviewed; every "
                "one reached a terminal state with positive basis "
                "(relevance classified or mismatch evidenced)")
@@ -1413,6 +1578,23 @@ GATE_DIMENSIONS = [
     "identity", "relevance", "baseline", "evidence", "comparability",
     "recommendation", "coverage", "provenance integrity"]
 
+# M11 P1-11: the eight dimensions split into two kinds. INTEGRITY
+# gates are discipline checks over what the run WROTE - always
+# evaluable, PASS means something in every run. ADEQUACY gates
+# measure whether there was enough retrieved material to judge the
+# science at all; with no candidate rows they have no subject, and
+# reporting "passed" over an empty input was the vacuity that let the
+# regression headline claim a conclusion from zero records (see
+# res-20261119-153059-9e95ab). An adequacy gate with no subject
+# reports passed=None ("N/A"): never a fake PASS, never a fake FAIL.
+GATE_CLASSES = {
+    "identity": "adequacy", "relevance": "adequacy",
+    "baseline": "adequacy", "evidence": "adequacy",
+    "comparability": "adequacy",
+    "recommendation": "integrity", "coverage": "integrity",
+    "provenance integrity": "integrity",
+}
+
 _ABSENCE_WORDS = ("none of", "no keyword", "contains no",
                   "does not mention", "absence of")
 
@@ -1430,9 +1612,20 @@ def scientific_gates(state: dict) -> list[dict]:
     """
     rows = state.get("candidates") or []
     alt_rows = [r for r in rows if not r.get("is_baseline")]
+    # an adequacy gate over candidates has no subject until at least
+    # one alternative candidate exists
+    has_subject = bool(alt_rows)
 
     def g(dim, passed, detail, violations=()):
-        return {"dimension": dim, "passed": bool(passed),
+        cls = GATE_CLASSES.get(dim, "integrity")
+        if cls == "adequacy" and dim != "baseline" and not has_subject:
+            return {"dimension": dim, "class": cls, "passed": None,
+                    "detail": "N/A - no alternative candidate was "
+                              "retrieved, so this dimension has nothing "
+                              "to judge (absence of candidates is not a "
+                              "passed scientific check)",
+                    "violations": []}
+        return {"dimension": dim, "class": cls, "passed": bool(passed),
                 "detail": detail, "violations": list(violations)[:8]}
 
     # 1 identity: attribution only under a resolved identity
@@ -1465,7 +1658,10 @@ def scientific_gates(state: dict) -> list[dict]:
              "quotes positive mismatch evidence" if not bad else
              "exclusion without positive basis", bad)
 
-    # 3 baseline
+    # 3 baseline: the deployed baseline either is or is not established
+    # from code/config evidence - this always has a subject, so it
+    # reports a real pass/fail (and its failure is what blocks a
+    # replacement conclusion), never N/A.
     bl = state.get("baseline") or {}
     out3 = g("baseline",
              bool(bl.get("identified")) and bool(bl.get("evidence")),
@@ -1534,5 +1730,59 @@ def scientific_gates(state: dict) -> list[dict]:
 
 def decision_ready_v2(gates) -> bool:
     """DECISION-READY only when every scientific gate actually
-    passed - no constant True anywhere."""
-    return bool(gates) and all(x["passed"] for x in gates)
+    passed - no constant True anywhere. M11 P1-11: an N/A adequacy
+    gate (passed=None) is NOT a pass - a run that never retrieved a
+    candidate to judge cannot call itself decision-ready."""
+    return bool(gates) and all(x["passed"] is True for x in gates)
+
+
+# M11 P1-11: the conclusion-first headline must match what the run
+# actually established. "NO tool replacement is justified" is a
+# VERDICT - it is only licensed when every researched module reached
+# a completed review; over an all-incomplete run it was the exact
+# overclaim the regression shipped (decision_ready=false underneath a
+# verdict sentence).
+INCOMPLETE_LABEL = "Review incomplete"
+
+
+def evaluation_headline(labels: list[str], records_retrieved: int) -> str:
+    if not labels:
+        return ("Nothing was researched this run - no conclusion of "
+                "any kind is available.")
+    if "Promising candidate for further evaluation" in labels:
+        return ("Independently verified, directly comparable published "
+                "evidence favours at least one candidate - adoption "
+                "still requires validation on this deployment (see "
+                "module table).")
+    if "Recommend targeted benchmark" in labels:
+        return ("NO tool replacement is justified today. "
+                f"{labels.count('Recommend targeted benchmark')}x "
+                "Recommend targeted benchmark - relevant candidates "
+                "exist for "
+                f"{labels.count('Recommend targeted benchmark')} "
+                "module(s) but no verified comparable numbers were "
+                "retrieved. The current tools stay in place.")
+    incomplete = labels.count(INCOMPLETE_LABEL)
+    if incomplete == len(labels):
+        return ("Research could not be completed; no comparison was "
+                "possible. Every researched module ended with an "
+                "incomplete review (unresolved baseline and/or an "
+                "empty literature feed) - an honest abstention, NOT a "
+                "finding that no replacement exists; the module table "
+                "records exactly what could not be resolved.")
+    if incomplete:
+        parts = ", ".join(f"{v}x {k}" for k, v in
+                          Counter(sorted(set(labels))).items()
+                          if k != INCOMPLETE_LABEL)
+        return (f"No researched module reached an evidenced "
+                f"replacement recommendation ({parts or 'all retain'}); "
+                f"{incomplete} of {len(labels)} module(s) ended with an "
+                "incomplete review, recorded as research-not-completed "
+                "for those modules - not as 'no replacement exists'.")
+    parts = ", ".join(f"{v}x {k}" for k, v in sorted(
+        Counter(labels).items(), key=lambda kv: -kv[1]))
+    return ("NO tool replacement is justified for any researched "
+            f"module ({parts}). Where zero suitable alternatives were "
+            "found after a COMPLETED review ({0} literature record(s) "
+            "retrieved), that is the finding - not a gap to pad with "
+            "irrelevant software.".format(records_retrieved))

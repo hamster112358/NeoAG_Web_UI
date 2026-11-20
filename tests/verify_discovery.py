@@ -143,8 +143,12 @@ status = ""
 # GitHub search costs ~2 min of recorded retry waits and a 2-module
 # run finishes in 44 min; with a fresh budget the same run takes ~5.
 # A slow-but-honest run must PASS, so the poll waits for the terminal
-# status rather than pre-empting it.
-while time.time() - t0 < 3000:
+# status rather than pre-empting it. Cap must therefore EXCEED the
+# documented worst case: measured 2026-11-20, retry-wait contention on
+# the shared host pushed a 2-module run past 3000 s while its status
+# remained honestly 'running' - a 50-min cap turned a slow-honest run
+# into 15 empty-report failures. 90 min it is.
+while time.time() - t0 < 5400:
     st, rr = call("/api/research/" + rid, timeout=20)
     status = rr.get("status", "")
     prog = rr.get("progress") or {}
@@ -488,6 +492,165 @@ check("34 M6 A8: definite registry-absence answers are tagged recorded "
       all(q.get("recorded_outcome") for q in _absent) and not _bad34,
       f"{len(_absent)} recorded-absence rows; unjustified demotions="
       f"{_bad34}")
+
+# ---------- 35-44 M11 P1-11: LIVE replay of the exact regression -----
+# res-20261119-153059-9e95ab (production DB, read) asked about
+# "POLYSOLVER和sovalign的可靠替代" and the engine used that untranslated
+# label VERBATIM in all 5 queries -> 5x0 records, vacuous PASS gates over
+# zero candidates, and the headline still claimed "NO tool replacement is
+# justified" under decision_ready=false. The matrix pins this suite to
+# replay the exact question against the LIVE engine and assert the
+# P1-11 contract on a real report: interpretation before retrieval,
+# English-only queries, per-tool separation, a baseline grounded in the
+# native configuration, and honest abstention over an empty feed.
+REG_Q = "POLYSOLVER和sovalign的可靠替代"
+st, sub3 = call("/api/research", {
+    "scope": "targeted", "engine": "live", "custom": [REG_Q]})
+check("35 P1-11 replay: the exact regression question is accepted as a "
+      "custom target", st == 202, str(sub3)[:160])
+rid3 = sub3.get("research_id", "")
+t0 = time.time()
+rep3, status3 = {}, ""
+while time.time() - t0 < 5400:  # same slow-but-honest worst case (above)
+    st, rr3 = call("/api/research/" + rid3, timeout=20)
+    status3 = rr3.get("status", "")
+    if status3 in ("completed", "incomplete", "failed", "cancelled"):
+        rep3 = rr3.get("report") or {}
+        break
+    time.sleep(3)
+check("36 P1-11 replay: terminal status + persisted report",
+      status3 in ("completed", "incomplete", "failed") and bool(rep3),
+      status3)
+_q3 = [q for q in (rep3.get("provenance") or {}).get("queries") or []
+       if q.get("source") in ("europepmc", "pubmed", "openalex",
+                              "github")]
+_bad37 = [q.get("query") for q in _q3
+          if not (q.get("query") or "").isascii()]
+check("37 P1-11 replay: EVERY retrieval query actually issued is ASCII - "
+      "the untranslated question is echoed nowhere (the regression asked "
+      "it 5 times verbatim and got 5x0 records)",
+      len(_q3) > 0 and not _bad37,
+      f"{len(_q3)} queries; non-ascii={str(_bad37[:2])[:150]}")
+_litq = [q for q in _q3 if q.get("source") != "github"]
+_pol = [q for q in _litq if "polysolver" in (q.get("query") or "").lower()]
+_sov = [q for q in _litq if "sovalign" in (q.get("query") or "").lower()]
+_blend = [q for q in _litq if all(
+    n in (q.get("query") or "").lower()
+    for n in ("polysolver", "sovalign"))]
+_eng = any("hla" in (q.get("query") or "").lower() for q in _q3)
+check("38 P1-11 replay: per-tool separation survives into live "
+      "provenance - POLYSOLVER and sovalign each get their OWN "
+      "literature query (never one blended string), and the domain "
+      "angle is asked with resolved ENGLISH terms (HLA typing), not "
+      "with the CJK label",
+      bool(_pol) and bool(_sov) and not _blend and _eng,
+      f"pol={len(_pol)} sov={len(_sov)} blended={len(_blend)} eng={_eng}")
+_t3 = ({t.get("target_id"): t
+        for t in rep3.get("task_comparisons") or []}
+       or {}).get("custom:polysolver-sovalign", {})
+_bl = _t3.get("baseline") or {}
+_blpol = [x for x in _bl.get("tools") or []
+          if "polysolver" in (x.get("name") or "").lower()]
+# the report builder joins each tool's evidence list into ONE string
+# (research.py: "; ".join(b["evidence"])[:220]) - accept either shape
+_ev0 = _blpol[0].get("evidence") if _blpol else ""
+_ev0 = [_ev0] if isinstance(_ev0, str) else (_ev0 or [])
+check("39 P1-11 replay: the baseline is grounded in the NATIVE "
+      "CONFIGURATION (POLYSOLVER enters it from the native tool "
+      "registry, evidence attached) and the note marks 'sovalign' "
+      "UNVERIFIED - an unknown name is carried as written, never "
+      "silently substituted",
+      bool(_bl.get("identified")) and bool(_blpol)
+      and any("registry" in str(e) for e in _ev0)
+      and "UNVERIFIED" in str(_bl.get("note") or "")
+      and "sovalign" in str(_bl.get("note") or ""),
+      json.dumps(_bl, ensure_ascii=False)[:240])
+_rec3 = len(rep3.get("literature_citations") or [])
+_mc3 = rep3.get("module_conclusions") or {}
+_lab3 = {m.get("recommendation") for m in _mc3.values()}
+_hl3 = (rep3.get("assessment") or {}).get("headline") or ""
+_dr3 = (rep3.get("assessment") or {}).get("decision_ready")
+check("40 P1-11 replay: the headline never prints a verdict over an "
+      "unfinished review - over a zero-record feed the module is "
+      "'Review incomplete' and the headline ABSTAINS ('Research could "
+      "not be completed'), never claiming 'NO tool replacement is "
+      "justified' (the regression's exact overclaim); with records the "
+      "verdict is licensed only when every module completed its review",
+      (("NO tool replacement is justified" not in _hl3)
+       and _lab3 == {"Review incomplete"} and _dr3 is False
+       and "Research could not be completed" in _hl3)
+      if _rec3 == 0 else
+      (("NO tool replacement is justified" not in _hl3)
+       or _lab3 != {"Review incomplete"}),
+      f"records={_rec3} labels={_lab3} decision_ready={_dr3} "
+      f"headline={_hl3[:110]}")
+_g3 = rep3.get("quality_gates") or []
+_byd = {g.get("dimension"): g.get("passed") for g in _g3}
+check("41 P1-11 replay: gates are CLASSES - integrity gates stay real "
+      "booleans, and over an empty feed the subjectless adequacy gates "
+      "report N/A (None), never a vacuous PASS (the regression passed "
+      "identity/relevance/evidence/comparability on zero candidates)",
+      all(g.get("class") in ("adequacy", "integrity") for g in _g3)
+      and all(isinstance(g.get("passed"), bool)
+              for g in _g3 if g.get("class") == "integrity")
+      and (_rec3 > 0 or all(_byd.get(d) is None for d in
+                            ("identity", "relevance", "evidence",
+                             "comparability"))),
+      str({k: v for k, v in _byd.items()})[:200])
+_qi3 = rep3.get("question_interpretation") or {}
+_it3 = (_qi3.get("custom:polysolver-sovalign")
+        or (next(iter(_qi3.values()), {}) if _qi3 else {}))
+_st3 = {t.get("raw"): t.get("status") for t in _it3.get("tools") or []}
+check("42 P1-11 replay: the report STATES its interpretation "
+      "(question_interpretation: POLYSOLVER resolves on a native rung, "
+      "sovalign stays UNVERIFIED) and states the licence vocabulary "
+      "ladder it used",
+      _st3.get("POLYSOLVER") in ("configured", "declared")
+      and _st3.get("sovalign") == "unverified"
+      and bool(rep3.get("licence_vocabulary")),
+      f"{_st3} ladder={bool(rep3.get('licence_vocabulary'))}")
+# generalization, offline and deterministic (no POLYSOLVER keyword is
+# anywhere in backend/ - the layer resolves names against native data,
+# so ANY modality question behaves the same way):
+try:
+    from backend import inventory as _inv_mod
+    from backend import intent as _intent_mod
+    _ginv = _inv_mod.load_inventory()
+    _gdecl = _intent_mod.load_declared(_ginv.get("repo") or "")
+    _GEN = {
+        "hla_typing": "HLA分型用什么工具更准确，有没有替代方案",
+        "purity_cnv": "纯度 purity 和 CNV 估计有没有更好的方法",
+        "fusion": "融合基因检测想比较一下不同工具",
+        "splicing": "可变剪接 splicing 分析用什么软件比较好",
+        "presentation": "抗原呈递 prediction 有什么新模型值得评估",
+    }
+    _bad43 = []
+    for _mid, _q in _GEN.items():
+        _git = _intent_mod.analyze(_q, stages=_ginv.get("stages") or (),
+                                   declared=_gdecl)
+        _gq = [x.get("query") or "" for x in
+               _sci.intent_queries(_git)]
+        if _mid not in (_git.get("modalities") or []) or not _gq or \
+                not all(x.isascii() for x in _gq):
+            _bad43.append((_mid, _git.get("modalities"),
+                           _gq[:1]))
+    check("43 P1-11 generalization: HLA typing / purity-CNV / fusion / "
+          "splicing / presentation questions all resolve their modality "
+          "and yield ENGLISH queries - no POLYSOLVER special-casing",
+          not _bad43, str(_bad43)[:220])
+except Exception as _e43:
+    check("43 P1-11 generalization: HLA typing / purity-CNV / fusion / "
+          "splicing / presentation questions all resolve their modality "
+          "and yield ENGLISH queries - no POLYSOLVER special-casing",
+          False, f"{type(_e43).__name__}: {_e43}")
+_kw44 = [f.name for f in sorted((ROOT / "backend").glob("*.py"))
+         if any(k in f.read_text(encoding="utf-8",
+                                 errors="replace").lower()
+                for k in ("polysolver", "sovalign"))]
+check("44 P1-11: NO tool keyword is hardcoded anywhere in backend/ - "
+      "the name-resolution layer generalizes to any tool named in any "
+      "question (grep-enforced on the shipped tree)", not _kw44,
+      str(_kw44))
 
 print()
 print(f"DISCOVERY E2E: {len(PASS)} passed, {len(FAIL)} failed")

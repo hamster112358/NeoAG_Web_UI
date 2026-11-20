@@ -441,7 +441,13 @@ def research_html(rid: str, rep: dict) -> bytes:
     gts = rep.get("quality_gates") or []
     if gts:
         a_sec("Research quality gates", "quality_gates")
-        app.append(_html_table(gts))
+        # M11 P1-11: passed=None is an N/A adequacy gate (no subject
+        # to judge) - printed as N/A, never as a blank or a fake PASS.
+        _gt_disp = [{**x, "passed": ("N/A" if x.get("passed") is None
+                                     else ("PASS" if x.get("passed")
+                                           else "FAIL"))}
+                    for x in gts]
+        app.append(_html_table(_gt_disp))
     inv = rep.get("inventory")
     if inv and inv.get("stages"):
         a_sec("Code-grounded pipeline inventory + baselines", "inventory")
@@ -854,7 +860,9 @@ def report_text_paras(rid: str, rep: dict) -> list[tuple[str, str]]:
                        f"not researched "
                        f"{len(cov.get('not_researched') or [])}"))
     for g in rep.get("quality_gates") or []:
-        p.append(("p", f"gate [{'PASS' if g.get('passed') else 'FAIL'}] "
+        _pv = g.get("passed")
+        _ps = ("N/A" if _pv is None else "PASS" if _pv else "FAIL")
+        p.append(("p", f"gate [{_ps}] "
                        f"{g.get('check')} - {g.get('detail')}"))
     if rep.get("limitations"):
         p.append(("h", "Limitations"))

@@ -4080,7 +4080,7 @@ function reportHtmlLive(rep, rid) {
         insufficient_evidence: cov.insufficient_evidence,
         not_researched: cov.not_researched, note: cov.note })}
       <b class="hint">${esc(t("disc.gatesL"))}</b>
-      <ul>${(rep.quality_gates || []).map((g) => `<li>${g.passed ? "PASS" : "FAIL"} ${esc(g.check)} - ${esc(g.detail)}</li>`).join("")}</ul>
+      <ul>${(rep.quality_gates || []).map((g) => `<li>${g.passed === null ? "N/A" : (g.passed ? "PASS" : "FAIL")} ${esc(g.check)} - ${esc(g.detail)}</li>`).join("")}</ul>
       <b class="hint">${esc(t("disc.citesL"))}</b>
       <ul>${(rep.literature_citations || []).slice(0, 40).map((c) => `
         <li><b>${esc(c.title || "")}</b> ${esc(c.year || "")} -

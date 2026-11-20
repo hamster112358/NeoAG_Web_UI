@@ -638,7 +638,7 @@ def _faked_sources():
 
     sources.ALL_ADAPTERS = {"europepmc": adapter, "pubmed": adapter,
                             "openalex": adapter}
-    sources.github_repo_search = lambda t, n=3: (
+    sources.github_repo_search = lambda t, n=3, **kw: (
         GH.get(t.lower(), [])[:n], None, {})
     sources.pypi_package = lambda s, n=1: ([], "not-on-pypi (fixture)",
                                            {})

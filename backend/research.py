@@ -27,11 +27,12 @@ from collections import Counter
 from pathlib import Path
 
 from . import (baselines, claims, claimverify, evidence, identity,
-               inventory, mock_data, ontology, science, sources, versions)
+               intent as intent_lib, inventory, mock_data, ontology,
+               science, sources, versions)
 from .store import Store, new_id, now
 from .mock_data import DEMO_DATASET_VERSION
 
-LIVE_ENGINE_VERSION = "live-retrieval-2026.11-m8-r1"
+LIVE_ENGINE_VERSION = "live-retrieval-2026.11-m11-r1"
 
 # M6 A9: the ONLY recommendations a module may receive (fixed
 # vocabulary, see backend/science.recommend for the evidence rules that
@@ -252,15 +253,81 @@ def _step(store, publish, rid, text, prog, prog_extra=None):
 # LIVE engine
 # ---------------------------------------------------------------------------
 
-def _literature_plan(target, queries_done):
+def _literature_plan(target, queries_done, intent=None):
     """M6 A4: the retrieval starts from the module's SCIENTIFIC QUESTION
     and its task vocabulary (backend/science.py), not from bare keywords
-    like 'ranking tools'."""
+    like 'ranking tools'. M11 P1-11: for a free-form (custom) target the
+    plan comes from the INTERPRETED question's English terms - never
+    from the untranslated label."""
     prof = science.profile_for(target["id"], target.get("label") or "")
-    plan = science.literature_queries(prof, target.get("label")
-                                      or target["id"])
+    if intent is not None:
+        prof = science.intent_profile(intent)
+    plan = science.literature_queries(prof,
+                                      target.get("label") or target["id"],
+                                      intent=intent)
     return [q for q in plan
             if f"{q['source']}|{q['query']}" not in queries_done]
+
+
+def _interpret_targets(resolved_targets, inv, prog):
+    """M11 P1-11: interpret every CUSTOM target's question once per
+    run (deterministic, offline). The interpretation is persisted in
+    progress so a resumed run reuses the same intent and the report
+    can show what the question was taken to mean. Configured/declared
+    names ground a baseline block from the NATIVE configuration
+    (declared/installed ladder via baselines.level_for_stage); an
+    unverified name is carried as written, never substituted."""
+    intents = dict(prog.get("intents") or {})
+    declared = intent_lib.load_declared(inv.get("repo") or "")
+    for t in resolved_targets:
+        if not t.get("custom") or t["id"] in intents:
+            continue
+        intents[t["id"]] = intent_lib.analyze(
+            t.get("label") or "", stages=inv.get("stages") or (),
+            declared=declared)
+    prog["intents"] = intents
+    return intents
+
+
+def _intent_stage(target, intents):
+    """Synthesized inventory-stage for a custom target whose question
+    named tools that the NATIVE configuration knows; None when nothing
+    named resolves natively (the baseline then honestly stays
+    unidentified)."""
+    it = (intents or {}).get(target["id"])
+    if not it or not target.get("custom"):
+        return None
+    tools = []
+    for t in it.get("tools") or []:
+        if t.get("status") not in ("configured", "declared"):
+            continue
+        ev = []
+        for s in t.get("stages") or []:
+            ev += [f"native inventory stage {s.get('id')}: {e}"
+                   for e in (s.get("evidence") or [])][:2]
+        for d in t.get("descriptions") or []:
+            ev.append("declared in the native tool registry: "
+                      + str(d)[:140])
+        tools.append({
+            "name": t["raw"],
+            "role": ("configured baseline tool" if t["status"] ==
+                     "configured" else
+                     "declared native tool (registry; not in the run "
+                     "plan)"),
+            "evidence": ev or ["native tool registry membership"],
+            "pinned_version": None})
+    if not tools:
+        return None
+    unverified = [t["raw"] for t in it.get("tools") or []
+                  if t.get("status") == "unverified"]
+    note = ("the question named these tools; those resolved against "
+            "the native configuration ground the baseline"
+            + (", ".join(f" - {u!r} is UNVERIFIED (not found in the "
+                         "native configuration)"
+                         for u in unverified) if unverified else ""))
+    return {"id": target["id"], "custom": True,
+            "baseline": {"identified": True, "consensus": False,
+                         "tools": tools, "note": note}}
 
 
 
@@ -326,16 +393,35 @@ def run_live(rid, scope, targets, store, resume):
         publish({"type": "research", "id": rid})
         return
 
+    # ---- M11 P1-11 phase 0: interpret free-form questions BEFORE
+    # retrieval. The untranslated mixed-language label is never a
+    # query; names are resolved against the native configuration
+    # (configured > declared > unverified, never silently conflated);
+    # the queries that follow carry ENGLISH terms with per-tool
+    # separation. ----
+    intents = _interpret_targets(resolved_targets, inv, prog)
+    for t in resolved_targets:
+        it = intents.get(t["id"])
+        if it:
+            _step(store, publish, rid, f"[{t['id']}] "
+                  + intent_lib.synthesis_note(it),
+                  prog, {"intents": intents})
+        synth = _intent_stage(t, intents)
+        if synth:
+            # the question's natively-known names ground this target's
+            # baseline block (declared/installed ladder applies)
+            stages_by_id[t["id"]] = synth
+
     lit_by_target = {}
     per_source = {}
     failures = []
-    # ---- phase 1: literature retrieval per target ----
-    for target in resolved_targets:
-        if cancelled():
-            break
-        plan = _literature_plan(target, set())
-        lit_by_target.setdefault(target["id"], [])
+
+    def _run_queries(target, plan):
+        """Execute a query plan for one target (resume-aware:
+        persisted records are RESTORED, not just skipped)."""
         for q in plan:
+            if cancelled():
+                return
             qkey = f"{q['source']}|{q['query']}"
             if qkey in done and qkey in lit_records:
                 # resume: restore the evidence, do not just skip
@@ -371,6 +457,46 @@ def run_live(rid, scope, targets, store, resume):
                          "lit_records": lit_records,
                          "coverage": {"per_source": per_source,
                                       "failures": failures}})
+
+    # ---- phase 1: literature retrieval per target ----
+    for target in resolved_targets:
+        if cancelled():
+            break
+        it = intents.get(target["id"])
+        plan = _literature_plan(target, set(), intent=it)
+        lit_by_target.setdefault(target["id"], [])
+        if not plan:
+            # honest skip, RECORDED as a query-plan fact: there is no
+            # English term to ask with. Zero queries attempted is
+            # visible in provenance; the label is never echoed.
+            entry = {"source": "plan", "query": "(none derivable)",
+                     "target": target["id"],
+                     "purpose": "no English query term could be "
+                                "derived from the question "
+                                "(M11 P1-11: the untranslated label "
+                                "is never used as a query)",
+                     "count": 0, "error": "no-english-term",
+                     "recorded_outcome": True, "ts": now()}
+            queries_log.append(entry)
+            _step(store, publish, rid,
+                  f"[{target['id']}] retrieval SKIPPED with reason: no "
+                  f"English term derivable (label never echoed)",
+                  prog, {"queries": queries_log})
+            continue
+        _run_queries(target, plan)
+        # M11 P1-11 bounded recovery: an all-zero primary plan gets
+        # exactly ONE broadening pass (names alone, qualifiers
+        # dropped) before the run must abstain honestly.
+        if it is not None and not lit_by_target[target["id"]]:
+            extra = [q for q in science.broaden_after_zero(it)
+                     if f"{q['source']}|{q['query']}" not in done]
+            if extra:
+                _step(store, publish, rid,
+                      f"[{target['id']}] primary plan returned zero "
+                      f"records - ONE bounded broadening pass "
+                      f"(M11 P1-11), then honest abstention if still "
+                      f"zero", prog)
+                _run_queries(target, extra)
     if cancelled():
         # literature phase interrupted: no conclusions yet - only
         # retrieval facts; candidate work never ran
@@ -415,6 +541,8 @@ def run_live(rid, scope, targets, store, resume):
         tid = target["id"]
         inv_stage = stages_by_id.get(tid) or {}
         prof = science.profile_for(tid, target.get("label") or "")
+        if intents.get(tid) is not None:
+            prof = science.intent_profile(intents[tid])
         task = ontology.task_for(tid)
         baseline_tool_names = [b["name"] for b in
                                (inv_stage.get("baseline") or {}).get(
@@ -436,16 +564,41 @@ def run_live(rid, scope, targets, store, resume):
                           "baseline_evidence": bt.get("evidence")})
         names += science.extract_tool_mentions(
             lit_by_target.get(tid, []), prof)
-        gh_query = target["label"].split("(")[0].strip()
+        # M11 P1-11: the repo search asks with ENGLISH terms too -
+        # per-tool quoted names for an interpreted question; when the
+        # interpretation produced no name, the search is recorded as
+        # skipped, never fired with the untranslated label. The
+        # measured core budget is passed in so the releases/latest
+        # CORE probe is a recorded planned skip when it is exhausted.
+        it = intents.get(tid)
+        if it is not None:
+            _tn = [t["raw"] for t in it.get("tools") or []][:2]
+            gh_query = " OR ".join(f'"{t}"' for t in _tn)
+        else:
+            gh_query = target["label"].split("(")[0].strip()
         tool_hits = []
         gh_key = f"github|{gh_query}"
         if gh_key in done and gh_key in lit_records:
             tool_hits.extend(lit_records[gh_key])  # resume restore
+        if not gh_query:
+            entry = {"source": "plan", "query": "(none derivable)",
+                     "target": tid,
+                     "purpose": "github repo search not attempted: no "
+                                "English search term could be derived "
+                                "(M11 P1-11)",
+                     "count": 0, "error": "no-english-term",
+                     "recorded_outcome": True, "ts": now()}
+            queries_log.append(entry)
+            _step(store, publish, rid,
+                  f"[{tid}] github repo search SKIPPED with reason: "
+                  f"no English term derivable",
+                  prog, {"queries": queries_log})
         for q in ([{"source": "github", "query": gh_query,
                     "purpose": "task-named repositories (suggestions "
                                "only - screened like everything else)"}]
-                  if gh_key not in done else []):
-            recs, err, _ = sources.github_repo_search(q["query"], 4)
+                  if gh_query and gh_key not in done else []):
+            recs, err, _ = sources.github_repo_search(q["query"], 4,
+                                                      budget=budget)
             entry = {"source": "github", "query": q["query"], "target": tid,
                      "purpose": q["purpose"], "count": len(recs),
                      "error": err, "ts": now()}
@@ -1016,8 +1169,12 @@ def _verify_candidate(n, target, citations, per_source, failures,
     # (PART 1.3/1.4 fix; raw queries stay in version_chain and
     # verification_hits as provenance, not as claims).
     verified_version = vchain["display"]
+    # M11 P1-11 licence ladder: "none-declared"/NOASSERTION is the
+    # registry SAYING NOTHING - it falls through like a blank, never
+    # enters the report as a licence statement.
     license_ = (gh_a[0].get("license") if gh_a and
-                gh_a[0].get("license") not in (None, "NOASSERTION") else
+                gh_a[0].get("license") not in (None, "NOASSERTION",
+                                               "none-declared") else
                 (py_a[0].get("license") if py_a else
                  (bc_a[0].get("license") if bc_a else
                   (bt_a[0].get("license") if bt_a else
@@ -1464,7 +1621,8 @@ def _task_comparisons(resolved_targets, candidates, stages_by_id,
     return out
 
 
-def _module_decision(target, candidates, stage, reached_fully=True):
+def _module_decision(target, candidates, stage, reached_fully=True,
+                     retrieved_records=None):
     """M8 S8+S9: the module's stage outputs assembled into comparability
     pairs and the five-label synthesis. The recommendation is a PURE
     function of the facts (label_facts); the recommendation gate
@@ -1547,7 +1705,12 @@ def _module_decision(target, candidates, stage, reached_fully=True):
         "relevance_rows": relevance_rows,
         "comparisons": comparisons,
         "endpoint_defined": bool(qtys),
-        "endpoint": ", ".join(qtys)}
+        "endpoint": ", ".join(qtys),
+        # M11 P1-11: the literature feed size is a FACT the label
+        # function consumes - an empty feed may never be dressed up
+        # as a completed "no justified change" review.
+        "retrieved_records": (None if retrieved_records is None
+                              else int(retrieved_records))}
     prov = science.recommend_v2(**label_facts)
     base_ev = "; ".join(str(e) for b in (base.get("tools") or [])
                         for e in (b.get("evidence") or []))[:300]
@@ -1697,6 +1860,15 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
             t["id"] if not t["id"].startswith("custom:") else "",
             _DEFAULT_METRICS)
     stages_by_id = {s["id"]: s for s in inv["stages"]}
+    # M11 P1-11: a custom target whose question named a natively-known
+    # tool gets a baseline grounded in the native configuration (the
+    # same overlay the live run used), so the baseline gate judges a
+    # REAL identified baseline instead of always reporting 'missing'.
+    _intents = prog.get("intents") or {}
+    for t in resolved_targets:
+        synth = _intent_stage(t, _intents)
+        if synth:
+            stages_by_id[t["id"]] = synth
     reached = (resolved_targets if reached_ids is None else
                [t for t in resolved_targets if t["id"] in reached_ids])
     # A8: a GitHub 403 rate-limit is a RECORDED gap in the version-
@@ -1768,14 +1940,15 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
     gates_flat = []
     for t in reached:
         tid = t["id"]
-        mc = _module_decision(t, candidates,
-                              stages_by_id.get(tid) or {},
-                              reached_fully=(tid not in
-                                             hard_fail_targets))
         tqs = [q for q in (prog.get("queries") or [])
                if q.get("target") == tid]
         t_cids = [(c.get("cid") or _canon_cid(c)) for c in citations
                   if tid in (c.get("targets") or [])]
+        mc = _module_decision(t, candidates,
+                              stages_by_id.get(tid) or {},
+                              reached_fully=(tid not in
+                                             hard_fail_targets),
+                              retrieved_records=len(t_cids))
         state = {
             "target": tid,
             "baseline": {
@@ -1794,7 +1967,11 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
             "label_proposed": mc["recommendation"],
             "label_facts": mc["label_facts"]}
         g = science.scientific_gates(state)
-        failing = [x for x in g if not x["passed"]
+        # M11 P1-11: only an explicit FALSE forces re-synthesis. An
+        # N/A adequacy gate (passed=None) has no subject - it is not a
+        # failure to feed into the rationale; the empty feed is already
+        # reported by the baseline/zero-record branches.
+        failing = [x for x in g if x["passed"] is False
                    and x["dimension"] != "recommendation"]
         if failing:
             facts2 = dict(mc["label_facts"],
@@ -1859,28 +2036,14 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
     # ---- M6 B1: conclusion-first assessment (one minute to read) ----
     by_rec = Counter(m["recommendation"]
                      for m in module_conclusions.values())
-    adv = {k: v for k, v in by_rec.items()
-           if k in ("Promising candidate for further evaluation",
-                    "Recommend targeted benchmark")}
-    if adv.get("Promising candidate for further evaluation"):
-        headline = ("Independently verified, directly comparable "
-                    "published evidence favours at least one "
-                    "candidate - adoption still requires validation "
-                    "on this deployment (see module table).")
-    elif adv:
-        headline = ("NO tool replacement is justified today. "
-                    + ", ".join(f"{v}x {k}" for k, v in adv.items())
-                    + f" - relevant candidates exist for {len(adv)} "
-                      "module(s) but no verified comparable numbers "
-                      "were retrieved. The current tools stay in "
-                      "place.")
-    else:
-        parts = ", ".join(f"{v}x {k}" for k, v in sorted(
-            by_rec.items(), key=lambda kv: -kv[1]))
-        headline = ("NO tool replacement is justified for any researched "
-                    f"module ({parts}). Where zero suitable alternatives "
-                    "were found, that is the finding - not a gap to "
-                    "pad with irrelevant software.")
+    # M11 P1-11: the headline is the pure science.evaluation_headline
+    # function of the module labels + feed size. The regression
+    # (res-20261119-153059-9e95ab) composed "NO tool replacement is
+    # justified" over an all-incomplete run; that verdict now requires
+    # every module to have COMPLETED its review.
+    headline = science.evaluation_headline(
+        [m["recommendation"] for m in module_conclusions.values()],
+        len(citations))
     findings = [
         f"[{tid}] {mc['recommendation']} - {mc['rationale'][:170]}"
         for tid, mc in module_conclusions.items()
@@ -2124,6 +2287,14 @@ def _live_report(rid, prog, inv, lit_by_target, status, candidates=None,
             "retrieved blurbs, not a code audit",
             ] + inv["limitations"],
         "availability_classes_legend": AVAILABILITY,
+        # M11 P1-11: the licensing vocabulary ladder, stated with the
+        # findings that use it.
+        "licence_vocabulary": science.LICENSE_LADDER_NOTE,
+        # M11 P1-11: exactly how each free-form question was
+        # interpreted (name resolution + English terms + disambiguation
+        # notes) - the run shows its interpretation, not just its
+        # conclusions.
+        "question_interpretation": (prog.get("intents") or {}),
         "timestamps": {"started": (prog.get("steps") or [""])[0:1],
                        "compiled_at": now(),
                        "engine": LIVE_ENGINE_VERSION},

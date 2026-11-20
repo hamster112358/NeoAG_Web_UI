@@ -161,8 +161,13 @@ def openalex_search(query: str, max_results: int = 8):
 
 # ---------------- software ----------------
 
-def github_repo_search(name: str, max_results: int = 3):
-    """GitHub repository search + (first hit) latest release probe."""
+def github_repo_search(name: str, max_results: int = 3, budget=None):
+    """GitHub repository search + (first hit) latest release probe.
+
+    M11 P1-11: releases/latest is a CORE-budget request. When the
+    caller passes the run's measured budget and it is exhausted, the
+    probe is a RECORDED planned skip (releases_note), never a silent
+    null that reads as 'no releases' and never a burned 403."""
     try:
         j = _http_json("https://api.github.com/search/repositories?"
                        + urllib.parse.urlencode(
@@ -181,15 +186,25 @@ def github_repo_search(name: str, max_results: int = 3):
                 pushed_at=r.get("pushed_at"),
                 language=r.get("language")))
         if out:
-            try:
-                rel = _http_json(
-                    "https://api.github.com/repos/"
-                    f"{out[0]['id']}/releases/latest", timeout=12)
-                out[0]["latest_release"] = rel.get("tag_name")
-                out[0]["latest_release_date"] = (
-                    rel.get("published_at") or "")[:10]
-            except Exception:
+            left = (budget or {}).get("core")
+            if left is not None and left < 1:
                 out[0]["latest_release"] = None
+                out[0]["releases_note"] = (
+                    "releases probe skipped: GitHub core budget "
+                    "exhausted at run start (planned skip, NOT "
+                    "'no releases')")
+            else:
+                if budget is not None and left is not None:
+                    budget["core"] = left - 1
+                try:
+                    rel = _http_json(
+                        "https://api.github.com/repos/"
+                        f"{out[0]['id']}/releases/latest", timeout=12)
+                    out[0]["latest_release"] = rel.get("tag_name")
+                    out[0]["latest_release_date"] = (
+                        rel.get("published_at") or "")[:10]
+                except Exception:
+                    out[0]["latest_release"] = None
         return out, None, {"total": j.get("total_count")}
     except Exception as e:
         return [], f"{type(e).__name__}: {str(e)[:180]}", {}

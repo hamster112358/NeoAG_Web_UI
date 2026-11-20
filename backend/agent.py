@@ -675,8 +675,9 @@ class DemoAgent:
     # M11 P0-3: live turns are NOT bounded by a wall-clock budget.
     # The gateway job outlives any single relay loop; ending a turn at
     # 900s while the job kept running is the exact regression this
-    # milestone was filed for (POLYSOLVER research turns legitimately
-    # run longer than the old cap). A turn now ends only on honest
+    # milestone was filed for (deep free-form research turns
+    # legitimately run longer than the old cap). A turn now ends only
+    # on honest
     # events: terminal job state, user cancel, lost connection, or a
     # relay crash. Explicit max_seconds remains a TEST seam - nothing
     # production passes it. STALL_NOTICE_SECONDS: one honest notice
