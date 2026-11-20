@@ -199,3 +199,64 @@ Legend: A# = audit finding above. "Test" = automated evidence named.
 10. P1-9, P1-10, P1-11, P1-12+13, P2-14.
 11. Scenarios A-K + all suites + this doc's status/class columns
     finalized + push + SHA verified + live restart.
+
+---
+
+## Step 11 - final regression sweep + delivery (2026-11-20)
+
+One serial sweep over the committed tree (af0bbde), one suite at a time,
+shared test ports never concurrent, python3 -u (unbuffered - a buffered
+kill loses the whole log), external timeout caps ABOVE each suite's
+internal live budget (discovery's own budget is 5400 s; the sweep cap
+is 7500 s). Every suite encodes its scenario rows: the P-suites map
+1:1 to the matrix rows above, m7/m10-acceptance replay the acceptance
+scenarios A-K end to end, gate/input_discovery/scientific/turn_recovery
+hold the shared contracts, battery is the standing whole-tree grep.
+
+| suite | checks | suite | checks |
+|---|---|---|---|
+| battery | 143/143 | m11_p214 | 25/25 |
+| m11_p01 | 16/16 | gate | 47/47 |
+| m11_p02 | 32/32 | input_discovery | 17/17 |
+| m11_p03 | 12/12 | m7_acceptance | 35/35 |
+| m11_p04 | 17/17 * | scientific | 76/76 |
+| m11_p05 | 9/9 | turn_recovery | 14/14 |
+| m11_p06 | 19/19 | m10_acceptance | 45/45 (1 note) |
+| m11_p07 | 21/21 | long_message | 28/28 + 1 skip * |
+| m11_p08 | 28/28 | real_agent | 36/36 * |
+| m11_p09 | 26/26 | discovery (live) | 44/44 |
+| m11_p10 | 22/22 | | |
+| m11_p11 | 36/36 | **total** | **806 pass, 0 fail, 1 skip** |
+| m11_p12 | 35/35 | | |
+| m11_p13 | 23/23 | | |
+
+\* first sweep pass flagged three red checks; both causes REPRODUCED in
+isolation and were proven stale TEST expectations predating landed M11
+contracts (product code verified first; no product change; 3a83ce7):
+
+- p04 5a still grepped the pre-P1-12 terminal phrase "Agent turn ended"
+  and the pre-normalization trim count. P1-12 owns the terminal line
+  (phrasing.turn_ended_text; stable honesty tail "No assistant reply
+  text was recorded") and human_detail states the trim count of the
+  WHITESPACE-COLLAPSED string it actually trims. 5a now derives the
+  expected size from the same normalization; the guarded contract
+  ("shortened for display SAYS so: marker + size") is unchanged.
+- real_agent R8 asserted the pre-P0-3 single outcome ("interrupted"
+  stamp within 30 s). P0-3 added relay RE-ATTACHMENT: a job the gateway
+  still reports alive keeps streaming and delivers its real reply; only
+  genuinely-dead jobs get the interrupted stamp. R8's post-kill job
+  (sleep 35) is alive, so the old assertion contradicted the shipped
+  contract, and the unresolved turn cascaded into R9 through the
+  one-exchange guard. R8 now waits up to 180 s for the turn to RESOLVE
+  and accepts either honest terminal - the regression it guards is the
+  permanent 'streaming' STALL, not which terminal wins.
+- long_message's 1 skip is the documented steady state: the full-M10
+  specification fixture env var is intentionally unset; its text is
+  never reconstructed.
+
+Post-fix verification on 3a83ce7: p04 17/17, real_agent 36/36 (the
+earlier documented R1 live flake also cleared), battery 143/143.
+
+Delivery: push to the GitHub fork + SHA verification + live :8712
+restart + live-instance suites: recorded in the next row of this
+section once executed.
