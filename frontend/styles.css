@@ -472,6 +472,9 @@ select:focus, textarea:focus, input[type="text"]:focus, input[type="number"]:foc
 .sctrl .radio { display: inline-flex; align-items: center; gap: 7px;
   font-size: 14px; color: var(--text); cursor: pointer; }
 .sctrl .radio input { accent-color: var(--accent); margin: 0; }
+/* M11 P1-13: visible-but-disabled (e.g. a genome build this host has
+   no validated assets for) - shown, explained, never selectable */
+.sctrl .radio.off { opacity: .5; cursor: not-allowed; }
 .sctrl input[type="number"] { max-width: 130px; padding: 6px 10px; }
 .sctrl .sc-hint { grid-column: 2; color: var(--text-2); font-size: 12.5px; }
 .sctrl.changed { background: var(--accent-soft); }

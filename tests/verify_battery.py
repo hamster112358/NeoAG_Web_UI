@@ -47,7 +47,10 @@ _srv = subprocess.Popen(
     env=dict(os.environ, NEOAG_DEMO_DB="batterytest.sqlite3",
              NEOAG_DEMO_PORT=str(PORT),
              NEOAG_SKILLS_DIR="/tmp/neoag-battery-skills",
-             NEOAG_TASKQ_DIR="/tmp/neoag-battery-taskq"),
+             NEOAG_TASKQ_DIR="/tmp/neoag-battery-taskq",
+             # M11 P1-13: the failure-simulation knob is now dead
+             # outside a battery; this suite opts in explicitly
+             NEOAG_DEMO_FAILSIM="1"),
     stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
 

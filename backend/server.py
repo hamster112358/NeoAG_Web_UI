@@ -42,6 +42,12 @@ from .store import Store, new_id, now
 ROOT = Path(__file__).resolve().parent.parent
 FRONTEND = ROOT / "frontend"
 DATA = ROOT / "data"
+
+# M11 P1-13: the failure-simulation knob is a VERIFICATION-ONLY device.
+# Outside a verification battery it is dead: a production body cannot
+# arm it, the run never pretends, and the parameter surface never
+# renders it. Batteries opt in explicitly with NEOAG_DEMO_FAILSIM=1.
+DEV_FAILSIM = os.environ.get("NEOAG_DEMO_FAILSIM") == "1"
 HOST = "127.0.0.1"
 # NEOAG_DEMO_PORT + NEOAG_DEMO_DB let verification batteries run isolated
 # servers against fresh databases without touching the live demo state.
@@ -266,7 +272,17 @@ def research_public_rows(store) -> list[dict]:
     display_title always wins; derived parts never invent metadata."""
     out = []
     for r in store.research_list():
+        # M11 P1-12: the SCIENTIFIC class rides with the row (same
+        # derivation research_task_rows uses) so every surface shows
+        # exec vs science from ONE pair of fields, not re-guessing
+        outcome = ""
+        if r.get("status") == "completed":
+            full = store.research_get(r["id"]) or {}
+            rep = full.get("report") or {}
+            outcome = ("decision_ready" if rep.get("decision_ready")
+                       else "preliminary")
         out.append({**r,
+                    "outcome": outcome,
                     "name_subject": str(r.get("target") or "")[:48],
                     "name_type": "review"})
     return out
@@ -759,15 +775,20 @@ class Handler(BaseHTTPRequestHandler):
                     "not invent tools here"]
                 mod["tools_provenance"] = prov or [
                     "no [stages.*] entry matched in the workflow TOML"]
+            # M6 PART E: the curated structured science panel (every
+            # control verified to change native execution) + the
+            # code-decided list with citations. M11 P1-13: choice
+            # availability is DERIVED per request (deployed reference
+            # manifest), never baked into the params module.
+            sci = [dict(c) for c in SCIENCE_CONTROLS]
+            for c in sci:
+                if c.get("id") == "genome_build":
+                    c["choices_availability"] = native_mod.build_choices()
             return self._json(200, {"groups": groups,
                                    "stage_graph": STAGE_GRAPH,
                                    "decision_points": DECISION_POINTS,
                                    "human_required": HUMAN_REQUIRED,
-                                   # M6 PART E: the curated structured
-                                   # science panel (every control verified
-                                   # to change native execution) + the
-                                   # code-decided list with citations.
-                                   "science": SCIENCE_CONTROLS,
+                                   "science": sci,
                                    "science_info": SCIENCE_INFO,
                                    "science_sections": SCIENCE_SECTIONS,
                                    "inventory_captured_at":
@@ -1694,8 +1715,8 @@ class Handler(BaseHTTPRequestHandler):
                                   str(body.get("mode", "auto")),
                                   execution_mode=str(body.get(
                                       "execution_mode", "controlled")),
-                                  simulate_failure=bool(body.get(
-                                      "simulate_failure")),
+                                  simulate_failure=(DEV_FAILSIM and bool(
+                                      body.get("simulate_failure"))),
                                   kind=kind,
                                   manifest_id=body.get("manifest_id"),
                                   requested_config=rcfg,

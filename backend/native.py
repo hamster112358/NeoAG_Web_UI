@@ -127,6 +127,52 @@ _SCIENCE_RANGE = {"event_top_n": (1, 500), "candidate_top_n": (1, 2000)}
 _SCIENCE_BOOL = ("skip_bam_matcher", "skip_dna_sv")
 
 
+def build_choices():
+    """M11 P1-13: genome-build availability DERIVED from the deployed
+    reference manifest (configs/references/reference_manifest.yaml
+    genome_build) plus the probed reference FASTA - never a hardcoded
+    option list. A build/asset mismatch silently produces stale calls,
+    so only builds this deployment has validated assets for may be
+    chosen; the others stay VISIBLE but disabled with the reason."""
+    validated = ""
+    try:
+        with open(REFERENCE_MANIFEST, encoding="utf-8") as fh:
+            for line in fh:
+                s = line.strip()
+                if s.startswith("genome_build:"):
+                    validated = s.split(":", 1)[1].strip().strip("'\"")
+                    break
+    except OSError:
+        pass
+    fasta_ok = os.path.exists(REF_FASTA)
+    if not validated:
+        # manifest unreadable (repo relocated?): UNKNOWN, not a
+        # verdict - never block a run on what this host cannot see;
+        # the native planner itself refuses what it cannot resolve
+        return {b: {"available": True, "known": False,
+                    "reason": "the deployed reference manifest is not "
+                              "readable from this host - availability "
+                              "unknown, the native planner will refuse "
+                              "assets it cannot resolve"}
+                for b in _SCIENCE_CHOICE["genome_build"]}
+    out = {}
+    for b in _SCIENCE_CHOICE["genome_build"]:
+        if b == validated and fasta_ok:
+            out[b] = {"available": True, "known": True,
+                      "reason": "the deployed reference manifest declares "
+                                "this build and the reference FASTA is "
+                                "present on this host"}
+        else:
+            out[b] = {
+                "available": False, "known": True,
+                "reason": "the deployed reference manifest declares "
+                          f"{validated} genome_build - this host has no "
+                          "validated asset set for this build (a "
+                          "build/asset mismatch silently produces "
+                          "stale calls)"}
+    return out
+
+
 def validate_scientific(params):
     """Return a list of human-readable problems with scientific overrides
     (empty = every value is a real, in-range option). Unknown keys are
@@ -137,6 +183,14 @@ def validate_scientific(params):
         v = params.get(k)
         if v not in (None, "") and str(v) not in allowed:
             errs.append(f"{k}={v!r} is not one of {list(allowed)}")
+    # M11 P1-13: a syntactically valid build that this deployment has
+    # no validated assets for is refused HERE, not only hidden in the UI
+    gb = params.get("genome_build")
+    if gb not in (None, ""):
+        av = build_choices().get(str(gb))
+        if av is not None and not av["available"]:
+            errs.append(f"genome_build={gb}: not usable on this "
+                        f"deployment - {av['reason']}")
     for k, (lo, hi) in _SCIENCE_RANGE.items():
         v = params.get(k)
         if v in (None, ""):

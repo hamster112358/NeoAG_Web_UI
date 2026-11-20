@@ -38,6 +38,7 @@ import time
 
 from . import mock_data
 from . import native as native_mod
+from . import phrasing
 from . import versions as versions_mod
 from .store import Store, new_id, now
 from .policies import POLICY_VERSION
@@ -930,7 +931,7 @@ class JobManager:
                     # conversation what happened to its formal job
                     self.store.msg_add(
                         "system",
-                        f"Job {job['id']}: {why[:300]}",
+                        f"Job {job['id']}: {phrasing.human_detail(why, 300)}",
                         {"kind": "approval_outcome", "decision": decision,
                          "job_id": job["id"]},
                         conv_id=job["conv_id"])
@@ -1174,7 +1175,8 @@ class JobManager:
             nxt = "check the gateway payload policy, then start again"
         elif code == "GATEWAY_SUBMISSION_FAILED":
             reason = "the native gateway refused this execution submission"
-            nxt = ("see the gateway detail below; the deployment log is "
+            nxt = ("the stated refusal reason is recorded in the "
+                   "task's technical details; the deployment log is "
                    f"{native_mod.WORK}/gateway.log")
         elif code == "GATEWAY_MONITOR_TIMEOUT":
             reason = ("the gateway job was still non-terminal after the "
@@ -1230,30 +1232,16 @@ class JobManager:
 
     def _notify_failure(self, job_id: str, report: dict,
                         completed: list, partial: int) -> None:
-        """M10 §11: the owning conversation is TOLD proactively - name,
-        time, whether computation started, the confirmed primary reason,
+        """M10 §11 + M11 P1-12: the owning conversation is TOLD
+        proactively through the shared phrasing module - execution and
+        scientific status get their own labeled sentences, the reason,
         what completed, partial results, next step. Raw codes stay in
-        the technical detail, not the headline."""
+        the technical detail, never in the stored sentence."""
         job = self.store.job_get(job_id)
         if not job:
             return
-        lines = [
-            ("started" if report.get("started_computation") else
-             "stopped") ,
-            report.get("reason", ""),
-        ]
-        if report.get("blockers"):
-            lines.append("Blocking issue(s): "
-                         + " | ".join(report["blockers"][:4]))
-        lines.append("Completed before the failure: "
-                     + (", ".join(completed) if completed
-                        else "nothing - no computation started"))
-        lines.append(f"Partial results: {partial} file(s) registered "
-                     "on the task for forensics" if partial else
-                     "Partial results: none")
-        lines.append("Next step: " + report.get("next_step", ""))
-        text = (f"Task {job_id} failed at {now()}. "
-                + " ".join(str(x) for x in lines if x))[:1200]
+        text = phrasing.failure_notice_text(job_id, report, completed,
+                                            partial, now())
         meta = {"kind": "job_failure", "job_id": job_id,
                 "badges": ["task failure"],
                 "failure": report,

@@ -232,6 +232,8 @@ const I18N = {
     "dr.renameCancel": "Cancel", "dr.renamed": "Title updated",
     "dr.id": "Task ID", "dr.created": "Created", "dr.finished": "Finished",
     "dr.exec": "Execution status", "dr.concl": "Scientific conclusion",
+    "dr.conclPending": "nothing established yet",
+    "sci.unvalidated": "not validated on this deployment",
     "dr.controls": "Controls", "dr.pause": "Pause", "dr.resume": "Resume",
     "dr.cancel": "Cancel",
     "dr.noPause": "This run type has no safe pause point.",
@@ -613,6 +615,8 @@ const I18N = {
     "dr.renameCancel": "取消", "dr.renamed": "标题已更新",
     "dr.id": "任务 ID", "dr.created": "创建于", "dr.finished": "完成于",
     "dr.exec": "执行状态", "dr.concl": "科学结论",
+    "dr.conclPending": "尚无结论",
+    "sci.unvalidated": "本部署未验证资产",
     "dr.controls": "操作", "dr.pause": "暂停", "dr.resume": "继续",
     "dr.cancel": "取消",
     "dr.noPause": "此类运行没有安全的暂停点。",
@@ -2151,11 +2155,22 @@ function scCtrlHtml(c, ov) {
   const changed = ov[c.id] !== undefined;
   let ctl;
   if (c.control === "radio") {
+    // M11 P1-13: when the server derives per-choice availability (the
+    // genome build against this deployment's validated reference
+    // assets), unavailable choices stay VISIBLE but disabled, each
+    // carrying its stated reason - nothing is silently dropped
+    const av = c.choices_availability || {};
     ctl = `<div class="sc-ctl">${(c.options || []).map((o) => {
-      const on = String(ov[c.id] !== undefined ? ov[c.id] : c.native_default) === String(o);
-      return `<label class="radio"><input type="radio" name="sci-${id}"
-        data-param="${id}" value="${esc(o)}"${on ? " checked" : ""}>
-        <span>${esc(o)}</span></label>`;
+      const info = av[o];
+      const off = info && info.available === false;
+      const on = !off && String(ov[c.id] !== undefined
+        ? ov[c.id] : c.native_default) === String(o);
+      return `<label class="radio${off ? " off" : ""}"${
+        off ? ` title="${esc(info.reason)}"` : ""
+        }><input type="radio" name="sci-${id}"
+        data-param="${id}" value="${esc(o)}"${on ? " checked" : ""}${
+        off ? " disabled" : ""}>
+        <span>${esc(o)}${off ? " · " + esc(t("sci.unvalidated")) : ""}</span></label>`;
     }).join("")}</div>`;
   } else if (c.control === "number") {
     const v = ov[c.id] !== undefined ? ov[c.id] : c.native_default;
@@ -3088,6 +3103,37 @@ function statusPill(st, j) {
     lbl = t("st.waitdec");
   return `<span class="pill ${cls}">${esc(lbl)}</span>`;
 }
+/* M11 P1-12: ONE shared phrasing pair for the two status classes.
+   Execution class = record lifecycle (statusPill); scientific class =
+   what the run established (sciPill). The Tasks head, the unified
+   task rows, the Discovery rows and the Results picker/header all
+   compose these SAME two, so a record is never described one way on
+   one surface and another way on the next. Chat's terminal notices
+   carry the same pair from the backend phrasing module. */
+function sciLabel(oc) {
+  if (!oc) return "";
+  const k = "concl." + oc;
+  return t(k) !== k ? t(k) : oc.replace(/_/g, " ");
+}
+function sciPill(j) {
+  if (!j || !j.outcome) return "";
+  const ok = j.outcome === "decision_ready" || j.outcome === "delivered";
+  return `<span class="pill ${ok ? "ok" : "warn"}">${esc(
+    sciLabel(j.outcome))}</span>`;
+}
+function execPill(j) {
+  const st = j.state !== undefined && j.state !== null
+    ? j.state : j.status;
+  return statusPill(st, j);
+}
+function statusPairText(j) {
+  // plain-text form for <option> labels (no HTML allowed there)
+  const st = j.state !== undefined && j.state !== null
+    ? j.state : j.status;
+  const ex = t("st." + st) !== "st." + st ? t("st." + st) : st;
+  return { exec: ex, sci: sciLabel(j.outcome) };
+}
+
 /* Display name: an explicit user title always wins; otherwise pieces
    derived from stored metadata only. The internal id stays beside it,
    smaller - never the headline. */
@@ -3119,8 +3165,7 @@ function jobRowHtml(j) {
     ? `<span class="jr-bar"><i style="width:${Math.min(95, j.progress)}%"></i></span>`
     : "";
   const concl = j.kind === "discovery" && j.outcome
-    ? t("concl." + j.outcome) !== "concl." + j.outcome
-      ? t("concl." + j.outcome) : "" : "";
+    ? statusPairText(j).sci : "";   // shared helper (P1-12)
   const sub = [j.id, fmtDT(j.created_at), j.stage || "", concl]
     .filter(Boolean).join(" · ");
   // human headline on terminal rows; the raw code stays in the tech record
@@ -3378,9 +3423,7 @@ function taskHeadHtml(job, task) {
   const bar = running && job.progress > 0
     ? `<div class="jr-bar wide"><i style="width:${
         Math.min(95, job.progress)}%"></i></div>` : "";
-  const conclHtml = job.kind === "discovery" && job.outcome
-    ? `<span class="pill ${job.outcome === "decision_ready" ? "ok" : "warn"}">${esc(t("concl." + job.outcome) !== "concl." + job.outcome ? t("concl." + job.outcome) : job.outcome)}</span>`
-    : job.outcome ? `<span class="pill ${job.outcome === "delivered" ? "ok" : "warn"}">${esc(job.outcome.replace(/_/g, " "))}</span>` : "";
+  const conclHtml = sciPill(job);   // shared helper (P1-12)
   return `<div class="task-head">
     <div class="dr-title-row">
       <h2 class="th-title">${esc(displayName(job))}</h2>
@@ -3389,7 +3432,8 @@ function taskHeadHtml(job, task) {
     <div class="dr-sub">${esc(t("dr.created"))}: ${esc(fmtDT(job.created_at))}
       &nbsp;·&nbsp; ${esc(t("dr.id"))}: ${esc(job.id)}</div>
     <div class="state-pair"><span>${esc(t("dr.exec"))}:</span>
-      ${statusPill(job.state, job)} ${conclHtml}</div>
+      ${execPill(job)} <span>${esc(t("dr.concl"))}:</span>
+      ${conclHtml || `<span class="pill muted">${esc(t("dr.conclPending"))}</span>`}</div>
     ${bar}
     <div class="btnrow" style="margin-top:8px">
       <button class="btn sm" id="th-pause"
@@ -3610,13 +3654,15 @@ async function renderResults() {
   $("res-mock").checked = !!state.resultsMock;
   const runs = jobs.filter((j) => state.resultsMock || !isMock(j));
   const opts = runs.map((j) => {
-    const st = t("st." + j.state) !== "st." + j.state ? t("st." + j.state) : j.state;
-    return `<option value="${esc(j.id)}">${esc(displayName(j))} · ${st}` +
-      `${j.outcome ? " - " + esc(j.outcome.replace(/_/g, " ")) : ""}` +
-      ` · ${esc(j.id)}</option>`;
+    // shared exec/science pair (P1-12) - the same wording the task
+    // head uses, never a third ad-hoc rendering of the state
+    const p = statusPairText(j);
+    return `<option value="${esc(j.id)}">${esc(displayName(j))} · ${
+      esc(p.exec)}${p.sci ? " · " + esc(p.sci) : ""} · ${esc(j.id)}</option>`;
   }).join("") + research.map((r) =>
     `<option value="${esc(r.id)}">${esc(researchName(r))} · ${
-      esc(t("res.discoveryRow"))}</option>`).join("");
+      esc(t("res.discoveryRow"))}${
+      r.outcome ? " · " + esc(statusPairText(r).sci) : ""}</option>`).join("");
   $("res-job").innerHTML = opts;
   if (!opts) {
     $("res-outcome").innerHTML = `<div class="empty">${esc(t("res.none"))}</div>`;
@@ -3633,7 +3679,7 @@ async function renderResults() {
   if (/^res-/.test(jid)) {
     const r = research.find((x) => x.id === jid) || {};
     $("res-outcome").innerHTML = `<div class="alert info">
-      <b>${esc(researchName(r))}</b> ${resPill(r.status || "completed")}
+      <b>${esc(researchName(r))}</b> ${execPill(r)}${sciPill(r)}
       <div>${esc(t("res.discoveryNote"))}</div>
       <div class="btnrow" style="margin-top:6px"><button class="btn sm"
         id="res-open-disc">${esc(t("res.openDiscovery"))}</button></div></div>`;
@@ -3705,7 +3751,7 @@ async function renderResults() {
     const outcome = res.outcome || "no_artifacts";
     $("res-outcome").innerHTML = `
       <div class="outcome ${esc(OUTCOME_CLS[outcome] || "muted")}">
-        <b>${esc(outcome.replace(/_/g, " "))}</b>
+        <b>${esc(sciLabel(outcome) || outcome)}</b>
         <div>${esc(res.outcome_note || "")}</div>
         <div class="hint">${esc(res.delivery_claim || "")}</div>
       </div>
@@ -3873,20 +3919,13 @@ function researchName(r) {
     ? `${r.name_subject} · ${t("type." + (r.name_type || "review"))}`
     : t("type.review");
 }
-function resPill(st) {
-  const cls = st === "completed" ? "ok"
-    : ["running", "queued"].includes(st) ? "accent" : "warn";
-  const lbl = t("st." + st) !== "st." + st ? t("st." + st) : st;
-  return `<span class="pill ${cls}">${esc(lbl)}</span>`;
-}
-
 function renderDiscovery() {
   const list = ((state.boot || {}).research || []);
   const ACTIVE = ["running", "queued"];
   $("res-list").innerHTML = list.length ? list.map((r) => `
     <div class="job-row" data-res="${esc(r.id)}">
       <div class="jr-name">${esc(researchName(r))}</div>
-      <div class="jr-sub">${esc(r.id)} · ${esc(r.engine === "live" ? t("disc.engineL") : t("disc.engineE"))} · ${esc(r.scope)} · ${resPill(r.status)}</div>
+      <div class="jr-sub">${esc(r.id)} · ${esc(r.engine === "live" ? t("disc.engineL") : t("disc.engineE"))} · ${esc(r.scope)} · ${execPill(r)}${sciPill(r)}</div>
       ${(r.progress && r.progress.note)
         ? `<div class="jr-sub hint">${esc(r.progress.note)}</div>` : ""}
     </div>`).join("")
@@ -4123,7 +4162,7 @@ async function showReport(id) {
     if (!r.report) {
       $("res-report").innerHTML = `<div class="card">
         <div class="jr-name">${esc(researchName(r))}</div>
-        <div class="jr-sub">${esc(r.id)} · ${resPill(r.status)}</div>
+        <div class="jr-sub">${esc(r.id)} · ${execPill(r)}</div>
         ${r.progress && r.progress.steps && r.progress.steps.length
           ? `<ul>${r.progress.steps.map((s) =>
             `<li class="hint">${esc(s)}</li>`).join("")}</ul>`

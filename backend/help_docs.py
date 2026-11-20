@@ -147,7 +147,9 @@ instead of poking at databases or writing ad-hoc SQL:
   dispatches a fresh job rebuilt from the durable saved history and the
   chat shows an honest "the agent session is new" notice - never fake
   continuity.
-- Gateway detail JSON can contain raw newlines - parsed leniently.
+- The JSON record the agent gateway reports per job can contain raw
+  newlines - it is parsed leniently and stored, never pasted raw into
+  a conversation (see the shared phrasing module).
 
 ## Safety posture
 

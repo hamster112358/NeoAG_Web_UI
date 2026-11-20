@@ -28,6 +28,7 @@ import threading
 import time
 
 from . import mock_data
+from . import phrasing
 from .policies import POLICY_BY_ID
 from .store import new_id
 
@@ -753,7 +754,8 @@ class DemoAgent:
                 self.store.msg_add(
                     "agent",
                     f"(The agent session was lost ({reason}) and the "
-                    f"automatic recovery could not start: {e}. Resend "
+                    "automatic recovery could not start: "
+                    f"{phrasing.human_detail(e)}. Resend "
                     "your message to try again.)",
                     {"badges": ["real agent", "integration error"],
                      "job_id": job_id}, conv_id)
@@ -785,9 +787,10 @@ class DemoAgent:
                                      conv_id, {"job": job_id, "err": str(e)})
                     self.store.msg_add(
                         "agent",
-                        f"(The connection to the agent job was lost "
-                        f"after repeated gateway errors ({e}). The job "
-                        "may still be working on the gateway; this "
+                        "(The connection to the agent job was lost "
+                        "after repeated service errors: "
+                        f"{phrasing.human_detail(e)}. The job "
+                        "may still be working on the server; this "
                         "interface will not guess its outcome.)",
                         {"badges": ["real agent", "connection lost"],
                          "job_id": job_id}, conv_id)
@@ -976,25 +979,21 @@ class DemoAgent:
                         # purpose; the honest terminal below stands.
                         return
                     else:
-                        _det = str(detail.get("detail") or "")
-                        # shown inside a user-visible message: if it
-                        # must be shortened (M11 P0-4) say so, never
-                        # clip silently
-                        live = (_det if len(_det) <= 200 else
-                                _det[:200] + f"... [gateway detail "
-                                f"trimmed from {len(_det)} chars]")
-                        label = {"done": "no reply recorded",
-                                 "failed": "failed",
-                                 "stopped": "cancelled"}[state]
+                        # M11 P1-12: the gateway's record goes through
+                        # the shared phrasing module - a stored
+                        # conversation row never carries raw dicts,
+                        # braces or internal-only phrases (trimming is
+                        # stated, never silent)
                         self.store.msg_add(
                             "agent",
-                            f"(Agent turn ended: {state}."
-                            + (f" Gateway detail: {live}" if live else "")
-                            + " No assistant reply text was recorded - "
-                              "this interface does not fabricate one.)",
+                            phrasing.turn_ended_text(
+                                state, detail.get("detail")),
                             {"badges": ["real agent", "integration note"],
                              "job_id": job_id}, conv_id)
-                        self._finish_turn(st, label)
+                        self._finish_turn(
+                            st, {"done": "no reply recorded",
+                                 "failed": "failed",
+                                 "stopped": "cancelled"}[state])
                     publish({"type": "chat", "conv_id": conv_id})
                     return
             self.store.msg_add(
@@ -1012,9 +1011,10 @@ class DemoAgent:
             try:
                 self.store.msg_add(
                     "agent",
-                    f"(The message relay for this turn stopped "
-                    f"unexpectedly: {e}. Nothing was fabricated; check "
-                    "the job status or send another message.)",
+                    "(The message relay for this turn stopped "
+                    "unexpectedly: "
+                    f"{phrasing.human_detail(e)}. Nothing was fabricated; "
+                    "check the job status or send another message.)",
                     {"badges": ["real agent", "relay error"],
                      "job_id": job_id}, conv_id)
                 self._finish_turn(st, "relay error")
@@ -1478,11 +1478,11 @@ class DemoAgent:
             return out
 
         if any(k in t for k in ("pause", "stop", "cancel", "resume")):
-            out.append(self._say(
-                "Use the pause / stop / resume buttons on the job card in "
-                "the Tasks view - controls act on the job worker, not just "
-                "the chat. Cancellation is cooperative at stage/substep "
-                "boundaries.", conv_id=conv_id))
+            # M11 P1-12: the guidance states the controls that really
+            # exist per worker - pause/resume are offered only where
+            # the job card actually enables them
+            out.append(self._say(phrasing.CONTROL_GUIDANCE,
+                                 conv_id=conv_id))
             return out
 
         if any(k in t for k in ("real", "pipeline", "connect", "production")):
